@@ -5,199 +5,64 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>FibLab Robot — Dashboard</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
-
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
   :root {
-    --bg: #0a0b0f;
-    --surface: #12141a;
-    --border: #1e2130;
-    --gold: #f0b429;
-    --green: #22c55e;
-    --red: #ef4444;
-    --orange: #f97316;
-    --muted: #4a5568;
-    --text: #e2e8f0;
-    --text-dim: #718096;
+    --bg:#080c10;--card:#0d1117;--border:#1c2333;--border2:#243044;
+    --gold:#f5a623;--gold-dim:#7a5214;--green:#3fb950;--red:#f85149;
+    --orange:#d29922;--blue:#58a6ff;--muted:#484f58;--text:#cdd9e5;
+    --text-dim:#768390;--font:'Space Grotesk',sans-serif;--mono:'Space Mono',monospace;
   }
-
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
-    min-height: 100vh;
-    padding: 24px;
-  }
-
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 32px;
-    padding-bottom: 20px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .logo {
-    font-family: 'Syne', sans-serif;
-    font-weight: 800;
-    font-size: 1.5rem;
-    color: var(--gold);
-    letter-spacing: -0.02em;
-  }
-
-  .logo span { color: var(--text-dim); font-weight: 400; font-size: 0.9rem; margin-left: 10px; }
-
-  .status-dot {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.75rem;
-    color: var(--green);
-  }
-
-  .dot {
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: var(--green);
-    animation: pulse 2s infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-
-  .stats {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 16px;
-    margin-bottom: 32px;
-  }
-
-  .stat-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-  }
-
-  .stat-card .label {
-    font-size: 0.65rem;
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    margin-bottom: 8px;
-  }
-
-  .stat-card .value {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.8rem;
-    font-weight: 800;
-    color: var(--gold);
-  }
-
-  .alerts-title {
-    font-family: 'Syne', sans-serif;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    letter-spacing: 0.15em;
-    color: var(--text-dim);
-    margin-bottom: 16px;
-  }
-
-  .alert-list {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .alert-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px 20px;
-    display: grid;
-    grid-template-columns: 60px 1fr auto auto auto;
-    align-items: center;
-    gap: 16px;
-    transition: border-color 0.2s;
-  }
-
-  .alert-card:hover { border-color: var(--gold); }
-
-  .alert-card.prioritaire { border-left: 3px solid var(--red); }
-  .alert-card.secondaire  { border-left: 3px solid var(--orange); }
-  .alert-card.info        { border-left: 3px solid var(--muted); }
-
-  .score-badge {
-    font-family: 'Syne', sans-serif;
-    font-weight: 800;
-    font-size: 1.4rem;
-    text-align: center;
-  }
-
-  .score-badge.prioritaire { color: var(--red); }
-  .score-badge.secondaire  { color: var(--orange); }
-  .score-badge.info        { color: var(--muted); }
-
-  .alert-main .asset {
-    font-family: 'Syne', sans-serif;
-    font-weight: 700;
-    font-size: 1rem;
-    color: var(--text);
-  }
-
-  .alert-main .type {
-    font-size: 0.72rem;
-    color: var(--text-dim);
-    margin-top: 3px;
-  }
-
-  .price {
-    font-size: 1rem;
-    font-weight: 700;
-    color: var(--gold);
-    text-align: right;
-  }
-
-  .side-badge {
-    padding: 3px 10px;
-    border-radius: 4px;
-    font-size: 0.7rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-
-  .side-badge.support    { background: rgba(34,197,94,0.15);  color: var(--green); }
-  .side-badge.resistance { background: rgba(239,68,68,0.15);  color: var(--red);   }
-
-  .scope-badge {
-    font-size: 0.65rem;
-    color: var(--text-dim);
-    text-align: right;
-  }
-
-  .scope-badge.pure { color: var(--gold); }
-
-  .empty {
-    text-align: center;
-    padding: 60px 20px;
-    color: var(--muted);
-    font-size: 0.85rem;
-  }
-
-  .empty .icon { font-size: 2.5rem; margin-bottom: 12px; }
-
-  @media (max-width: 600px) {
-    .alert-card {
-      grid-template-columns: 50px 1fr;
-      grid-template-rows: auto auto;
-    }
-    .side-badge, .scope-badge { display: none; }
-    .price { grid-column: 2; text-align: left; font-size: 0.9rem; }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
+  header{display:flex;align-items:center;justify-content:space-between;padding:18px 32px;background:var(--card);border-bottom:1px solid var(--border)}
+  .logo-main{font-size:1.25rem;font-weight:700;color:var(--gold)}
+  .logo-sub{font-size:0.75rem;color:var(--text-dim);margin-left:10px}
+  .live-badge{display:flex;align-items:center;gap:7px;font-size:0.75rem;font-weight:600;color:var(--green);background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.25);padding:5px 12px;border-radius:20px}
+  .live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 1.8s ease-in-out infinite}
+  @keyframes blink{0%,100%{opacity:1;box-shadow:0 0 6px var(--green)}50%{opacity:0.3;box-shadow:none}}
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border-bottom:1px solid var(--border)}
+  .stat{background:var(--card);padding:20px 28px}
+  .stat-label{font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:6px}
+  .stat-value{font-family:var(--mono);font-size:2rem;font-weight:700;line-height:1}
+  .stat-value.gold{color:var(--gold)}.stat-value.red{color:var(--red)}.stat-value.orange{color:var(--orange)}.stat-value.dim{color:var(--text-dim);font-size:0.85rem;padding-top:6px}
+  .main{padding:28px 32px;max-width:1400px;margin:0 auto}
+  .section-title{font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-dim);margin-bottom:16px;display:flex;align-items:center;gap:10px}
+  .section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+  .table-wrap{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  table{width:100%;border-collapse:collapse}
+  thead tr{background:#0a0f16;border-bottom:1px solid var(--border)}
+  thead th{padding:11px 16px;text-align:left;font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim)}
+  tbody tr{border-bottom:1px solid var(--border);transition:background 0.15s}
+  tbody tr:last-child{border-bottom:none}
+  tbody tr:hover{background:rgba(255,255,255,0.02)}
+  tbody tr.prioritaire{border-left:3px solid var(--red)}
+  tbody tr.secondaire{border-left:3px solid var(--orange)}
+  tbody tr.info{border-left:3px solid var(--muted)}
+  td{padding:13px 16px;font-size:0.85rem;vertical-align:middle}
+  .score-pill{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;font-family:var(--mono);font-weight:700;font-size:1rem}
+  .score-pill.prioritaire{background:rgba(248,81,73,0.15);color:var(--red);border:1px solid rgba(248,81,73,0.3)}
+  .score-pill.secondaire{background:rgba(210,153,34,0.15);color:var(--orange);border:1px solid rgba(210,153,34,0.3)}
+  .score-pill.info{background:rgba(72,79,88,0.2);color:var(--muted);border:1px solid var(--border)}
+  .level-label{font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;margin-top:3px;text-align:center}
+  .level-label.prioritaire{color:var(--red)}.level-label.secondaire{color:var(--orange)}.level-label.info{color:var(--muted)}
+  .asset-name{font-weight:700;font-size:0.95rem;color:var(--text)}
+  .asset-tf{font-size:0.72rem;color:var(--text-dim);font-family:var(--mono);margin-top:2px}
+  .type-badge{display:inline-block;padding:3px 9px;border-radius:4px;font-size:0.72rem;font-weight:600;background:rgba(88,166,255,0.1);color:var(--blue);border:1px solid rgba(88,166,255,0.2);white-space:nowrap}
+  .price{font-family:var(--mono);font-weight:700;font-size:0.95rem;color:var(--gold)}
+  .side-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:4px;font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em}
+  .side-badge.support{background:rgba(63,185,80,0.1);color:var(--green);border:1px solid rgba(63,185,80,0.25)}
+  .side-badge.resistance{background:rgba(248,81,73,0.1);color:var(--red);border:1px solid rgba(248,81,73,0.25)}
+  .scope{font-size:0.75rem;font-weight:600}
+  .scope.pure{color:var(--gold)}.scope.non-pure{color:var(--muted)}
+  .time{font-family:var(--mono);font-size:0.72rem;color:var(--text-dim)}
+  .empty-state{padding:80px 20px;text-align:center}
+  .empty-state .icon{font-size:3rem;margin-bottom:16px;opacity:0.5}
+  .empty-state p{font-size:0.9rem;color:var(--text-dim)}
+  .empty-state .hint{font-size:0.75rem;color:var(--muted);margin-top:8px;font-family:var(--mono)}
+  @media(max-width:900px){
+    .stats{grid-template-columns:repeat(2,1fr)}
+    thead th:nth-child(n+6),td:nth-child(n+6){display:none}
+    header,main{padding:14px 16px}
   }
 </style>
 </head>
@@ -205,61 +70,85 @@
 
 <header>
   <div>
-    <div class="logo">FibLab Robot <span>by Charlie Joe</span></div>
+    <span class="logo-main">FibLab Robot</span>
+    <span class="logo-sub">by Charlie Joe 1972</span>
   </div>
-  <div class="status-dot">
-    <div class="dot"></div>
-    LIVE
-  </div>
+  <div class="live-badge"><div class="live-dot"></div>LIVE</div>
 </header>
 
 <div class="stats">
-  <div class="stat-card">
-    <div class="label">Alertes reçues</div>
-    <div class="value">{{ alerts|length }}</div>
+  <div class="stat">
+    <div class="stat-label">Alertes reçues</div>
+    <div class="stat-value gold">{{ alerts|length }}</div>
   </div>
-  <div class="stat-card">
-    <div class="label">Prioritaires</div>
-    <div class="value" style="color: var(--red)">
-      {{ alerts | selectattr('level', 'equalto', 'PRIORITAIRE') | list | length }}
-    </div>
+  <div class="stat">
+    <div class="stat-label">Prioritaires</div>
+    <div class="stat-value red">{{ alerts | selectattr('level', 'equalto', 'PRIORITAIRE') | list | length }}</div>
   </div>
-  <div class="stat-card">
-    <div class="label">Secondaires</div>
-    <div class="value" style="color: var(--orange)">
-      {{ alerts | selectattr('level', 'equalto', 'SECONDAIRE') | list | length }}
-    </div>
+  <div class="stat">
+    <div class="stat-label">Secondaires</div>
+    <div class="stat-value orange">{{ alerts | selectattr('level', 'equalto', 'SECONDAIRE') | list | length }}</div>
   </div>
-  <div class="stat-card">
-    <div class="label">Dernière alerte</div>
-    <div class="value" style="font-size:0.85rem; padding-top:6px; color: var(--text-dim)">
-      {% if alerts %}{{ alerts[0].timestamp[:19].replace('T', ' ') }}{% else %}—{% endif %}
-    </div>
+  <div class="stat">
+    <div class="stat-label">Dernière alerte</div>
+    <div class="stat-value dim">{% if alerts %}{{ alerts[0].timestamp[:19].replace('T',' ') }} UTC{% else %}—{% endif %}</div>
   </div>
 </div>
 
-<div class="alerts-title">Historique des alertes</div>
-
-<div class="alert-list">
-{% if alerts %}
-  {% for a in alerts %}
-  <div class="alert-card {{ a.level|lower }}">
-    <div class="score-badge {{ a.level|lower }}">{{ a.score }}</div>
-    <div class="alert-main">
-      <div class="asset">{{ a.asset or '?' }} <span style="color:var(--muted); font-size:0.8rem">{{ a.timeframe or '' }}</span></div>
-      <div class="type">{{ a.type or '?' }}</div>
+<div class="main">
+  <div class="section-title">Historique des alertes</div>
+  <div class="table-wrap">
+    {% if alerts %}
+    <table>
+      <thead>
+        <tr>
+          <th>Score</th>
+          <th>Asset</th>
+          <th>Type d'alerte</th>
+          <th>Prix</th>
+          <th>Direction</th>
+          <th>Scope</th>
+          <th>Heure UTC</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in alerts %}
+        <tr class="{{ a.level|lower }}">
+          <td>
+            <div class="score-pill {{ a.level|lower }}">{{ a.score }}</div>
+            <div class="level-label {{ a.level|lower }}">{{ a.level }}</div>
+          </td>
+          <td>
+            <div class="asset-name">{{ a.asset or '—' }}</div>
+            <div class="asset-tf">{{ a.timeframe or '' }}</div>
+          </td>
+          <td><span class="type-badge">{{ a.type or '—' }}</span></td>
+          <td><span class="price">{{ a.price or '—' }}</span></td>
+          <td>
+            {% if a.side %}
+            <span class="side-badge {{ a.side|lower }}">
+              {% if a.side == 'Support' %}▲{% else %}▼{% endif %} {{ a.side }}
+            </span>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            <span class="scope {{ (a.scope or '')|lower|replace(' ','-') }}">
+              {% if a.scope == 'Pure' %}★ Pure{% elif a.scope %}{{ a.scope }}{% else %}—{% endif %}
+            </span>
+          </td>
+          <td><span class="time">{{ a.timestamp[:19].replace('T',' ') if a.timestamp else '—' }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+      <div class="icon">📡</div>
+      <p>En attente des alertes TradingView...</p>
+      <p class="hint">Configure le webhook dans TradingView pour commencer</p>
     </div>
-    <div class="price">{{ a.price or '?' }}</div>
-    <div class="side-badge {{ (a.side or '')|lower }}">{{ a.side or '?' }}</div>
-    <div class="scope-badge {{ (a.scope or '')|lower }}">{{ a.scope or '' }}</div>
+    {% endif %}
   </div>
-  {% endfor %}
-{% else %}
-  <div class="empty">
-    <div class="icon">📡</div>
-    En attente des alertes TradingView...
-  </div>
-{% endif %}
 </div>
 
 </body>
