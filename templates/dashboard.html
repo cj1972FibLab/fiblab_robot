@@ -3,66 +3,91 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FibLab Robot — Dashboard</title>
+<title>FibLab Robot — {{ {'all':'Global','xau':'XAU/USD','solana':'Solana','dax':'DAX'}[page] }}</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
-  :root {
-    --bg:#080c10;--card:#0d1117;--border:#1c2333;--border2:#243044;
-    --gold:#f5a623;--gold-dim:#7a5214;--green:#3fb950;--red:#f85149;
-    --orange:#d29922;--blue:#58a6ff;--muted:#484f58;--text:#cdd9e5;
-    --text-dim:#768390;--font:'Space Grotesk',sans-serif;--mono:'Space Mono',monospace;
+  :root{
+    --bg:#080c10;--card:#0d1117;--border:#1c2333;
+    --gold:#f5a623;--green:#3fb950;--red:#f85149;--orange:#d29922;
+    --blue:#58a6ff;--purple:#a78bfa;--muted:#484f58;
+    --text:#cdd9e5;--text-dim:#768390;
+    --font:'Space Grotesk',sans-serif;--mono:'Space Mono',monospace;
   }
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
-  header{display:flex;align-items:center;justify-content:space-between;padding:18px 32px;background:var(--card);border-bottom:1px solid var(--border)}
-  .logo-main{font-size:1.25rem;font-weight:700;color:var(--gold)}
-  .logo-sub{font-size:0.75rem;color:var(--text-dim);margin-left:10px}
-  .live-badge{display:flex;align-items:center;gap:7px;font-size:0.75rem;font-weight:600;color:var(--green);background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.25);padding:5px 12px;border-radius:20px}
+
+  /* HEADER */
+  header{display:flex;align-items:center;justify-content:space-between;padding:16px 32px;background:var(--card);border-bottom:1px solid var(--border)}
+  .logo-main{font-size:1.2rem;font-weight:700;color:var(--gold)}
+  .logo-sub{font-size:0.75rem;color:var(--text-dim);margin-left:8px}
+  .live-badge{display:flex;align-items:center;gap:7px;font-size:0.72rem;font-weight:600;color:var(--green);background:rgba(63,185,80,0.1);border:1px solid rgba(63,185,80,0.25);padding:4px 12px;border-radius:20px}
   .live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:blink 1.8s ease-in-out infinite}
   @keyframes blink{0%,100%{opacity:1;box-shadow:0 0 6px var(--green)}50%{opacity:0.3;box-shadow:none}}
+
+  /* NAV */
+  nav{background:var(--card);border-bottom:1px solid var(--border);padding:0 32px;display:flex;gap:0}
+  nav a{display:flex;align-items:center;gap:6px;padding:12px 18px;font-size:0.8rem;font-weight:600;text-decoration:none;color:var(--text-dim);border-bottom:2px solid transparent;transition:all 0.2s;white-space:nowrap}
+  nav a:hover{color:var(--text)}
+  nav a .count{font-size:0.65rem;background:var(--border);padding:1px 6px;border-radius:10px;font-family:var(--mono)}
+  nav a.active-all   {color:var(--blue);  border-bottom-color:var(--blue)}
+  nav a.active-xau   {color:var(--gold);  border-bottom-color:var(--gold)}
+  nav a.active-solana{color:var(--purple);border-bottom-color:var(--purple)}
+  nav a.active-dax   {color:var(--green); border-bottom-color:var(--green)}
+
+  /* STATS */
   .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border);border-bottom:1px solid var(--border)}
-  .stat{background:var(--card);padding:20px 28px}
-  .stat-label{font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:6px}
-  .stat-value{font-family:var(--mono);font-size:2rem;font-weight:700;line-height:1}
-  .stat-value.gold{color:var(--gold)}.stat-value.red{color:var(--red)}.stat-value.orange{color:var(--orange)}.stat-value.dim{color:var(--text-dim);font-size:0.85rem;padding-top:6px}
-  .main{padding:28px 32px;max-width:1400px;margin:0 auto}
-  .section-title{font-size:0.7rem;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-dim);margin-bottom:16px;display:flex;align-items:center;gap:10px}
+  .stat{background:var(--card);padding:18px 28px}
+  .stat-label{font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim);margin-bottom:6px}
+  .stat-value{font-family:var(--mono);font-size:1.9rem;font-weight:700;line-height:1}
+  .v-blue{color:var(--blue)}.v-gold{color:var(--gold)}.v-purple{color:var(--purple)}
+  .v-green{color:var(--green)}.v-red{color:var(--red)}.v-orange{color:var(--orange)}
+  .v-dim{color:var(--text-dim);font-size:0.82rem;padding-top:6px}
+
+  /* MAIN */
+  .main{padding:24px 32px}
+  .section-title{font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-dim);margin-bottom:14px;display:flex;align-items:center;gap:10px}
   .section-title::after{content:'';flex:1;height:1px;background:var(--border)}
+
+  /* TABLE */
   .table-wrap{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
   table{width:100%;border-collapse:collapse}
   thead tr{background:#0a0f16;border-bottom:1px solid var(--border)}
-  thead th{padding:11px 16px;text-align:left;font-size:0.68rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim)}
+  thead th{padding:10px 16px;text-align:left;font-size:0.65rem;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-dim)}
   tbody tr{border-bottom:1px solid var(--border);transition:background 0.15s}
   tbody tr:last-child{border-bottom:none}
   tbody tr:hover{background:rgba(255,255,255,0.02)}
   tbody tr.prioritaire{border-left:3px solid var(--red)}
-  tbody tr.secondaire{border-left:3px solid var(--orange)}
-  tbody tr.info{border-left:3px solid var(--muted)}
-  td{padding:13px 16px;font-size:0.85rem;vertical-align:middle}
-  .score-pill{display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:50%;font-family:var(--mono);font-weight:700;font-size:1rem}
-  .score-pill.prioritaire{background:rgba(248,81,73,0.15);color:var(--red);border:1px solid rgba(248,81,73,0.3)}
-  .score-pill.secondaire{background:rgba(210,153,34,0.15);color:var(--orange);border:1px solid rgba(210,153,34,0.3)}
-  .score-pill.info{background:rgba(72,79,88,0.2);color:var(--muted);border:1px solid var(--border)}
-  .level-label{font-size:0.62rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;margin-top:3px;text-align:center}
+  tbody tr.secondaire {border-left:3px solid var(--orange)}
+  tbody tr.info       {border-left:3px solid var(--muted)}
+  td{padding:12px 16px;font-size:0.83rem;vertical-align:middle}
+
+  .score-pill{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:50%;font-family:var(--mono);font-weight:700;font-size:0.95rem}
+  .score-pill.prioritaire{background:rgba(248,81,73,0.15); color:var(--red);   border:1px solid rgba(248,81,73,0.3)}
+  .score-pill.secondaire {background:rgba(210,153,34,0.15);color:var(--orange);border:1px solid rgba(210,153,34,0.3)}
+  .score-pill.info       {background:rgba(72,79,88,0.2);   color:var(--muted); border:1px solid var(--border)}
+  .level-label{font-size:0.6rem;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;margin-top:3px;text-align:center}
   .level-label.prioritaire{color:var(--red)}.level-label.secondaire{color:var(--orange)}.level-label.info{color:var(--muted)}
-  .asset-name{font-weight:700;font-size:0.95rem;color:var(--text)}
-  .asset-tf{font-size:0.72rem;color:var(--text-dim);font-family:var(--mono);margin-top:2px}
-  .type-badge{display:inline-block;padding:3px 9px;border-radius:4px;font-size:0.72rem;font-weight:600;background:rgba(88,166,255,0.1);color:var(--blue);border:1px solid rgba(88,166,255,0.2);white-space:nowrap}
-  .price{font-family:var(--mono);font-weight:700;font-size:0.95rem;color:var(--gold)}
-  .side-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:4px;font-size:0.72rem;font-weight:700;text-transform:uppercase;letter-spacing:0.05em}
-  .side-badge.support{background:rgba(63,185,80,0.1);color:var(--green);border:1px solid rgba(63,185,80,0.25)}
-  .side-badge.resistance{background:rgba(248,81,73,0.1);color:var(--red);border:1px solid rgba(248,81,73,0.25)}
-  .scope{font-size:0.75rem;font-weight:600}
+
+  .asset-name{font-weight:700;font-size:0.92rem}
+  .asset-tf{font-size:0.7rem;color:var(--text-dim);font-family:var(--mono);margin-top:2px}
+  .type-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:0.7rem;font-weight:600;background:rgba(88,166,255,0.1);color:var(--blue);border:1px solid rgba(88,166,255,0.2);white-space:nowrap}
+  .price{font-family:var(--mono);font-weight:700;font-size:0.92rem;color:var(--gold)}
+  .side-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:4px;font-size:0.7rem;font-weight:700;text-transform:uppercase}
+  .side-badge.support   {background:rgba(63,185,80,0.1); color:var(--green);border:1px solid rgba(63,185,80,0.25)}
+  .side-badge.resistance{background:rgba(248,81,73,0.1); color:var(--red);  border:1px solid rgba(248,81,73,0.25)}
+  .scope{font-size:0.73rem;font-weight:600}
   .scope.pure{color:var(--gold)}.scope.non-pure{color:var(--muted)}
-  .time{font-family:var(--mono);font-size:0.72rem;color:var(--text-dim)}
-  .empty-state{padding:80px 20px;text-align:center}
-  .empty-state .icon{font-size:3rem;margin-bottom:16px;opacity:0.5}
-  .empty-state p{font-size:0.9rem;color:var(--text-dim)}
-  .empty-state .hint{font-size:0.75rem;color:var(--muted);margin-top:8px;font-family:var(--mono)}
+  .time{font-family:var(--mono);font-size:0.7rem;color:var(--text-dim)}
+
+  .empty-state{padding:72px 20px;text-align:center}
+  .empty-state .icon{font-size:2.8rem;margin-bottom:14px;opacity:0.45}
+  .empty-state p{font-size:0.88rem;color:var(--text-dim)}
+  .empty-state .hint{font-size:0.72rem;color:var(--muted);margin-top:8px;font-family:var(--mono)}
+
   @media(max-width:900px){
     .stats{grid-template-columns:repeat(2,1fr)}
     thead th:nth-child(n+6),td:nth-child(n+6){display:none}
-    header,main{padding:14px 16px}
+    header,nav,.main{padding-left:16px;padding-right:16px}
   }
 </style>
 </head>
@@ -76,27 +101,48 @@
   <div class="live-badge"><div class="live-dot"></div>LIVE</div>
 </header>
 
+<nav>
+  <a href="/" class="{% if page=='all' %}active-all{% endif %}">
+    📊 Global <span class="count">{{ (alerts|length) if page=='all' else (counts.xau + counts.solana + counts.dax) }}</span>
+  </a>
+  <a href="/xau" class="{% if page=='xau' %}active-xau{% endif %}">
+    🥇 XAU/USD <span class="count">{{ counts.xau }}</span>
+  </a>
+  <a href="/solana" class="{% if page=='solana' %}active-solana{% endif %}">
+    💎 Solana <span class="count">{{ counts.solana }}</span>
+  </a>
+  <a href="/dax" class="{% if page=='dax' %}active-dax{% endif %}">
+    🇩🇪 DAX <span class="count">{{ counts.dax }}</span>
+  </a>
+</nav>
+
 <div class="stats">
   <div class="stat">
-    <div class="stat-label">Alertes reçues</div>
-    <div class="stat-value gold">{{ alerts|length }}</div>
+    <div class="stat-label">Alertes affichées</div>
+    <div class="stat-value {% if page=='all' %}v-blue{% elif page=='xau' %}v-gold{% elif page=='solana' %}v-purple{% else %}v-green{% endif %}">{{ alerts|length }}</div>
   </div>
   <div class="stat">
-    <div class="stat-label">Prioritaires</div>
-    <div class="stat-value red">{{ alerts | selectattr('level', 'equalto', 'PRIORITAIRE') | list | length }}</div>
+    <div class="stat-label">🔴 Prioritaires</div>
+    <div class="stat-value v-red">{{ alerts | selectattr('level','equalto','PRIORITAIRE') | list | length }}</div>
   </div>
   <div class="stat">
-    <div class="stat-label">Secondaires</div>
-    <div class="stat-value orange">{{ alerts | selectattr('level', 'equalto', 'SECONDAIRE') | list | length }}</div>
+    <div class="stat-label">⚠️ Secondaires</div>
+    <div class="stat-value v-orange">{{ alerts | selectattr('level','equalto','SECONDAIRE') | list | length }}</div>
   </div>
   <div class="stat">
     <div class="stat-label">Dernière alerte</div>
-    <div class="stat-value dim">{% if alerts %}{{ alerts[0].timestamp[:19].replace('T',' ') }} UTC{% else %}—{% endif %}</div>
+    <div class="stat-value v-dim">{% if alerts %}{{ alerts[0].timestamp[:19].replace('T',' ') }} UTC{% else %}—{% endif %}</div>
   </div>
 </div>
 
 <div class="main">
-  <div class="section-title">Historique des alertes</div>
+  <div class="section-title">
+    {% if page=='xau' %}🥇 Alertes XAU/USD
+    {% elif page=='solana' %}💎 Alertes SOLUSDT.P
+    {% elif page=='dax' %}🇩🇪 Alertes DE30EUR
+    {% else %}📊 Toutes les alertes{% endif %}
+  </div>
+
   <div class="table-wrap">
     {% if alerts %}
     <table>
@@ -143,8 +189,12 @@
     </table>
     {% else %}
     <div class="empty-state">
-      <div class="icon">📡</div>
-      <p>En attente des alertes TradingView...</p>
+      <div class="icon">
+        {% if page=='xau' %}🥇{% elif page=='solana' %}💎{% elif page=='dax' %}🇩🇪{% else %}📡{% endif %}
+      </div>
+      <p>En attente des alertes
+        {% if page=='xau' %}XAU/USD{% elif page=='solana' %}SOLUSDT.P{% elif page=='dax' %}DE30EUR{% else %}TradingView{% endif %}...
+      </p>
       <p class="hint">Configure le webhook dans TradingView pour commencer</p>
     </div>
     {% endif %}
