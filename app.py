@@ -42,6 +42,8 @@ ASSET_META = {
 
 def get_asset_group(asset: str) -> str:
     """Retourne la catégorie d'un asset ou None"""
+    if not asset:
+        return None
     a = asset.upper().replace("-", "").replace(".", "").replace("/", "")
     for group, assets in ASSET_GROUPS.items():
         for ref in assets:
@@ -79,6 +81,29 @@ def parse_fiblab_message(raw: str) -> dict:
         "side": None, "price": None, "scope": None,
         "timestamp": datetime.utcnow().isoformat(),
     }
+    # ── Format ATR PROXIMITY (multiligne, pas de "—") ──
+    # Origin ATR PROXIMITY\nTF: 2D\nSide: Support\nOrigin entry nearby: 55.555\nDistance: 3.56x ATR\nATR: 5.2
+    if raw.startswith("Origin ATR PROXIMITY") or raw.startswith("ATR PROXIMITY"):
+        result["type"] = "ATR Proximity"
+
+        m = re.search(r'TF:\s*([^\n\r|]+)', raw, re.IGNORECASE)
+        if m:
+            tf_raw = m.group(1).strip().upper()
+            result["timeframe"] = normalize_timeframe(tf_raw)
+
+        m = re.search(r'Side:\s*(Support|Resistance)', raw, re.IGNORECASE)
+        if m: result["side"] = m.group(1).capitalize()
+
+        # Prix = "Origin entry nearby"
+        m = re.search(r'Origin entry nearby:\s*([\d.]+)', raw, re.IGNORECASE)
+        if m: result["price"] = float(m.group(1))
+
+        # Pas d'asset dans le message ATR → on le laisse None
+        # L'asset sera déduit du chart TradingView si possible
+        result["scope"] = "Pure"   # ATR Proximity = toujours sur Origin Untouched Pure
+        return result
+
+    # ── Format standard (avec "—") ──
     if "—" in raw:
         parts = raw.split("—", 1)
         result["type"] = parts[0].strip()
@@ -175,12 +200,14 @@ def send_telegram(message: str, chat_id: str = None):
 
 
 def format_telegram_message(parsed: dict, scoring: dict) -> str:
-    asset = parsed.get("asset", "?")
-    group = get_asset_group(asset)
-    meta  = ASSET_META.get(group, {"emoji": "📊", "label": asset})
+    asset  = parsed.get("asset") or None
+    group  = get_asset_group(asset) if asset else None
+    meta   = ASSET_META.get(group, {"emoji": "📡", "label": asset or "?"})
+    is_atr = "atr" in (parsed.get("type") or "").lower()
 
     side_emoji = "🟢" if parsed.get("side") == "Support" else "🔴"
     scope_tag  = "✅ Pure" if parsed.get("scope") == "Pure" else "⬜ Non-Pure"
+    asset_display = f"{meta['emoji']} {asset}" if asset else f"{meta['emoji']} voir chart"
     action = (
         "→ Surveille M1 maintenant\n→ Setup <b>LONG</b> potentiel\n→ SL visé : 5-10 pts"
         if parsed.get("side") == "Support" else
@@ -190,9 +217,9 @@ def format_telegram_message(parsed: dict, scoring: dict) -> str:
     msg = (
         f"{scoring['emoji']} <b>ALERTE {scoring['level']} — Score {scoring['score']}/15</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Asset    : <b>{meta['emoji']} {asset}</b>\n"
+        f"Asset    : <b>{asset_display}</b>\n"
         f"Niveau   : <b>{parsed.get('price', '?')}</b>\n"
-        f"Type     : {parsed.get('type', '?')}\n"
+        f"Type     : {'📡 ' if is_atr else ''}{parsed.get('type', '?')}\n"
         f"TF       : {parsed.get('timeframe', '?')}\n"
         f"Side     : {side_emoji} {parsed.get('side', '?')}\n"
         f"Scope    : {scope_tag}\n"
