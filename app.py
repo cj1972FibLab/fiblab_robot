@@ -28,6 +28,33 @@ alert_history = deque(maxlen=50)
 # ─────────────────────────────────────────────
 # PARSER — Fib Lab message → dict structuré
 # ─────────────────────────────────────────────
+def normalize_timeframe(tf: str) -> str:
+    """
+    Convertit les timeframes numériques TradingView en labels lisibles.
+    TradingView envoie des minutes brutes : 60 = H1, 240 = H4, 1440 = D1, etc.
+    """
+    numeric_map = {
+        "1":    "M1",
+        "3":    "M3",
+        "5":    "M5",
+        "10":   "M10",
+        "15":   "M15",
+        "30":   "M30",
+        "45":   "M45",
+        "60":   "H1",
+        "120":  "H2",
+        "180":  "H3",
+        "240":  "H4",
+        "360":  "H6",
+        "480":  "H8",
+        "720":  "H12",
+        "1440": "D1",
+        "10080":"W1",
+        "43200":"MN",
+    }
+    return numeric_map.get(tf, tf)
+
+
 def parse_fiblab_message(raw: str) -> dict:
     """
     Exemples gérés :
@@ -58,11 +85,13 @@ def parse_fiblab_message(raw: str) -> dict:
         # Format "Origin Broken: Origin BSUT Created — ..."
         rest = raw
 
-    # Asset + Timeframe (ex: XAUUSD 30S  ou  BTCUSDT H4)
-    asset_tf = re.search(r'([A-Z0-9./]+)\s+([0-9]+[SMHD]|Daily|Weekly|Monthly)', rest, re.IGNORECASE)
+    # Asset + Timeframe
+    # Gère : XAUUSD 30S, BTCUSDT H4, XAUUSD 60, XAUUSD 1440, etc.
+    asset_tf = re.search(r'([A-Z0-9./]+)\s+([0-9]+[SMHD]?|Daily|Weekly|Monthly)', rest, re.IGNORECASE)
     if asset_tf:
-        result["asset"]     = asset_tf.group(1).upper()
-        result["timeframe"] = asset_tf.group(2).upper()
+        result["asset"] = asset_tf.group(1).upper()
+        raw_tf = asset_tf.group(2).upper()
+        result["timeframe"] = normalize_timeframe(raw_tf)
 
     # Side
     side_match = re.search(r'Side:\s*(Support|Resistance)', rest, re.IGNORECASE)
@@ -88,14 +117,19 @@ def parse_fiblab_message(raw: str) -> dict:
 
 # Poids des timeframes pour le scoring
 TF_WEIGHT = {
-    "1M": 0, "3M": 0, "5M": 0, "15M": 0, "30S": 0, "1S": 0,
-    "30": 0,
-    "1H": 1, "2H": 1,
-    "4H": 2, "H4": 2,
-    "8H": 2, "H8": 2,
-    "12H": 2, "H12": 2,
-    "1D": 3, "D": 3, "DAILY": 3,
-    "1W": 3, "W": 3, "WEEKLY": 3,
+    # Petits TF — pas de bonus
+    "M1": 0, "M3": 0, "M5": 0, "M10": 0, "M15": 0, "M30": 0, "M45": 0,
+    "1M": 0, "3M": 0, "5M": 0, "15M": 0, "30M": 0,
+    "30S": 0, "1S": 0,
+    # H1/H2 — bonus léger
+    "H1": 1, "H2": 1, "1H": 1, "2H": 1,
+    # H3/H4/H6/H8/H12 — bonus moyen
+    "H3": 2, "H4": 2, "H6": 2, "H8": 2, "H12": 2,
+    "4H": 2, "8H": 2, "12H": 2,
+    # Daily/Weekly — bonus fort
+    "D1": 3, "1D": 3, "D": 3, "DAILY": 3,
+    "W1": 3, "1W": 3, "W": 3, "WEEKLY": 3,
+    "MN": 3, "MONTHLY": 3,
 }
 
 TYPE_SCORES = {
