@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FibLab Robot — Dashboard</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
+
+  :root {
+    --bg: #0a0b0f;
+    --surface: #12141a;
+    --border: #1e2130;
+    --gold: #f0b429;
+    --green: #22c55e;
+    --red: #ef4444;
+    --orange: #f97316;
+    --muted: #4a5568;
+    --text: #e2e8f0;
+    --text-dim: #718096;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+    padding: 24px;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 32px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.5rem;
+    color: var(--gold);
+    letter-spacing: -0.02em;
+  }
+
+  .logo span { color: var(--text-dim); font-weight: 400; font-size: 0.9rem; margin-left: 10px; }
+
+  .status-dot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.75rem;
+    color: var(--green);
+  }
+
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .stat-card .label {
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 8px;
+  }
+
+  .stat-card .value {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.8rem;
+    font-weight: 800;
+    color: var(--gold);
+  }
+
+  .alerts-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--text-dim);
+    margin-bottom: 16px;
+  }
+
+  .alert-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .alert-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    display: grid;
+    grid-template-columns: 60px 1fr auto auto auto;
+    align-items: center;
+    gap: 16px;
+    transition: border-color 0.2s;
+  }
+
+  .alert-card:hover { border-color: var(--gold); }
+
+  .alert-card.prioritaire { border-left: 3px solid var(--red); }
+  .alert-card.secondaire  { border-left: 3px solid var(--orange); }
+  .alert-card.info        { border-left: 3px solid var(--muted); }
+
+  .score-badge {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.4rem;
+    text-align: center;
+  }
+
+  .score-badge.prioritaire { color: var(--red); }
+  .score-badge.secondaire  { color: var(--orange); }
+  .score-badge.info        { color: var(--muted); }
+
+  .alert-main .asset {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text);
+  }
+
+  .alert-main .type {
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin-top: 3px;
+  }
+
+  .price {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--gold);
+    text-align: right;
+  }
+
+  .side-badge {
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .side-badge.support    { background: rgba(34,197,94,0.15);  color: var(--green); }
+  .side-badge.resistance { background: rgba(239,68,68,0.15);  color: var(--red);   }
+
+  .scope-badge {
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    text-align: right;
+  }
+
+  .scope-badge.pure { color: var(--gold); }
+
+  .empty {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+
+  .empty .icon { font-size: 2.5rem; margin-bottom: 12px; }
+
+  @media (max-width: 600px) {
+    .alert-card {
+      grid-template-columns: 50px 1fr;
+      grid-template-rows: auto auto;
+    }
+    .side-badge, .scope-badge { display: none; }
+    .price { grid-column: 2; text-align: left; font-size: 0.9rem; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">FibLab Robot <span>by Charlie Joe</span></div>
+  </div>
+  <div class="status-dot">
+    <div class="dot"></div>
+    LIVE
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="label">Alertes reçues</div>
+    <div class="value">{{ alerts|length }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Prioritaires</div>
+    <div class="value" style="color: var(--red)">
+      {{ alerts | selectattr('level', 'equalto', 'PRIORITAIRE') | list | length }}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Secondaires</div>
+    <div class="value" style="color: var(--orange)">
+      {{ alerts | selectattr('level', 'equalto', 'SECONDAIRE') | list | length }}
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Dernière alerte</div>
+    <div class="value" style="font-size:0.85rem; padding-top:6px; color: var(--text-dim)">
+      {% if alerts %}{{ alerts[0].timestamp[:19].replace('T', ' ') }}{% else %}—{% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="alerts-title">Historique des alertes</div>
+
+<div class="alert-list">
+{% if alerts %}
+  {% for a in alerts %}
+  <div class="alert-card {{ a.level|lower }}">
+    <div class="score-badge {{ a.level|lower }}">{{ a.score }}</div>
+    <div class="alert-main">
+      <div class="asset">{{ a.asset or '?' }} <span style="color:var(--muted); font-size:0.8rem">{{ a.timeframe or '' }}</span></div>
+      <div class="type">{{ a.type or '?' }}</div>
+    </div>
+    <div class="price">{{ a.price or '?' }}</div>
+    <div class="side-badge {{ (a.side or '')|lower }}">{{ a.side or '?' }}</div>
+    <div class="scope-badge {{ (a.scope or '')|lower }}">{{ a.scope or '' }}</div>
+  </div>
+  {% endfor %}
+{% else %}
+  <div class="empty">
+    <div class="icon">📡</div>
+    En attente des alertes TradingView...
+  </div>
+{% endif %}
+</div>
+
+</body>
+</html>
