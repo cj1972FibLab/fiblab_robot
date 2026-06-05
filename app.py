@@ -16,94 +16,103 @@ from collections import deque
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────
-# CONFIGURATION — Variables Railway
+# CONFIGURATION
 # ─────────────────────────────────────────────
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")      # Charlie — toutes alertes
-TELEGRAM_CHAT_ID_2 = os.environ.get("TELEGRAM_CHAT_ID_2", "")   # Frère — PRIORITAIRES uniquement
-
-# État global
-robot_state = {"paused": False}
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID_2 = os.environ.get("TELEGRAM_CHAT_ID_2", "")
 
 # ─────────────────────────────────────────────
-# ASSETS PAR CATÉGORIE
+# ÉTAT GLOBAL
+# ─────────────────────────────────────────────
+robot_state = {
+    "paused": False,
+    "mode": "swing",  # swing | scalp | both
+    "tf_custom": {    # TF non-standard activables manuellement
+        "72": False, "90": False, "96": False,
+        "144": False, "160": False, "288": False,
+    }
+}
+
+# ─────────────────────────────────────────────
+# ASSETS
 # ─────────────────────────────────────────────
 ASSET_GROUPS = {
     "xau":    {"XAUUSD", "XAU/USD", "GOLD", "GC1!", "MGC1!"},
-    "solana": {"SOLUSDT", "SOL/USD", "SOLUSDT.P", "SOLUSD"},
     "dax":    {"DE30EUR", "GER30", "DAX40", "FDAX1!", "DE30", "GER40", "DAX"},
+    "solana": {"SOLUSDT", "SOL/USD", "SOLUSDT.P", "SOLUSD"},
+    "btc":    {"BTCUSDT", "BTC/USD", "BTCUSDT.P", "BTCUSD", "BTCUSDTP"},
+    "stocks": {"TSLA","HOOD","CELH","TTD","PLTR","AMZN","NVDA",
+               "AAPL","META","GOOGL","MSFT","SOFI"},
 }
 
 ASSET_META = {
-    "xau":    {"label": "XAU/USD",  "emoji": "🥇", "color": "#f5a623", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD"},
-    "solana": {"label": "SOLANA",   "emoji": "💎", "color": "#a78bfa", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:SOLUSDT.P"},
-    "dax":    {"label": "DAX",      "emoji": "🇩🇪", "color": "#3fb950", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:DE30EUR"},
+    "xau":    {"label":"XAU/USD",   "emoji":"🥇", "tv":"https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD"},
+    "dax":    {"label":"DAX",       "emoji":"🇩🇪", "tv":"https://www.tradingview.com/chart/?symbol=OANDA:DE30EUR"},
+    "solana": {"label":"SOLANA",    "emoji":"💎", "tv":"https://www.tradingview.com/chart/?symbol=BITGET:SOLUSDT.P"},
+    "btc":    {"label":"BITCOIN",   "emoji":"₿",  "tv":"https://www.tradingview.com/chart/?symbol=BITGET:BTCUSDT.P"},
+    "stocks": {"label":"STOCKS",    "emoji":"📈", "tv":"https://www.tradingview.com/chart/?symbol=NASDAQ:"},
 }
 
 def get_asset_group(asset: str) -> str:
-    """Retourne la catégorie d'un asset ou None"""
-    if not asset:
-        return None
-    a = asset.upper().replace("-", "").replace(".", "").replace("/", "")
+    if not asset: return None
+    a = asset.upper().replace("-","").replace(".","").replace("/","")
     for group, assets in ASSET_GROUPS.items():
         for ref in assets:
             if a == ref.upper().replace("-","").replace(".","").replace("/",""):
                 return group
     return None
 
+def get_tv_link(asset: str, group: str) -> str:
+    if not group: return ""
+    meta = ASSET_META.get(group, {})
+    tv = meta.get("tv", "")
+    # Pour les stocks, on ajoute le ticker directement
+    if group == "stocks" and asset:
+        return f"https://www.tradingview.com/chart/?symbol=NASDAQ:{asset}"
+    return tv
+
 # Historiques
 alert_history = deque(maxlen=200)
-histories = {
-    "xau":    deque(maxlen=100),
-    "solana": deque(maxlen=100),
-    "dax":    deque(maxlen=100),
-}
-
+histories = {g: deque(maxlen=100) for g in ASSET_GROUPS}
 
 # ─────────────────────────────────────────────
 # PARSER
 # ─────────────────────────────────────────────
 def normalize_timeframe(tf: str) -> str:
     numeric_map = {
-        "1": "M1", "3": "M3", "5": "M5", "10": "M10",
-        "15": "M15", "30": "M30", "45": "M45",
-        "60": "H1", "120": "H2", "180": "H3", "240": "H4",
-        "360": "H6", "480": "H8", "720": "H12",
-        "1440": "D1", "10080": "W1", "43200": "MN",
+        "1":"M1","2":"M2","3":"M3","4":"M4","5":"M5","10":"M10",
+        "15":"M15","30":"M30","45":"M45",
+        "60":"H1","120":"H2","180":"H3","240":"H4",
+        "360":"H6","480":"H8","720":"H12",
+        "1440":"D1","10080":"W1","43200":"MN",
+        # TF non-standard — gardés tels quels pour filtrage manuel
+        "72":"72m","90":"90m","96":"96m",
+        "144":"144m","160":"160m","288":"288m",
     }
     return numeric_map.get(tf, tf)
 
 
 def parse_fiblab_message(raw: str) -> dict:
     result = {
-        "raw": raw.strip(),
-        "type": None, "asset": None, "timeframe": None,
-        "side": None, "price": None, "scope": None,
-        "timestamp": datetime.utcnow().isoformat(),
+        "raw": raw.strip(), "type": None, "asset": None,
+        "timeframe": None, "side": None, "price": None,
+        "scope": None, "timestamp": datetime.utcnow().isoformat(),
     }
-    # ── Format ATR PROXIMITY (multiligne, pas de "—") ──
-    # Origin ATR PROXIMITY\nTF: 2D\nSide: Support\nOrigin entry nearby: 55.555\nDistance: 3.56x ATR\nATR: 5.2
-    if raw.startswith("Origin ATR PROXIMITY") or raw.startswith("ATR PROXIMITY"):
+
+    # Format ATR PROXIMITY multiligne
+    if "ATR PROXIMITY" in raw.upper():
         result["type"] = "ATR Proximity"
-
         m = re.search(r'TF:\s*([^\n\r|]+)', raw, re.IGNORECASE)
-        if m:
-            tf_raw = m.group(1).strip().upper()
-            result["timeframe"] = normalize_timeframe(tf_raw)
-
+        if m: result["timeframe"] = normalize_timeframe(m.group(1).strip().upper())
         m = re.search(r'Side:\s*(Support|Resistance)', raw, re.IGNORECASE)
         if m: result["side"] = m.group(1).capitalize()
-
-        # Prix = "Origin entry nearby"
         m = re.search(r'Origin entry nearby:\s*([\d.]+)', raw, re.IGNORECASE)
         if m: result["price"] = float(m.group(1))
-
-        # Pas d'asset dans le message ATR → on le laisse None
-        # L'asset sera déduit du chart TradingView si possible
-        result["scope"] = "Pure"   # ATR Proximity = toujours sur Origin Untouched Pure
+        result["scope"] = "Pure"
         return result
 
-    # ── Format standard (avec "—") ──
+    # Format standard avec "—"
     if "—" in raw:
         parts = raw.split("—", 1)
         result["type"] = parts[0].strip()
@@ -111,17 +120,19 @@ def parse_fiblab_message(raw: str) -> dict:
     else:
         rest = raw
 
-    asset_tf = re.search(r'([A-Z0-9./]+)\s+([0-9]+[SMHD]?|[HMD][0-9]+|Daily|Weekly|Monthly)', rest, re.IGNORECASE)
+    # Asset + TF : gère XAUUSD H4, XAUUSD 240, SOLUSDT.P 2D etc.
+    asset_tf = re.search(
+        r'([A-Z0-9./]+)\s+([0-9]+[SMHD]?|[HMD][0-9]+|Daily|Weekly|Monthly)',
+        rest, re.IGNORECASE
+    )
     if asset_tf:
         result["asset"] = asset_tf.group(1).upper()
         result["timeframe"] = normalize_timeframe(asset_tf.group(2).upper())
 
     m = re.search(r'Side:\s*(Support|Resistance)', rest, re.IGNORECASE)
     if m: result["side"] = m.group(1).capitalize()
-
     m = re.search(r'Price:\s*([\d.]+)', rest)
     if m: result["price"] = float(m.group(1))
-
     m = re.search(r'Scope:\s*(Pure|Non-Pure)', rest, re.IGNORECASE)
     if m: result["scope"] = m.group(1)
 
@@ -132,20 +143,21 @@ def parse_fiblab_message(raw: str) -> dict:
 # SCORING
 # ─────────────────────────────────────────────
 TF_WEIGHT = {
-    "M1":0,"M3":0,"M5":0,"M10":0,"M15":0,"M30":0,"M45":0,
-    "1M":0,"3M":0,"5M":0,"15M":0,"30M":0,"30S":0,"1S":0,
-    "H1":1,"H2":1,"1H":1,"2H":1,
-    "H3":2,"H4":2,"H6":2,"H8":2,"H12":2,"4H":2,"8H":2,"12H":2,
-    "D1":3,"1D":3,"D":3,"DAILY":3,
-    "W1":3,"1W":3,"W":3,"WEEKLY":3,"MN":3,"MONTHLY":3,
+    "M1":0,"M2":0,"M3":0,"M4":0,"M5":1,"M10":1,"M15":1,"M30":1,"M45":1,
+    "H1":2,"H2":2,"H3":2,
+    "H4":3,"H6":3,"H8":3,"H12":3,
+    "D1":4,"1D":4,"D":4,"DAILY":4,
+    "W1":4,"1W":4,"W":4,"WEEKLY":4,"MN":4,"MONTHLY":4,
+    # TF custom
+    "72m":1,"90m":1,"96m":1,"144m":2,"160m":2,"288m":2,
 }
 
 TYPE_SCORES = {
-    "origin untouched":5, "origin first touch":4,
-    "broken origin first touch":4, "broken first touch":3,
-    "break first touch":3, "break created":2,
-    "origin broken":2, "bsut created":2,
-    "atr proximity":3, "origin touched":1,
+    "origin untouched":5,"origin first touch":4,
+    "broken origin first touch":4,"broken first touch":3,
+    "break first touch":3,"atr proximity":3,
+    "break created":2,"origin broken":2,"bsut created":2,
+    "origin touched":1,
 }
 
 def compute_score(parsed: dict) -> dict:
@@ -164,7 +176,7 @@ def compute_score(parsed: dict) -> dict:
         score += 2
         details.append("Scope Pure → +2")
 
-    tf_score = TF_WEIGHT.get(tf, 0)
+    tf_score = TF_WEIGHT.get(tf, TF_WEIGHT.get(tf.lower(), 0))
     if tf_score > 0:
         score += tf_score
         details.append(f"Timeframe {tf} → +{tf_score}")
@@ -181,71 +193,75 @@ def compute_score(parsed: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
-# FILTRES ALERTES
+# FILTRES
 # ─────────────────────────────────────────────
+TF_SWING  = {"H4","H6","H8","H12","D1","D2","D3","D4","D5","D6","D7",
+             "W1","MN","1D","2D","3D","4D","5D","6D","7D","1W","4H","8H","12H"}
+TF_SCALP  = {"M1","M2","M3","M4","M5","M10","M15","M30","M45","H1","H2","H3","H4","4H"}
+TF_CUSTOM = {"72m","90m","96m","144m","160m","288m"}
 
-# TF minimum pour recevoir une notification
-TF_MINIMUM = {"H4","H6","H8","H12","D1","D2","D3","D4","D5","D6","D7","W1","MN",
-               "4H","8H","12H","1D","2D","3D","4D","5D","6D","7D","1W"}
+TF_DAILY  = {"D1","D2","D3","D4","D5","D6","D7","1D","2D","3D","4D","5D","6D","7D","W1","MN","1W"}
 
-# Types toujours notifiés (H4+)
-TYPES_ALWAYS = {
-    "origin first touch", "origin untouched",
-    "atr proximity",
-    "break first touch", "broken first touch",
-    "broken origin first touch",
-}
+TYPES_ALWAYS      = {"origin first touch","origin untouched","atr proximity",
+                     "break first touch","broken first touch","broken origin first touch"}
+TYPES_DAILY_ONLY  = {"origin touched"}
+TYPES_SCORE_MIN   = {"bsut created": 6}
+TYPES_IGNORED     = {"break created"}
 
-# Types notifiés seulement si Daily+
-TF_DAILY = {"D1","D2","D3","D4","D5","D6","D7","1D","2D","3D","4D","5D","6D","7D","W1","MN","1W"}
-TYPES_DAILY_ONLY = {"origin touched"}
-
-# Types notifiés seulement si score 6+
-TYPES_SCORE_MIN = {"bsut created": 6}
-
-# Types toujours ignorés
-TYPES_IGNORED = {"break created"}
-
-def should_notify(parsed: dict, scoring: dict) -> tuple[bool, str]:
-    """Retourne (notifier, raison_si_non)"""
+def should_notify(parsed: dict, scoring: dict) -> tuple:
     alert_type = (parsed.get("type") or "").lower()
     tf = (parsed.get("timeframe") or "").upper()
+    tf_lower = tf.lower()
+    mode = robot_state["mode"]
 
-    # 1. TF minimum H4
-    if tf not in TF_MINIMUM:
-        return False, f"TF '{tf}' < H4 — ignoré"
+    # TF custom (72m, 90m...) — vérifie si activé manuellement
+    if tf_lower in TF_CUSTOM:
+        key = tf_lower.replace("m","")
+        if not robot_state["tf_custom"].get(key, False):
+            return False, f"TF custom '{tf}' désactivé — /tf_on {key} pour activer"
+        # Si activé, on continue le filtrage normal
 
-    # 2. Types ignorés
+    # Filtre selon le mode
+    elif mode == "swing" and tf not in TF_SWING:
+        return False, f"Mode SWING : TF '{tf}' ignoré"
+    elif mode == "scalp" and tf not in TF_SCALP:
+        return False, f"Mode SCALP : TF '{tf}' ignoré"
+    elif mode == "both" and tf not in TF_SWING | TF_SCALP:
+        return False, f"TF '{tf}' non reconnu"
+
+    # Types ignorés
     for ignored in TYPES_IGNORED:
         if ignored in alert_type:
             return False, f"Type '{alert_type}' ignoré"
 
-    # 3. Types score minimum
+    # Types score minimum
     for t, min_score in TYPES_SCORE_MIN.items():
         if t in alert_type:
             if scoring["score"] < min_score:
-                return False, f"Type '{alert_type}' score {scoring['score']} < {min_score}"
+                return False, f"BSUT score {scoring['score']} < {min_score}"
             return True, "ok"
 
-    # 4. Types Daily+ seulement
+    # Origin Touched → Daily+ seulement
     for t in TYPES_DAILY_ONLY:
         if t in alert_type:
             if tf not in TF_DAILY:
-                return False, f"Type '{alert_type}' nécessite Daily+ (TF={tf})"
+                return False, f"Origin Touched nécessite Daily+ (TF={tf})"
             return True, "ok"
 
-    # 5. Types toujours notifiés (H4+)
+    # Types toujours notifiés
     for t in TYPES_ALWAYS:
         if t in alert_type:
             return True, "ok"
 
-    # 6. Autres types non listés → on notifie si score 5+
     if scoring["score"] >= 5:
         return True, "ok"
 
     return False, f"Score {scoring['score']} insuffisant"
 
 
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
 def send_telegram(message: str, chat_id: str = None):
     if not TELEGRAM_TOKEN: return False
     target = chat_id or TELEGRAM_CHAT_ID
@@ -267,9 +283,10 @@ def format_telegram_message(parsed: dict, scoring: dict) -> str:
     group  = get_asset_group(asset) if asset else None
     meta   = ASSET_META.get(group, {"emoji": "📡", "label": asset or "?"})
     is_atr = "atr" in (parsed.get("type") or "").lower()
+    tv_link = get_tv_link(asset, group)
 
-    side_emoji = "🟢" if parsed.get("side") == "Support" else "🔴"
-    scope_tag  = "✅ Pure" if parsed.get("scope") == "Pure" else "⬜ Non-Pure"
+    side_emoji    = "🟢" if parsed.get("side") == "Support" else "🔴"
+    scope_tag     = "✅ Pure" if parsed.get("scope") == "Pure" else "⬜ Non-Pure"
     asset_display = f"{meta['emoji']} {asset}" if asset else f"{meta['emoji']} voir chart"
     action = (
         "→ Surveille M1 maintenant\n→ Setup <b>LONG</b> potentiel\n→ SL visé : 5-10 pts"
@@ -286,16 +303,14 @@ def format_telegram_message(parsed: dict, scoring: dict) -> str:
         f"TF       : {parsed.get('timeframe', '?')}\n"
         f"Side     : {side_emoji} {parsed.get('side', '?')}\n"
         f"Scope    : {scope_tag}\n"
+        f"Mode     : {robot_state['mode'].upper()}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Scoring :\n"
     )
     for d in scoring["details"]:
         msg += f"  • {d}\n"
 
-    # Lien TradingView
-    tv_link = meta.get("tv", "")
     tv_line = f"\n📈 <a href='{tv_link}'>Ouvrir le chart</a>" if tv_link else ""
-
     msg += (
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Action :\n{action}\n"
@@ -310,53 +325,96 @@ def format_telegram_message(parsed: dict, scoring: dict) -> str:
 # COMMANDES TELEGRAM
 # ─────────────────────────────────────────────
 def handle_telegram_command(text: str, chat_id: str):
-    cmd = text.strip().lower().split()[0]
+    parts = text.strip().lower().split()
+    cmd   = parts[0]
+    arg   = parts[1] if len(parts) > 1 else ""
 
-    if cmd == "/status":
+    # /mode swing|scalp|both
+    if cmd == "/mode":
+        if arg in ("swing","scalp","both"):
+            robot_state["mode"] = arg
+            labels = {"swing":"🔵 SWING (H4+)","scalp":"⚡ SCALP (M5-H3)","both":"🌐 BOTH (tout)"}
+            msg = f"✅ Mode changé → <b>{labels[arg]}</b>"
+        else:
+            msg = "Usage : /mode swing | /mode scalp | /mode both"
+
+    # /tf_on 72
+    elif cmd == "/tf_on":
+        if arg in robot_state["tf_custom"]:
+            robot_state["tf_custom"][arg] = True
+            msg = f"✅ TF <b>{arg}m</b> activé"
+        else:
+            msg = f"TF '{arg}' inconnu. Disponibles : 72 90 96 144 160 288"
+
+    # /tf_off 72
+    elif cmd == "/tf_off":
+        if arg in robot_state["tf_custom"]:
+            robot_state["tf_custom"][arg] = False
+            msg = f"⛔ TF <b>{arg}m</b> désactivé"
+        else:
+            msg = f"TF '{arg}' inconnu. Disponibles : 72 90 96 144 160 288"
+
+    # /tf_status
+    elif cmd == "/tf_status":
+        actifs   = [k for k,v in robot_state["tf_custom"].items() if v]
+        inactifs = [k for k,v in robot_state["tf_custom"].items() if not v]
+        msg = (
+            f"📊 <b>TF non-standard</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Actifs   : {', '.join(actifs) if actifs else 'aucun'}\n"
+            f"⛔ Inactifs : {', '.join(inactifs)}\n\n"
+            f"Mode actuel : <b>{robot_state['mode'].upper()}</b>"
+        )
+
+    elif cmd == "/status":
         etat = "⏸ EN PAUSE" if robot_state["paused"] else "✅ ACTIF"
+        tf_on = [k for k,v in robot_state["tf_custom"].items() if v]
         msg = (
             f"🤖 <b>FibLab Robot</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"État      : {etat}\n"
-            f"Total     : {len(alert_history)} alertes\n"
-            f"🥇 XAU    : {len(histories['xau'])}\n"
-            f"💎 Solana : {len(histories['solana'])}\n"
-            f"🇩🇪 DAX   : {len(histories['dax'])}\n"
+            f"État   : {etat}\n"
+            f"Mode   : <b>{robot_state['mode'].upper()}</b>\n"
+            f"TF+    : {', '.join(tf_on) if tf_on else 'aucun'}\n"
+            f"Total  : {len(alert_history)} alertes\n"
+            f"🥇 XAU : {len(histories['xau'])}\n"
+            f"💎 SOL : {len(histories['solana'])}\n"
+            f"₿ BTC  : {len(histories['btc'])}\n"
+            f"🇩🇪 DAX: {len(histories['dax'])}\n"
+            f"📈 STK : {len(histories['stocks'])}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"/pause /reprendre /derniere\n"
-            f"/xau /solana /dax"
+            f"/mode swing|scalp|both\n"
+            f"/tf_on 72 | /tf_off 72 | /tf_status"
         )
 
     elif cmd == "/pause":
         robot_state["paused"] = True
-        msg = "⏸ Robot mis en <b>pause</b> — plus de notifications."
+        msg = "⏸ Robot mis en <b>pause</b>"
 
     elif cmd == "/reprendre":
         robot_state["paused"] = False
-        msg = "✅ Robot <b>réactivé</b> — notifications reprises."
+        msg = f"✅ Robot <b>réactivé</b> — Mode {robot_state['mode'].upper()}"
 
-    elif cmd in ("/derniere", "/xau", "/solana", "/dax"):
-        key = {"derniere": None, "xau": "xau", "solana": "solana", "dax": "dax"}[cmd[1:]]
+    elif cmd in ("/derniere","/xau","/solana","/dax","/btc","/stocks"):
+        key = cmd[1:] if cmd[1:] in histories else None
         hist = histories[key] if key else alert_history
-        labels = {"xau":"🥇 XAU", "solana":"💎 Solana", "dax":"🇩🇪 DAX"}
+        labels = {"xau":"🥇 XAU","solana":"💎 Solana","dax":"🇩🇪 DAX","btc":"₿ BTC","stocks":"📈 Stocks"}
         prefix = labels.get(key, "📊 Toutes")
         if hist:
-            a = hist[0]
+            a  = hist[0]
             sc = {"score":a.get("score",0),"level":a.get("level",""),"emoji":a.get("emoji",""),"details":a.get("details",[])}
-            msg = f"🔁 <b>Dernière alerte {prefix} :</b>\n\n" + format_telegram_message(a, sc)
+            msg = f"🔁 <b>Dernière {prefix} :</b>\n\n" + format_telegram_message(a, sc)
         else:
             msg = f"📭 Aucune alerte {prefix} pour l'instant."
 
     else:
         msg = (
-            "🤖 <b>Commandes disponibles :</b>\n\n"
-            "/status → état du robot\n"
-            "/pause → suspendre\n"
-            "/reprendre → réactiver\n"
-            "/derniere → dernière alerte\n"
-            "/xau → dernière alerte XAU\n"
-            "/solana → dernière alerte SOL\n"
-            "/dax → dernière alerte DAX"
+            "🤖 <b>Commandes :</b>\n\n"
+            "/status\n"
+            "/mode swing | scalp | both\n"
+            "/tf_on 72 | /tf_off 72\n"
+            "/tf_status\n"
+            "/pause | /reprendre\n"
+            "/derniere | /xau | /solana | /btc | /dax | /stocks"
         )
 
     send_telegram(msg, chat_id)
@@ -365,18 +423,17 @@ def handle_telegram_command(text: str, chat_id: str):
 # ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw = request.get_data(as_text=True).strip()
     if raw.startswith("{"):
         try:
             data = json.loads(raw)
-            raw = data.get("message", data.get("text", raw))
+            raw  = data.get("message", data.get("text", raw))
         except Exception:
             pass
 
-    print(f"[WEBHOOK] Reçu : {raw}")
+    print(f"[WEBHOOK] Reçu : {raw[:100]}")
     if not raw:
         return jsonify({"error": "empty body"}), 400
 
@@ -384,41 +441,27 @@ def webhook():
     scoring = compute_score(parsed)
     entry   = {**parsed, **scoring}
 
-    # Historique global
     alert_history.appendleft(entry)
-
-    # Historique par groupe
     group = get_asset_group(parsed.get("asset") or "")
-    if group:
+    if group and group in histories:
         histories[group].appendleft(entry)
 
-    # Pause ?
     if robot_state["paused"]:
-        print("[WEBHOOK] Robot en pause — pas de Telegram")
-        return jsonify({"status": "paused", "parsed": parsed, "scoring": scoring}), 200
+        return jsonify({"status": "paused"}), 200
 
-    # ── FILTRE INTELLIGENT ──
     notify, reason = should_notify(parsed, scoring)
     if not notify:
         print(f"[WEBHOOK] Filtré : {reason}")
-        return jsonify({"status": "filtered", "reason": reason, "parsed": parsed}), 200
+        return jsonify({"status": "filtered", "reason": reason}), 200
 
     tg_msg = format_telegram_message(parsed, scoring)
-
-    # Charlie reçoit tout
     sent_charlie = send_telegram(tg_msg, TELEGRAM_CHAT_ID)
-
-    # Frère reçoit les PRIORITAIRES uniquement
-    sent_frere = False
+    sent_frere   = False
     if TELEGRAM_CHAT_ID_2 and scoring["level"] == "PRIORITAIRE":
         sent_frere = send_telegram(tg_msg, TELEGRAM_CHAT_ID_2)
 
-    print(f"[WEBHOOK] Score={scoring['score']} Level={scoring['level']} Group={group} Charlie={'✅' if sent_charlie else '❌'} Frère={'✅' if sent_frere else '❌'}")
-
-    return jsonify({
-        "status": "ok", "parsed": parsed, "scoring": scoring,
-        "group": group, "telegram_charlie": sent_charlie, "telegram_frere": sent_frere,
-    }), 200
+    print(f"[WEBHOOK] {scoring['level']} Score={scoring['score']} TF={parsed.get('timeframe')} Group={group} Charlie={'✅' if sent_charlie else '❌'}")
+    return jsonify({"status":"ok","scoring":scoring,"group":group,"telegram_sent":sent_charlie}), 200
 
 
 @app.route("/telegram_update", methods=["POST"])
@@ -439,67 +482,71 @@ def telegram_update():
 def status():
     return jsonify({
         "status": "paused" if robot_state["paused"] else "running",
+        "mode": robot_state["mode"],
+        "tf_custom": robot_state["tf_custom"],
         "alerts_total": len(alert_history),
-        "alerts_xau": len(histories["xau"]),
-        "alerts_solana": len(histories["solana"]),
-        "alerts_dax": len(histories["dax"]),
-        "telegram_configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-        "frere_configured": bool(TELEGRAM_CHAT_ID_2),
-        "last_alert": alert_history[0]["timestamp"] if alert_history else None,
+        **{f"alerts_{g}": len(h) for g,h in histories.items()},
     })
 
-
-@app.route("/", methods=["GET"])
+@app.route("/",       methods=["GET"])
 def dashboard_all():
-    return render_template("dashboard.html",
-        alerts=list(alert_history), page="all",
-        counts={"xau": len(histories["xau"]), "solana": len(histories["solana"]), "dax": len(histories["dax"])})
+    return render_template("dashboard.html", alerts=list(alert_history), page="all",
+        counts={g: len(h) for g,h in histories.items()})
 
-@app.route("/xau", methods=["GET"])
+@app.route("/xau",    methods=["GET"])
 def dashboard_xau():
-    return render_template("dashboard.html",
-        alerts=list(histories["xau"]), page="xau",
-        counts={"xau": len(histories["xau"]), "solana": len(histories["solana"]), "dax": len(histories["dax"])})
+    return render_template("dashboard.html", alerts=list(histories["xau"]), page="xau",
+        counts={g: len(h) for g,h in histories.items()})
 
 @app.route("/solana", methods=["GET"])
 def dashboard_solana():
-    return render_template("dashboard.html",
-        alerts=list(histories["solana"]), page="solana",
-        counts={"xau": len(histories["xau"]), "solana": len(histories["solana"]), "dax": len(histories["dax"])})
+    return render_template("dashboard.html", alerts=list(histories["solana"]), page="solana",
+        counts={g: len(h) for g,h in histories.items()})
 
-@app.route("/dax", methods=["GET"])
+@app.route("/dax",    methods=["GET"])
 def dashboard_dax():
-    return render_template("dashboard.html",
-        alerts=list(histories["dax"]), page="dax",
-        counts={"xau": len(histories["xau"]), "solana": len(histories["solana"]), "dax": len(histories["dax"])})
+    return render_template("dashboard.html", alerts=list(histories["dax"]), page="dax",
+        counts={g: len(h) for g,h in histories.items()})
+
+@app.route("/btc",    methods=["GET"])
+def dashboard_btc():
+    return render_template("dashboard.html", alerts=list(histories["btc"]), page="btc",
+        counts={g: len(h) for g,h in histories.items()})
+
+@app.route("/stocks", methods=["GET"])
+def dashboard_stocks():
+    return render_template("dashboard.html", alerts=list(histories["stocks"]), page="stocks",
+        counts={g: len(h) for g,h in histories.items()})
 
 @app.route("/levels", methods=["GET"])
 def levels():
     return jsonify(list(alert_history))
 
-@app.route("/test", methods=["GET"])
-def test_alert():
-    fake   = "Origin First Touch — XAUUSD H4 | Side: Support | Price: 3325.00 | Scope: Pure"
-    parsed = parse_fiblab_message(fake)
-    scoring= compute_score(parsed)
-    sent   = send_telegram(format_telegram_message(parsed, scoring), TELEGRAM_CHAT_ID)
-    return jsonify({"telegram_sent": sent, "scoring": scoring})
+@app.route("/test",        methods=["GET"])
+def test_xau():
+    return _test("Origin First Touch — XAUUSD H4 | Side: Support | Price: 3325.00 | Scope: Pure")
 
 @app.route("/test_solana", methods=["GET"])
 def test_solana():
-    fake   = "Origin First Touch — SOLUSDT.P H4 | Side: Support | Price: 142.50 | Scope: Pure"
-    parsed = parse_fiblab_message(fake)
-    scoring= compute_score(parsed)
-    sent   = send_telegram(format_telegram_message(parsed, scoring), TELEGRAM_CHAT_ID)
-    return jsonify({"telegram_sent": sent, "scoring": scoring})
+    return _test("Origin First Touch — SOLUSDT.P H4 | Side: Support | Price: 142.50 | Scope: Pure")
 
-@app.route("/test_dax", methods=["GET"])
+@app.route("/test_dax",    methods=["GET"])
 def test_dax():
-    fake   = "Broken First Touch — DE30EUR H4 | Side: Resistance | Price: 24850.00 | Scope: Pure"
-    parsed = parse_fiblab_message(fake)
-    scoring= compute_score(parsed)
-    sent   = send_telegram(format_telegram_message(parsed, scoring), TELEGRAM_CHAT_ID)
-    return jsonify({"telegram_sent": sent, "scoring": scoring})
+    return _test("Broken First Touch — DE30EUR H4 | Side: Resistance | Price: 24850.00 | Scope: Pure")
+
+@app.route("/test_btc",    methods=["GET"])
+def test_btc():
+    return _test("Origin First Touch — BTCUSDT.P H4 | Side: Support | Price: 98500.00 | Scope: Pure")
+
+@app.route("/test_stocks", methods=["GET"])
+def test_stocks():
+    return _test("Origin First Touch — TSLA H4 | Side: Support | Price: 285.00 | Scope: Pure")
+
+def _test(fake: str):
+    parsed  = parse_fiblab_message(fake)
+    scoring = compute_score(parsed)
+    sent    = send_telegram(format_telegram_message(parsed, scoring), TELEGRAM_CHAT_ID)
+    return jsonify({"telegram_sent": sent, "scoring": scoring, "parsed": parsed})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
