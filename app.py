@@ -35,9 +35,9 @@ ASSET_GROUPS = {
 }
 
 ASSET_META = {
-    "xau":    {"label": "XAU/USD",  "emoji": "🥇", "color": "#f5a623"},
-    "solana": {"label": "SOLANA",   "emoji": "💎", "color": "#a78bfa"},
-    "dax":    {"label": "DAX",      "emoji": "🇩🇪", "color": "#3fb950"},
+    "xau":    {"label": "XAU/USD",  "emoji": "🥇", "color": "#f5a623", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:XAUUSD"},
+    "solana": {"label": "SOLANA",   "emoji": "💎", "color": "#a78bfa", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:SOLUSDT.P"},
+    "dax":    {"label": "DAX",      "emoji": "🇩🇪", "color": "#3fb950", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:DE30EUR"},
 }
 
 def get_asset_group(asset: str) -> str:
@@ -111,7 +111,7 @@ def parse_fiblab_message(raw: str) -> dict:
     else:
         rest = raw
 
-    asset_tf = re.search(r'([A-Z0-9./]+)\s+([0-9]+[SMHD]?|Daily|Weekly|Monthly)', rest, re.IGNORECASE)
+    asset_tf = re.search(r'([A-Z0-9./]+)\s+([0-9]+[SMHD]?|[HMD][0-9]+|Daily|Weekly|Monthly)', rest, re.IGNORECASE)
     if asset_tf:
         result["asset"] = asset_tf.group(1).upper()
         result["timeframe"] = normalize_timeframe(asset_tf.group(2).upper())
@@ -181,8 +181,71 @@ def compute_score(parsed: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
-# TELEGRAM
+# FILTRES ALERTES
 # ─────────────────────────────────────────────
+
+# TF minimum pour recevoir une notification
+TF_MINIMUM = {"H4","H6","H8","H12","D1","D2","D3","D4","D5","D6","D7","W1","MN",
+               "4H","8H","12H","1D","2D","3D","4D","5D","6D","7D","1W"}
+
+# Types toujours notifiés (H4+)
+TYPES_ALWAYS = {
+    "origin first touch", "origin untouched",
+    "atr proximity",
+    "break first touch", "broken first touch",
+    "broken origin first touch",
+}
+
+# Types notifiés seulement si Daily+
+TF_DAILY = {"D1","D2","D3","D4","D5","D6","D7","1D","2D","3D","4D","5D","6D","7D","W1","MN","1W"}
+TYPES_DAILY_ONLY = {"origin touched"}
+
+# Types notifiés seulement si score 6+
+TYPES_SCORE_MIN = {"bsut created": 6}
+
+# Types toujours ignorés
+TYPES_IGNORED = {"break created"}
+
+def should_notify(parsed: dict, scoring: dict) -> tuple[bool, str]:
+    """Retourne (notifier, raison_si_non)"""
+    alert_type = (parsed.get("type") or "").lower()
+    tf = (parsed.get("timeframe") or "").upper()
+
+    # 1. TF minimum H4
+    if tf not in TF_MINIMUM:
+        return False, f"TF '{tf}' < H4 — ignoré"
+
+    # 2. Types ignorés
+    for ignored in TYPES_IGNORED:
+        if ignored in alert_type:
+            return False, f"Type '{alert_type}' ignoré"
+
+    # 3. Types score minimum
+    for t, min_score in TYPES_SCORE_MIN.items():
+        if t in alert_type:
+            if scoring["score"] < min_score:
+                return False, f"Type '{alert_type}' score {scoring['score']} < {min_score}"
+            return True, "ok"
+
+    # 4. Types Daily+ seulement
+    for t in TYPES_DAILY_ONLY:
+        if t in alert_type:
+            if tf not in TF_DAILY:
+                return False, f"Type '{alert_type}' nécessite Daily+ (TF={tf})"
+            return True, "ok"
+
+    # 5. Types toujours notifiés (H4+)
+    for t in TYPES_ALWAYS:
+        if t in alert_type:
+            return True, "ok"
+
+    # 6. Autres types non listés → on notifie si score 5+
+    if scoring["score"] >= 5:
+        return True, "ok"
+
+    return False, f"Score {scoring['score']} insuffisant"
+
+
 def send_telegram(message: str, chat_id: str = None):
     if not TELEGRAM_TOKEN: return False
     target = chat_id or TELEGRAM_CHAT_ID
@@ -228,11 +291,17 @@ def format_telegram_message(parsed: dict, scoring: dict) -> str:
     )
     for d in scoring["details"]:
         msg += f"  • {d}\n"
+
+    # Lien TradingView
+    tv_link = meta.get("tv", "")
+    tv_line = f"\n📈 <a href='{tv_link}'>Ouvrir le chart</a>" if tv_link else ""
+
     msg += (
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Action :\n{action}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {parsed.get('timestamp','')[:19].replace('T',' ')} UTC"
+        f"{tv_line}"
     )
     return msg
 
@@ -327,6 +396,12 @@ def webhook():
     if robot_state["paused"]:
         print("[WEBHOOK] Robot en pause — pas de Telegram")
         return jsonify({"status": "paused", "parsed": parsed, "scoring": scoring}), 200
+
+    # ── FILTRE INTELLIGENT ──
+    notify, reason = should_notify(parsed, scoring)
+    if not notify:
+        print(f"[WEBHOOK] Filtré : {reason}")
+        return jsonify({"status": "filtered", "reason": reason, "parsed": parsed}), 200
 
     tg_msg = format_telegram_message(parsed, scoring)
 
