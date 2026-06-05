@@ -545,8 +545,16 @@ def test_stocks():
 def _test(fake: str):
     parsed  = parse_fiblab_message(fake)
     scoring = compute_score(parsed)
-    sent    = send_telegram(format_telegram_message(parsed, scoring), TELEGRAM_CHAT_ID)
-    return jsonify({"telegram_sent": sent, "scoring": scoring, "parsed": parsed})
+    msg     = format_telegram_message(parsed, scoring)
+    sent_charlie = send_telegram(msg, TELEGRAM_CHAT_ID)
+    sent_frere   = send_telegram(msg, TELEGRAM_CHAT_ID_2) if TELEGRAM_CHAT_ID_2 else False
+    return jsonify({
+        "telegram_charlie": sent_charlie,
+        "telegram_frere":   sent_frere,
+        "frere_configured": bool(TELEGRAM_CHAT_ID_2),
+        "scoring": scoring,
+        "parsed": parsed
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
