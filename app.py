@@ -1,13 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.1.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.2.0)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
-║  Patches :                                                   ║
-║   • TF 2D/3D/4D enfin pris en compte dans le scoring         ║
-║   • /webhook authentifié (WEBHOOK_SECRET)                    ║
+║  Base v2.1.0 + patch :                                       ║
+║   • Scoring 6D/7D (D6/D7) — tes plus hauts TF scoraient 0    ║
+║   • load_alert_history() : dashboard survit aux redéploys    ║
+║   • send_telegram() avec retry + backoff (sans dépendance)   ║
+║   • /db_count : preuve de persistance (COUNT réel en base)   ║
+║                                                              ║
+║  Hérité de v2.1.0 :                                          ║
+║   • TF 2D/3D/4D pris en compte dans le scoring               ║
+║   • /webhook authentifié (WEBHOOK_SECRET, query ?token=)     ║
 ║   • Échappement HTML des champs externes (anti-injection)    ║
-║   • Killswitch admin réintroduit (robot_state vivant)        ║
+║   • Killswitch admin (robot_state vivant)                    ║
 ║   • Persistance SQLite : profils + alertes + issues          ║
 ║   • Squelette d'évaluation d'issue (/outcome, /stats)        ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -17,6 +23,7 @@ import os
 import re
 import json
 import html
+import time
 import sqlite3
 import requests
 from datetime import datetime, timezone
@@ -220,6 +227,43 @@ alert_history = deque(maxlen=200)
 histories = {g: deque(maxlen=100) for g in ASSET_GROUPS}
 
 
+# ── NEW v2.2.0 : rechargement de l'historique au démarrage ──
+LEVEL_EMOJI = {"PRIORITAIRE": "🔴", "SECONDAIRE": "⚠️", "INFO": "📊"}
+
+
+def load_alert_history(limit: int = 200):
+    """Recharge les dernières alertes depuis SQLite au démarrage.
+    Sans ça, le dashboard repart vide à chaque redéploiement même si la
+    base persiste. La table alerts ne stocke pas emoji/details : on
+    reconstruit l'emoji depuis 'level' et on laisse details vide."""
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        for r in reversed(rows):          # plus ancien → plus récent
+            entry = {
+                "id":        r["id"],
+                "timestamp": r["ts"],
+                "asset":     r["asset"],
+                "timeframe": r["timeframe"],
+                "type":      r["type"],
+                "side":      r["side"],
+                "price":     r["price"],
+                "scope":     r["scope"],
+                "score":     r["score"],
+                "level":     r["level"],
+                "emoji":     LEVEL_EMOJI.get(r["level"], "📊"),
+                "details":   [],
+            }
+            alert_history.appendleft(entry)
+            grp = r["grp"]
+            if grp and grp in histories:
+                histories[grp].appendleft(entry)
+    except Exception as e:
+        print(f"[DB] load_alert_history : {e}")
+
+
 # ─────────────────────────────────────────────
 # PARSER
 # ─────────────────────────────────────────────
@@ -297,6 +341,7 @@ TF_WEIGHT = {
     # ── FIX : les multi-journaliers, colonne vertébrale de la stratégie Origin ──
     "2D": 4, "3D": 5, "4D": 5, "5D": 5,
     "D2": 4, "D3": 5, "D4": 5, "D5": 5,
+    "6D": 5, "7D": 5, "D6": 5, "D7": 5,   # NEW v2.2.0 : plus hauts TF enfin scorés
     "W1": 4, "1W": 4, "W": 4, "WEEKLY": 4, "MN": 4, "MONTHLY": 4,
     "72m": 1, "90m": 1, "96m": 1, "144m": 2, "160m": 2, "288m": 2,
 }
@@ -407,22 +452,31 @@ def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
 # ─────────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────────
-def send_telegram(message: str, chat_id: str = None):
+def send_telegram(message: str, chat_id: str = None, retries: int = 3):
+    """Envoi Telegram avec retry + backoff (sans dépendance externe).
+    429 / 5xx → on réessaie ; 4xx (hors 429) → abandon immédiat."""
     if not TELEGRAM_TOKEN:
         return False
     target = chat_id or TELEGRAM_CHAT_ID
     if not target:
         return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": target, "text": message, "parse_mode": "HTML"},
-            timeout=10
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[TELEGRAM] Erreur : {e}")
-        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": target, "text": message, "parse_mode": "HTML"}
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                return True
+            if r.status_code != 429 and 400 <= r.status_code < 500:
+                print(f"[TELEGRAM] HTTP {r.status_code} (non-retry) : {r.text[:120]}")
+                return False
+            print(f"[TELEGRAM] essai {attempt}/{retries} → HTTP {r.status_code}")
+        except requests.RequestException as e:
+            print(f"[TELEGRAM] essai {attempt}/{retries} → {e}")
+        if attempt < retries:
+            time.sleep(min(2 ** (attempt - 1), 4))   # 1s, 2s, (cap 4s)
+    print(f"[TELEGRAM] échec après {retries} essais pour {target}")
+    return False
 
 
 def format_telegram_message(parsed: dict, scoring: dict, profile: dict = None) -> str:
@@ -744,6 +798,20 @@ def stats():
     })
 
 
+@app.route("/db_count", methods=["GET"])
+def db_count():
+    """NEW v2.2.0 — compte réel en base, pour prouver que le volume persiste.
+    Test : appeler /test deux-trois fois → redéployer → si ce compteur ne
+    repart pas à zéro, la persistance fonctionne."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    with db() as conn:
+        a = conn.execute("SELECT COUNT(*) AS n FROM alerts").fetchone()["n"]
+        o = conn.execute("SELECT COUNT(*) AS n FROM outcomes").fetchone()["n"]
+        p = conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"]
+    return jsonify({"alerts": a, "outcomes": o, "profiles": p, "db_path": DB_PATH})
+
+
 @app.route("/status", methods=["GET"])
 def status():
     profiles_summary = {uid: {"mode": p["mode"], "paused": p["paused"]}
@@ -844,6 +912,7 @@ def test_stocks():
 # ─────────────────────────────────────────────
 init_db()
 load_profiles()
+load_alert_history()   # NEW v2.2.0 : restaure le dashboard après redéploiement
 
 
 if __name__ == "__main__":
