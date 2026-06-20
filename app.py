@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.2.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.3.0)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.1.0 + patch :                                       ║
@@ -26,7 +26,7 @@ import html
 import time
 import sqlite3
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template
 from collections import deque
 
@@ -645,26 +645,173 @@ def handle_telegram_command(text: str, chat_id: str):
 
 
 # ─────────────────────────────────────────────
-# ÉVALUATION DES ISSUES — squelette
+# ÉVALUATION AUTOMATIQUE DES ISSUES (v2.3.0)
 # ─────────────────────────────────────────────
+# Mesure, pour chaque alerte 'pending' assez ancienne, si le NIVEAU a produit
+# un mouvement favorable. C'est un PROXY DIRECTIONNEL pour calibrer le scoring
+# (un score 12 réagit-il mieux qu'un score 7 ?), PAS le P&L exact de ton trade
+# qui dépend de ton englobante/SL réel.
+#
+# Source : Twelve Data si TWELVEDATA_API_KEY défini (couverture homogène),
+# sinon Yahoo keyless (XAU via le futur GC=F → léger basis vs ton feed Vantage).
+# Granularité H1.
+
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+
+EVAL_MIN_AGE_H = 12     # n'évalue qu'une alerte d'au moins 12h (assez de recul)
+EVAL_HORIZON_H = 72     # fenêtre d'observation après l'alerte
+
+# 1R = SL proxy (en points) ; win si +tp_r*SL atteint AVANT -SL
+EVAL_RISK = {
+    "xau":    {"sl": 15.0,  "tp_r": 3.0},
+    "dax":    {"sl": 30.0,  "tp_r": 3.0},
+    "btc":    {"sl": 400.0, "tp_r": 3.0},
+    "solana": {"sl": 2.0,   "tp_r": 3.0},
+    "stocks": {"sl": 2.0,   "tp_r": 3.0},
+}
+
+SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD"}
+SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD"}
+
+
+def _yahoo_symbol(group, asset):
+    if group == "stocks":
+        return re.sub(r"[^A-Z0-9.\-]", "", (asset or "").upper())
+    return SYMBOL_MAP_YF.get(group)
+
+
+def _twelvedata_symbol(group, asset):
+    if group == "stocks":
+        return re.sub(r"[^A-Z0-9.\-]", "", (asset or "").upper())
+    return SYMBOL_MAP_TD.get(group)
+
+
+def _fetch_yahoo(symbol, start_dt, end_dt):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"period1": int(start_dt.timestamp()),
+              "period2": int(end_dt.timestamp()), "interval": "1h"}
+    r = requests.get(url, params=params, timeout=15,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    res = (r.json().get("chart", {}).get("result") or [None])[0]
+    if not res:
+        return []
+    ts = res.get("timestamp") or []
+    q = (res.get("indicators", {}).get("quote") or [{}])[0]
+    highs, lows = q.get("high") or [], q.get("low") or []
+    bars = []
+    for i, t in enumerate(ts):
+        hi = highs[i] if i < len(highs) else None
+        lo = lows[i] if i < len(lows) else None
+        if hi is not None and lo is not None:
+            bars.append((datetime.fromtimestamp(t, tz=timezone.utc), float(hi), float(lo)))
+    return bars
+
+
+def _fetch_twelvedata(symbol, start_dt, end_dt):
+    url = "https://api.twelvedata.com/time_series"
+    params = {"symbol": symbol, "interval": "1h",
+              "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+              "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+              "apikey": TWELVEDATA_API_KEY, "timezone": "UTC", "outputsize": 5000}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    vals = r.json().get("values")
+    if not vals:
+        return []
+    bars = []
+    for v in vals:
+        try:
+            dt = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            bars.append((dt, float(v["high"]), float(v["low"])))
+        except Exception:
+            continue
+    bars.sort(key=lambda x: x[0])
+    return bars
+
+
+def fetch_prices(group, asset, start_dt, end_dt):
+    """[(datetime, high, low), ...] en H1. Twelve Data si clé, sinon Yahoo."""
+    try:
+        if TWELVEDATA_API_KEY:
+            sym = _twelvedata_symbol(group, asset)
+            if sym:
+                return _fetch_twelvedata(sym, start_dt, end_dt)
+        sym = _yahoo_symbol(group, asset)
+        if sym:
+            return _fetch_yahoo(sym, start_dt, end_dt)
+    except Exception as e:
+        print(f"[EVAL] fetch_prices {group}/{asset} : {e}")
+    return []
+
+
 def evaluate_pending_outcomes():
-    """
-    SQUELETTE — à brancher sur un flux de prix (OANDA, broker, TradingView export...).
+    """Évalue les alertes 'pending' assez anciennes. Renvoie le nb traité.
+    Depuis le niveau, dans le sens du Side : win si +tp_r*SL atteint avant -SL ;
+    loss sinon ; 'invalid' si ni l'un ni l'autre dans la fenêtre. Intrabar, on
+    teste le SL avant le TP (hypothèse conservatrice)."""
+    now = datetime.now(timezone.utc)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price "
+            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
+            "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL"
+        ).fetchall()
 
-    Pour chaque alerte 'pending' suffisamment ancienne, la logique cible est :
-      1. récupérer l'historique de prix depuis (price, timestamp) de l'alerte
-      2. mesurer MFE (max favorable excursion) et MAE (max adverse) en points
-      3. trancher win/loss selon une règle explicite, p.ex. :
-           - LONG  (Side=Support)    : win si +TP_pts atteint avant -SL_pts
-           - SHORT (Side=Resistance) : symétrique
-      4. UPDATE outcomes SET status/mfe_pts/mae_pts/r_realized
+    evaluated = 0
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(r["ts"])
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (now - ts).total_seconds() / 3600 < EVAL_MIN_AGE_H:
+            continue
+        risk = EVAL_RISK.get(r["grp"])
+        if not risk:
+            continue
 
-    Tant qu'aucun price feed n'est branché, on ne touche à rien (reste 'pending').
-    C'est CE log d'issue qui rendra le backtest v3.0.0 possible et permettra de
-    vérifier si un score 11 gagne vraiment plus souvent qu'un score 7.
-    """
-    # TODO: brancher PRICE_FEED puis dérouler la logique ci-dessus.
-    return
+        bars = fetch_prices(r["grp"], r["asset"], ts,
+                            min(ts + timedelta(hours=EVAL_HORIZON_H), now))
+        if not bars:
+            continue   # pas de data pour l'instant → on réessaiera plus tard
+
+        entry = r["price"]
+        sl = risk["sl"]
+        tp = sl * risk["tp_r"]
+        long_bias = (r["side"] == "Support")
+        mfe = mae = 0.0
+        status = None
+        r_real = None
+
+        for (_dt, hi, lo) in bars:
+            fav = (hi - entry) if long_bias else (entry - lo)
+            adv = (entry - lo) if long_bias else (hi - entry)
+            mfe = max(mfe, fav)
+            mae = max(mae, adv)
+            if adv >= sl:                 # SL touché d'abord (conservateur)
+                status, r_real = "loss", -1.0
+                break
+            if fav >= tp:
+                status, r_real = "win", risk["tp_r"]
+                break
+
+        if status is None:
+            status = "invalid"            # ni TP ni SL dans la fenêtre
+            r_real = round(mfe / sl, 2) if sl else None
+
+        src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
+        with db() as conn:
+            conn.execute(
+                "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, r_realized=?, "
+                "note=?, updated_ts=? WHERE alert_id=?",
+                (status, round(mfe, 2), round(mae, 2), r_real,
+                 f"auto ({src}, SL={sl}, TP={tp})", now_iso(), r["id"])
+            )
+            conn.commit()
+        evaluated += 1
+    return evaluated
 
 
 # ─────────────────────────────────────────────
@@ -796,6 +943,29 @@ def stats():
         "by_type":  enrich(by_type),
         "by_tf":    enrich(by_tf),
     })
+
+
+@app.route("/evaluate", methods=["GET", "POST"])
+def evaluate_route():
+    """Lance l'évaluation des issues 'pending'. À pinger périodiquement
+    (cron-job.org, Railway cron...) ou à la main. Renvoie le nb traité."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    n = evaluate_pending_outcomes()
+    return jsonify({"evaluated": n})
+
+
+@app.route("/price_test", methods=["GET"])
+def price_test():
+    """Vérifie que la source de prix répond (utile si Yahoo bloque l'IP Railway)."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=48)
+    bars = fetch_prices("xau", "XAUUSD", start, end)
+    src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
+    sample = [{"t": b[0].isoformat(), "high": b[1], "low": b[2]} for b in bars[:3]]
+    return jsonify({"source": src, "bars": len(bars), "sample": sample})
 
 
 @app.route("/db_count", methods=["GET"])
