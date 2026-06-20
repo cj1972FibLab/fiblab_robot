@@ -968,6 +968,36 @@ def price_test():
     return jsonify({"source": src, "bars": len(bars), "sample": sample})
 
 
+@app.route("/seed_test", methods=["GET", "POST"])
+def seed_test():
+    """TEST — crée une alerte XAU backdatée (~5j, données figées et denses),
+    l'évalue aussitôt et renvoie le résultat. Pour voir la boucle evaluate→
+    outcome sans attendre. À retirer après vérification."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    ts = datetime.now(timezone.utc) - timedelta(days=5)
+    bars = fetch_prices("xau", "XAUUSD", ts, ts + timedelta(hours=6))
+    if not bars:
+        return jsonify({"error": "pas de prix a cette date (marche ferme ?), reessaie"}), 200
+    entry = round((bars[0][1] + bars[0][2]) / 2, 2)
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO alerts (ts,asset,grp,timeframe,type,side,price,scope,score,level) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (ts.isoformat(), "XAUUSD", "xau", "2D", "SEED TEST",
+             "Support", entry, "Pure", 12, "PRIORITAIRE"))
+        sid = cur.lastrowid
+        conn.execute("INSERT INTO outcomes (alert_id,status,updated_ts) VALUES (?, 'pending', ?)",
+                     (sid, now_iso()))
+        conn.commit()
+    n = evaluate_pending_outcomes()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM outcomes WHERE alert_id=?", (sid,)).fetchone()
+        o = dict(row) if row else {}
+    return jsonify({"seeded_alert_id": sid, "entry": entry, "ts": ts.isoformat(),
+                    "side": "Support", "evaluated_now": n, "outcome": o})
+
+
 @app.route("/db_count", methods=["GET"])
 def db_count():
     """NEW v2.2.0 — compte réel en base, pour prouver que le volume persiste.
