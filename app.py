@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.3.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.4.0)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.1.0 + patch :                                       ║
@@ -262,6 +262,21 @@ def load_alert_history(limit: int = 200):
                 histories[grp].appendleft(entry)
     except Exception as e:
         print(f"[DB] load_alert_history : {e}")
+
+
+def clean_seed_rows():
+    """Supprime les alertes de test (type 'SEED%') et leurs outcomes."""
+    try:
+        with db() as conn:
+            ids = [r["id"] for r in conn.execute("SELECT id FROM alerts WHERE type LIKE 'SEED%'")]
+            for aid in ids:
+                conn.execute("DELETE FROM outcomes WHERE alert_id=?", (aid,))
+                conn.execute("DELETE FROM alerts WHERE id=?", (aid,))
+            conn.commit()
+            if ids:
+                print(f"[CLEAN] {len(ids)} ligne(s) SEED supprimée(s)")
+    except Exception as e:
+        print(f"[CLEAN] clean_seed_rows : {e}")
 
 
 # ─────────────────────────────────────────────
@@ -968,34 +983,136 @@ def price_test():
     return jsonify({"source": src, "bars": len(bars), "sample": sample})
 
 
-@app.route("/seed_test", methods=["GET", "POST"])
-def seed_test():
-    """TEST — crée une alerte XAU backdatée (~5j, données figées et denses),
-    l'évalue aussitôt et renvoie le résultat. Pour voir la boucle evaluate→
-    outcome sans attendre. À retirer après vérification."""
+# ─────────────────────────────────────────────
+# TABLEAU DE BORD DE CALIBRATION (v2.4.0)
+# ─────────────────────────────────────────────
+DASH_HTML = """<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FibLab — Calibration</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{--bg:#080c10;--card:#0d1117;--bd:#1c2333;--gold:#f5a623;--grn:#3fb950;
+--red:#f85149;--blue:#58a6ff;--pur:#a78bfa;--tx:#cdd9e5;--dim:#768390}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px;max-width:1100px;margin:0 auto}
+h1{font-size:1.5rem;color:var(--gold);margin-bottom:4px}
+.sub{color:var(--dim);font-size:.8rem;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:22px}
+.stat{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:13px}
+.lbl{font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:5px}
+.val{font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:18px}
+.card h2{font-size:.95rem;margin-bottom:12px;color:var(--blue)}
+.note{background:rgba(88,166,255,.06);border:1px solid rgba(88,166,255,.2);border-radius:8px;padding:14px;font-size:.8rem;line-height:1.6;color:var(--tx)}
+table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:8px}
+th{text-align:left;padding:7px 9px;font-size:.6rem;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--bd)}
+td{padding:7px 9px;border-bottom:1px solid var(--bd);font-variant-numeric:tabular-nums}
+.empty{text-align:center;color:var(--dim);padding:40px;font-size:.9rem}
+.refresh{float:right;font-size:.75rem;color:var(--blue);text-decoration:none;border:1px solid var(--bd);padding:5px 10px;border-radius:6px}
+canvas{max-height:260px}
+</style></head><body>
+<a class="refresh" href="javascript:location.reload()">↻ Rafraîchir</a>
+<h1>🎯 Calibration du scoring</h1>
+<div class="sub">Win rate des alertes par score / type / timeframe — pour ajuster les poids sur des faits</div>
+<div id="app"></div>
+<script>
+const D = __DATA__;
+const app = document.getElementById('app');
+const C = {grid:'#1c2333', tick:'#768390', gold:'#f5a623', grn:'#3fb950', blue:'#58a6ff', pur:'#a78bfa'};
+
+if (D.total_eval === 0) {
+  app.innerHTML = '<div class="empty">Aucune alerte évaluée pour l\'instant.<br><br>'
+    + 'Les alertes sont notées automatiquement une fois passées 12h '
+    + '(' + (D.counts.pending||0) + ' en attente). Reviens dans un jour ou deux.</div>';
+} else {
+  const wr = D.overall_wr;
+  const wrColor = wr>=50 ? C.grn : C.gold;
+  app.innerHTML = `
+    <div class="grid">
+      <div class="stat"><div class="lbl">Évaluées</div><div class="val" style="color:${C.blue}">${D.total_eval}</div></div>
+      <div class="stat"><div class="lbl">Win rate global</div><div class="val" style="color:${wrColor}">${wr}%</div></div>
+      <div class="stat"><div class="lbl">Win</div><div class="val" style="color:${C.grn}">${D.counts.win}</div></div>
+      <div class="stat"><div class="lbl">Loss</div><div class="val" style="color:${C.red||'#f85149'}">${D.counts.loss}</div></div>
+      <div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:${C.tick}">${D.counts.invalid||0}</div></div>
+      <div class="stat"><div class="lbl">En attente</div><div class="val" style="color:${C.tick}">${D.counts.pending||0}</div></div>
+    </div>
+    <div class="card"><h2>Win rate par SCORE — le graphe clé</h2><canvas id="cScore"></canvas></div>
+    <div class="note"><b>Comment lire :</b> si ton scoring est bon, le win rate doit <b>monter avec le score</b>
+      (un 12 gagne plus qu'un 7). Si la barre d'un score faible dépasse celle d'un score fort, c'est que les
+      <b>poids sont mal calibrés</b> — c'est exactement ce qu'on ajustera. Les barres pâles = peu de données (peu fiable).</div>
+    <div class="card"><h2>Win rate par TYPE</h2><canvas id="cType"></canvas></div>
+    <div class="card"><h2>Win rate par TIMEFRAME</h2><canvas id="cTf"></canvas></div>
+    <div class="card"><h2>Détail par score</h2>
+      <table><thead><tr><th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead>
+      <tbody>${D.by_score.map(r=>`<tr><td>${r.k}</td><td style="color:${C.grn}">${r.win}</td>
+        <td style="color:#f85149">${r.loss}</td><td>${r.n}</td>
+        <td style="font-weight:700;color:${r.wr>=50?C.grn:C.gold}">${r.wr}%</td></tr>`).join('')}</tbody></table>
+    </div>`;
+
+  function barChart(id, rows, color){
+    const op = rows.map(r => r.n>=5 ? 1 : 0.4);  // pâle si < 5 trades
+    new Chart(document.getElementById(id), {
+      type:'bar',
+      data:{labels: rows.map(r=>r.k),
+        datasets:[{data: rows.map(r=>r.wr), backgroundColor: rows.map((r,i)=>color), borderRadius:4,
+          // opacité gérée via barThickness/alpha
+          backgroundColor: rows.map((r)=> r.n>=5 ? color : color+'66')}]},
+      options:{plugins:{legend:{display:false},
+        tooltip:{callbacks:{label:(c)=>{const r=rows[c.dataIndex];return ` ${r.wr}%  (${r.win}W / ${r.loss}L · n=${r.n})`;}}}},
+        scales:{y:{beginAtZero:true,max:100,grid:{color:C.grid},ticks:{color:C.tick,callback:v=>v+'%'}},
+          x:{grid:{display:false},ticks:{color:C.tick}}}}
+    });
+  }
+  barChart('cScore', D.by_score, C.gold);
+  barChart('cType',  D.by_type,  C.blue);
+  barChart('cTf',    D.by_tf,    C.pur);
+}
+</script></body></html>"""
+
+
+@app.route("/stats_view", methods=["GET"])
+def stats_view():
+    """Tableau de bord HTML : win rate par score/type/TF (calibration des poids)."""
     if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    ts = datetime.now(timezone.utc) - timedelta(days=5)
-    bars = fetch_prices("xau", "XAUUSD", ts, ts + timedelta(hours=6))
-    if not bars:
-        return jsonify({"error": "pas de prix a cette date (marche ferme ?), reessaie"}), 200
-    entry = round((bars[0][1] + bars[0][2]) / 2, 2)
+        return ("unauthorized", 403)
     with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO alerts (ts,asset,grp,timeframe,type,side,price,scope,score,level) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (ts.isoformat(), "XAUUSD", "xau", "2D", "SEED TEST",
-             "Support", entry, "Pure", 12, "PRIORITAIRE"))
-        sid = cur.lastrowid
-        conn.execute("INSERT INTO outcomes (alert_id,status,updated_ts) VALUES (?, 'pending', ?)",
-                     (sid, now_iso()))
-        conn.commit()
-    n = evaluate_pending_outcomes()
-    with db() as conn:
-        row = conn.execute("SELECT * FROM outcomes WHERE alert_id=?", (sid,)).fetchone()
-        o = dict(row) if row else {}
-    return jsonify({"seeded_alert_id": sid, "entry": entry, "ts": ts.isoformat(),
-                    "side": "Support", "evaluated_now": n, "outcome": o})
+        rows = conn.execute(
+            "SELECT a.score, a.type, a.timeframe, o.status "
+            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id"
+        ).fetchall()
+
+    counts = {"win": 0, "loss": 0, "invalid": 0, "pending": 0, "skip": 0}
+    by_score, by_type, by_tf = {}, {}, {}
+    for r in rows:
+        st = r["status"] or "pending"
+        counts[st] = counts.get(st, 0) + 1
+        if st in ("win", "loss"):
+            by_score.setdefault(r["score"], {"win": 0, "loss": 0})[st] += 1
+            by_type.setdefault(r["type"] or "?", {"win": 0, "loss": 0})[st] += 1
+            by_tf.setdefault(r["timeframe"] or "?", {"win": 0, "loss": 0})[st] += 1
+
+    def pack(bucket, numeric=False):
+        items = []
+        for k, v in bucket.items():
+            tot = v["win"] + v["loss"]
+            items.append({"k": str(k), "_s": k, "win": v["win"], "loss": v["loss"],
+                          "n": tot, "wr": round(100 * v["win"] / tot, 1) if tot else 0})
+        items.sort(key=lambda x: x["_s"] if numeric else str(x["_s"]))
+        for it in items:
+            del it["_s"]
+        return items
+
+    won = counts["win"]
+    tot_eval = counts["win"] + counts["loss"]
+    data = {
+        "counts": counts,
+        "total_eval": tot_eval,
+        "overall_wr": round(100 * won / tot_eval, 1) if tot_eval else 0,
+        "by_score": pack(by_score, numeric=True),
+        "by_type":  pack(by_type),
+        "by_tf":    pack(by_tf),
+    }
+    return DASH_HTML.replace("__DATA__", json.dumps(data))
 
 
 @app.route("/db_count", methods=["GET"])
@@ -1111,8 +1228,9 @@ def test_stocks():
 # INIT (au chargement du module → fonctionne aussi sous gunicorn)
 # ─────────────────────────────────────────────
 init_db()
+clean_seed_rows()                # v2.4.0 : retire les lignes de test SEED
 load_profiles()
-load_alert_history()   # NEW v2.2.0 : restaure le dashboard après redéploiement
+load_alert_history()             # restaure le dashboard après redéploiement
 
 
 if __name__ == "__main__":
