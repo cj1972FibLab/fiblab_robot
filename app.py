@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.5.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.5.1)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.1.0 + patch :                                       ║
@@ -361,12 +361,28 @@ TF_WEIGHT = {
     "72m": 1, "90m": 1, "96m": 1, "144m": 2, "160m": 2, "288m": 2,
 }
 
+# Score de TYPE — couvre les 10 types reels de l'indicateur Origin Levels.
+# Le matching retient la cle la PLUS SPECIFIQUE (la plus longue) presente dans le
+# libelle. Les valeurs marquees (valider) sont provisoires -> a confirmer par Syn.
 TYPE_SCORES = {
-    "origin untouched": 5, "origin first touch": 4,
-    "broken origin first touch": 4, "broken first touch": 3,
-    "break first touch": 3, "atr proximity": 3,
-    "break created": 2, "origin broken": 2, "bsut created": 2,
+    # — niveaux "au contact" (price au niveau, tradeable) —
+    "origin untouched": 5,
+    "broken origin first touch": 4,
+    "origin first touch": 4,
+    "break first touch": 3,
+    "broken first touch": 3,
+    "atr proximity": 3,
     "origin touched": 1,
+    # — evenements de flip / BSUT (valider Syn) —
+    "origin broken: origin bsut created": 3,
+    "break broken: bsut created": 3,
+    # — evenements de FORMATION de niveau (price pas encore au niveau, valider Syn) —
+    "rng-hit created": 2,
+    "origin created": 1,
+    "break created": 1,
+    # — fallbacks de robustesse —
+    "origin broken": 2,
+    "bsut created": 2,
 }
 
 
@@ -376,8 +392,9 @@ def compute_score(parsed: dict) -> dict:
     tf    = (parsed.get("timeframe") or "").upper()
     scope = (parsed.get("scope") or "").lower()
 
-    for key, val in TYPE_SCORES.items():
+    for key in sorted(TYPE_SCORES, key=len, reverse=True):
         if key in alert_type:
+            val = TYPE_SCORES[key]
             score += val
             details.append(f"Type '{parsed['type']}' → +{val}")
             break
