@@ -1,21 +1,20 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.5.1)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.0)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
-║  Base v2.1.0 + patch :                                       ║
-║   • Scoring 6D/7D (D6/D7) — tes plus hauts TF scoraient 0    ║
-║   • load_alert_history() : dashboard survit aux redéploys    ║
-║   • send_telegram() avec retry + backoff (sans dépendance)   ║
-║   • /db_count : preuve de persistance (COUNT réel en base)   ║
+║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
+║   • TYPE_SCORES re-pondérés sur les probabilités de Syn      ║
+║     (retest break level = 95% → poids relevé)                ║
+║   • Bonus de CONFLUENCE : niveaux empilés au même prix       ║
+║     sur plusieurs TF = haute proba (cœur du système Syn)     ║
+║   • Intégration HOLD LEVELS (indicateur Syn) :               ║
+║     parser multi-lignes + 6 états + cible d'obligation (Exit)║
+║   • Champ target (cible d'obligation) : message + calibration║
+║   • Fallback asset via ?asset= dans l'URL du webhook hold    ║
 ║                                                              ║
-║  Hérité de v2.1.0 :                                          ║
-║   • TF 2D/3D/4D pris en compte dans le scoring               ║
-║   • /webhook authentifié (WEBHOOK_SECRET, query ?token=)     ║
-║   • Échappement HTML des champs externes (anti-injection)    ║
-║   • Killswitch admin (robot_state vivant)                    ║
-║   • Persistance SQLite : profils + alertes + issues          ║
-║   • Squelette d'évaluation d'issue (/outcome, /stats)        ║
+║  Hérité de v2.5.1 :                                          ║
+║   • Scoring 6D/7D, persistance, killswitch, /stats_view, etc.║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -84,7 +83,9 @@ def init_db():
                 price     REAL,
                 scope     TEXT,
                 score     INTEGER,
-                level     TEXT
+                level     TEXT,
+                target    REAL,
+                move_pct  REAL
             )
         """)
         conn.execute("""
@@ -110,15 +111,30 @@ def init_db():
         conn.commit()
 
 
+def migrate_db():
+    """Ajoute les colonnes target/move_pct si la base vient d'une version < 2.6.0.
+    Idempotent : ne fait rien si les colonnes existent déjà."""
+    try:
+        with db() as conn:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(alerts)")]
+            if "target" not in cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN target REAL")
+            if "move_pct" not in cols:
+                conn.execute("ALTER TABLE alerts ADD COLUMN move_pct REAL")
+            conn.commit()
+    except Exception as e:
+        print(f"[DB] migrate_db : {e}")
+
+
 def save_alert(parsed: dict, scoring: dict, group: str) -> int:
     """Insère l'alerte + une ligne 'pending' dans outcomes. Retourne l'id."""
     with db() as conn:
         cur = conn.execute(
-            "INSERT INTO alerts (ts,asset,grp,timeframe,type,side,price,scope,score,level) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO alerts (ts,asset,grp,timeframe,type,side,price,scope,score,level,target,move_pct) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (parsed.get("timestamp"), parsed.get("asset"), group, parsed.get("timeframe"),
              parsed.get("type"), parsed.get("side"), parsed.get("price"), parsed.get("scope"),
-             scoring["score"], scoring["level"])
+             scoring["score"], scoring["level"], parsed.get("target"), parsed.get("move_pct"))
         )
         alert_id = cur.lastrowid
         conn.execute(
@@ -227,21 +243,21 @@ alert_history = deque(maxlen=200)
 histories = {g: deque(maxlen=100) for g in ASSET_GROUPS}
 
 
-# ── NEW v2.2.0 : rechargement de l'historique au démarrage ──
+# ── rechargement de l'historique au démarrage ──
 LEVEL_EMOJI = {"PRIORITAIRE": "🔴", "SECONDAIRE": "⚠️", "INFO": "📊"}
 
 
 def load_alert_history(limit: int = 200):
     """Recharge les dernières alertes depuis SQLite au démarrage.
     Sans ça, le dashboard repart vide à chaque redéploiement même si la
-    base persiste. La table alerts ne stocke pas emoji/details : on
-    reconstruit l'emoji depuis 'level' et on laisse details vide."""
+    base persiste."""
     try:
         with db() as conn:
             rows = conn.execute(
                 "SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
         for r in reversed(rows):          # plus ancien → plus récent
+            keys = r.keys()
             entry = {
                 "id":        r["id"],
                 "timestamp": r["ts"],
@@ -253,6 +269,8 @@ def load_alert_history(limit: int = 200):
                 "scope":     r["scope"],
                 "score":     r["score"],
                 "level":     r["level"],
+                "target":    r["target"]   if "target"   in keys else None,
+                "move_pct":  r["move_pct"] if "move_pct" in keys else None,
                 "emoji":     LEVEL_EMOJI.get(r["level"], "📊"),
                 "details":   [],
             }
@@ -298,11 +316,46 @@ def normalize_timeframe(tf: str) -> str:
     return numeric_map.get(tf, tf)
 
 
+def parse_hold_message(raw: str, asset_hint: str = None) -> dict:
+    """Parse le format multi-lignes Hold/Origin Hold de l'indicateur Syn.
+    Retourne None si ce n'est pas un message hold (laisse la main au parser std).
+    Le champ 'Exit' devient la cible d'obligation (target)."""
+    lines = [l.strip() for l in raw.replace("\\n", "\n").split("\n") if l.strip()]
+    if not lines or "hold" not in lines[0].lower():
+        return None
+    res = {"raw": raw.strip(), "type": lines[0].strip(), "asset": None,
+           "timeframe": None, "side": None, "price": None, "target": None,
+           "move_pct": None, "scope": "Pure", "timestamp": now_iso()}
+    body = "\n".join(lines)
+
+    m = re.search(r"TF:\s*(\d+)", body)
+    if m:
+        res["timeframe"] = normalize_timeframe(m.group(1))
+    for l in lines:
+        if l in ("Support", "Resistance"):
+            res["side"] = l
+    m = (re.search(r"Entry touched:\s*([\d.]+)", body)
+         or re.search(r"Entry:\s*([\d.]+)", body)
+         or re.search(r"entry nearby:\s*([\d.]+)", body))
+    if m:
+        res["price"] = float(m.group(1))
+    m = re.search(r"Exit:\s*([\d.]+)", body)          # cible d'obligation
+    if m:
+        res["target"] = float(m.group(1))
+    m = re.search(r"Move%:\s*([\d.]+)", body)
+    if m:
+        res["move_pct"] = float(m.group(1))
+    if asset_hint:
+        res["asset"] = asset_hint.upper()
+    return res
+
+
 def parse_fiblab_message(raw: str) -> dict:
     result = {
         "raw": raw.strip(), "type": None, "asset": None,
         "timeframe": None, "side": None, "price": None,
-        "scope": None, "timestamp": now_iso(),
+        "scope": None, "target": None, "move_pct": None,
+        "timestamp": now_iso(),
     }
     if "ATR PROXIMITY" in raw.upper():
         result["type"] = "ATR Proximity"
@@ -342,6 +395,9 @@ def parse_fiblab_message(raw: str) -> dict:
     m = re.search(r'Scope:\s*(Pure|Non-Pure)', rest, re.IGNORECASE)
     if m:
         result["scope"] = m.group(1)
+    m = re.search(r'Target:\s*([\d.]+)', rest, re.IGNORECASE)   # cible optionnelle (pipe)
+    if m:
+        result["target"] = float(m.group(1))
     return result
 
 
@@ -353,40 +409,83 @@ TF_WEIGHT = {
     "H1": 2, "H2": 2, "H3": 2,
     "H4": 3, "H6": 3, "H8": 3, "H12": 3,
     "D1": 4, "1D": 4, "D": 4, "DAILY": 4,
-    # ── FIX : les multi-journaliers, colonne vertébrale de la stratégie Origin ──
     "2D": 4, "3D": 5, "4D": 5, "5D": 5,
     "D2": 4, "D3": 5, "D4": 5, "D5": 5,
-    "6D": 5, "7D": 5, "D6": 5, "D7": 5,   # NEW v2.2.0 : plus hauts TF enfin scorés
+    "6D": 5, "7D": 5, "D6": 5, "D7": 5,
     "W1": 4, "1W": 4, "W": 4, "WEEKLY": 4, "MN": 4, "MONTHLY": 4,
     "72m": 1, "90m": 1, "96m": 1, "144m": 2, "160m": 2, "288m": 2,
 }
 
-# Score de TYPE — couvre les 10 types reels de l'indicateur Origin Levels.
-# Le matching retient la cle la PLUS SPECIFIQUE (la plus longue) presente dans le
-# libelle. Les valeurs marquees (valider) sont provisoires -> a confirmer par Syn.
+# Poids fondés sur la hiérarchie de probabilité de Syn (corpus) :
+#   retest break level cassé ~95% · hold rejection / untested origin ~90% ·
+#   origin retest 1ère visite haute · formation faible.
+# Ce sont des PRIORS : /stats_view reste l'arbitre sur tes vrais trades.
 TYPE_SCORES = {
-    # — niveaux "au contact" (price au niveau, tradeable) —
-    "origin untouched": 5,
-    "broken origin first touch": 4,
-    "origin first touch": 4,
-    "break first touch": 3,
-    "broken first touch": 3,
-    "atr proximity": 3,
-    "origin touched": 1,
-    # — evenements de flip / BSUT (valider Syn) —
+    # — retest de niveau cassé : catégorie la + fiable (95%) —
+    "break first touch":           6,
+    "broken first touch":          6,
+    # — origin retest première visite (~90%) —
+    "broken origin first touch":   5,
+    "origin first touch":          5,
+    "origin untouched":            5,
+    # — HOLD LEVELS (indicateur Syn) : rejet de hold = proba la + haute —
+    "hold activated":              6,   # attrape aussi "Origin Hold ACTIVATED"
+    "hold armed":                  4,   # "Origin Hold ARMED"
+    "hold atr proximity":          3,   # "Hold/Origin Hold ATR PROXIMITY"
+    "hold created":                2,   # niveau formé, prix pas encore là
+    # — approche / armement —
+    "atr proximity":               3,
+    # — niveau déjà visité —
+    "origin touched":              1,
+    # — flips / BSUT (valider Syn) —
     "origin broken: origin bsut created": 3,
-    "break broken: bsut created": 3,
-    # — evenements de FORMATION de niveau (price pas encore au niveau, valider Syn) —
-    "rng-hit created": 2,
-    "origin created": 1,
-    "break created": 1,
-    # — fallbacks de robustesse —
-    "origin broken": 2,
-    "bsut created": 2,
+    "break broken: bsut created":  3,
+    # — événements de FORMATION —
+    "rng-hit created":             2,
+    "origin created":              1,
+    "break created":               1,
+    # — fallbacks —
+    "origin broken":               2,
+    "bsut created":                2,
 }
 
 
-def compute_score(parsed: dict) -> dict:
+# ── CONFLUENCE : niveaux empilés au même prix = haute proba (système Syn) ──
+CONFLUENCE_TOL_PCT = 0.8      # tolérance prix pour considérer deux niveaux "au même endroit"
+CONFLUENCE_MAX_BONUS = 4      # plafond du bonus
+
+
+def confluence_bonus(parsed: dict, history, tol_pct: float = CONFLUENCE_TOL_PCT,
+                     max_bonus: int = CONFLUENCE_MAX_BONUS):
+    """(bonus, details) : compte les alertes récentes de même asset+side, à prix
+    proche, sur des TF DIFFÉRENTS (un même TF ne compte qu'une fois)."""
+    asset = (parsed.get("asset") or "").upper()
+    side  = parsed.get("side")
+    price = parsed.get("price")
+    tf    = parsed.get("timeframe")
+    if not (asset and side and price):
+        return 0, []
+    stacked, seen_tf = [], set()
+    for h in history:
+        if (h.get("asset") or "").upper() != asset:
+            continue
+        if h.get("side") != side:
+            continue
+        htf = h.get("timeframe")
+        if htf == tf or htf in seen_tf:
+            continue
+        hp = h.get("price")
+        if hp and abs(price - hp) / hp * 100 <= tol_pct:
+            stacked.append(htf)
+            seen_tf.add(htf)
+    n = len(stacked)
+    if n == 0:
+        return 0, []
+    bonus = min(n + 1, max_bonus)          # 1 empilement → +2, 2 → +3, 3+ → +4
+    return bonus, [f"Confluence ×{n} (TF empilés : {', '.join(map(str, stacked))}) → +{bonus}"]
+
+
+def compute_score(parsed: dict, history=None) -> dict:
     score, details = 0, []
     alert_type = (parsed.get("type") or "").lower()
     tf    = (parsed.get("timeframe") or "").upper()
@@ -412,6 +511,13 @@ def compute_score(parsed: dict) -> dict:
         score += 2
         details.append("Première visite (First Touch) → +2")
 
+    # ── CONFLUENCE (si l'historique est fourni) ──
+    if history is not None:
+        cb, cdetails = confluence_bonus(parsed, history)
+        if cb:
+            score += cb
+            details.extend(cdetails)
+
     if score >= 8:
         level, emoji = "PRIORITAIRE", "🔴"
     elif score >= 5:
@@ -432,7 +538,8 @@ TF_CUSTOM = {"72m", "90m", "96m", "144m", "160m", "288m"}
 TF_DAILY  = {"D1", "D2", "D3", "D4", "D5", "D6", "D7", "1D", "2D", "3D", "4D", "5D", "6D", "7D", "W1", "MN", "1W"}
 
 TYPES_ALWAYS     = {"origin first touch", "origin untouched", "atr proximity",
-                    "break first touch", "broken first touch", "broken origin first touch"}
+                    "break first touch", "broken first touch", "broken origin first touch",
+                    "hold activated"}
 TYPES_DAILY_ONLY = {"origin touched"}
 TYPES_SCORE_MIN  = {"bsut created": 6}
 TYPES_IGNORED    = {"break created"}
@@ -485,8 +592,7 @@ def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
 # TELEGRAM
 # ─────────────────────────────────────────────
 def send_telegram(message: str, chat_id: str = None, retries: int = 3):
-    """Envoi Telegram avec retry + backoff (sans dépendance externe).
-    429 / 5xx → on réessaie ; 4xx (hors 429) → abandon immédiat."""
+    """Envoi Telegram avec retry + backoff (sans dépendance externe)."""
     if not TELEGRAM_TOKEN:
         return False
     target = chat_id or TELEGRAM_CHAT_ID
@@ -522,10 +628,22 @@ def format_telegram_message(parsed: dict, scoring: dict, profile: dict = None) -
     side_emoji    = "🟢" if parsed.get("side") == "Support" else "🔴"
     scope_tag     = "✅ Pure" if parsed.get("scope") == "Pure" else "⬜ Non-Pure"
     asset_display = f"{meta['emoji']} {esc(asset)}" if asset else f"{meta['emoji']} voir chart"
+
+    # Ligne cible : si une cible d'obligation est fournie (Exit du hold ou Target),
+    # on l'affiche à la place du SL générique.
+    target   = parsed.get("target")
+    move_pct = parsed.get("move_pct")
+    if target:
+        tgt_line = f"→ 🎯 Cible obligation : <b>{esc(target)}</b>"
+        if move_pct:
+            tgt_line += f"  (<b>{esc(move_pct)}%</b>)"
+    else:
+        tgt_line = "→ SL visé : 5-10 pts"
+
     action = (
-        "→ Surveille M1 maintenant\n→ Setup <b>LONG</b> potentiel\n→ SL visé : 5-10 pts"
+        f"→ Surveille M1 maintenant\n→ Setup <b>LONG</b> potentiel\n{tgt_line}"
         if parsed.get("side") == "Support" else
-        "→ Surveille M1 maintenant\n→ Setup <b>SHORT</b> potentiel\n→ SL visé : 5-10 pts"
+        f"→ Surveille M1 maintenant\n→ Setup <b>SHORT</b> potentiel\n{tgt_line}"
     )
 
     msg = (
@@ -606,7 +724,6 @@ def handle_telegram_command(text: str, chat_id: str):
         msg = f"✅ Tes notifications sont <b>réactivées</b>\nMode : {profile['mode'].upper()}"
 
     elif cmd == "/killswitch":
-        # Commande admin : coupe/réactive TOUTES les notifications, tous utilisateurs
         if chat_id != TELEGRAM_CHAT_ID:
             msg = "⛔ Commande réservée à l'admin."
         elif arg == "on":
@@ -667,7 +784,6 @@ def handle_telegram_command(text: str, chat_id: str):
             "/btc | /dax | /stocks"
         )
 
-    # Persistance du profil après toute commande (upsert idempotent)
     try:
         save_profile(chat_id, profile)
     except Exception as e:
@@ -677,29 +793,17 @@ def handle_telegram_command(text: str, chat_id: str):
 
 
 # ─────────────────────────────────────────────
-# ÉVALUATION AUTOMATIQUE DES ISSUES (v2.3.0)
+# ÉVALUATION AUTOMATIQUE DES ISSUES
 # ─────────────────────────────────────────────
-# Mesure, pour chaque alerte 'pending' assez ancienne, si le NIVEAU a produit
-# un mouvement favorable. C'est un PROXY DIRECTIONNEL pour calibrer le scoring
-# (un score 12 réagit-il mieux qu'un score 7 ?), PAS le P&L exact de ton trade
-# qui dépend de ton englobante/SL réel.
-#
-# Source : Twelve Data si TWELVEDATA_API_KEY défini (couverture homogène),
-# sinon Yahoo keyless (XAU via le futur GC=F → léger basis vs ton feed Vantage).
-# Granularité H1.
-
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
-EVAL_MIN_AGE_H      = 12      # age minimum d'une alerte avant 1re evaluation (h)
-EVAL_ATR_BARS       = 14      # nb de bougies (au TF de l'alerte) pour l'ATR
-EVAL_HORIZON_BARS   = 12      # fenetre d'observation = 12 bougies du TF de l'alerte
-EVAL_HORIZON_MIN_H  = 48      # plancher de la fenetre (h)
-EVAL_HORIZON_MAX_H  = 504     # plafond de la fenetre = 21 jours (h)
-EVAL_LOOKBACK_MAX_H = 504     # plafond du lookback ATR (h)
+EVAL_MIN_AGE_H      = 12
+EVAL_ATR_BARS       = 14
+EVAL_HORIZON_BARS   = 12
+EVAL_HORIZON_MIN_H  = 48
+EVAL_HORIZON_MAX_H  = 504
+EVAL_LOOKBACK_MAX_H = 504
 
-# Stop ADAPTATIF par timeframe : SL = k * ATR(au TF de l'alerte), borne par
-# [sl_floor, sl_cap]. fallback = SL fixe si l'ATR ne peut pas etre calcule.
-# tp_r = multiple de R vise (TP = tp_r * SL).
 EVAL_RISK = {
     "xau":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
     "dax":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 8.0,  "sl_cap": 400.0,  "fallback": 30.0},
@@ -708,7 +812,6 @@ EVAL_RISK = {
     "stocks": {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
 }
 
-# Duree (heures) d'une bougie par timeframe -> dimensionne ATR, lookback et horizon
 TF_HOURS = {
     "M1": 1, "M2": 1, "M3": 1, "M4": 1, "M5": 1, "M10": 1, "M15": 1, "M30": 1, "M45": 1,
     "H1": 1, "H2": 2, "H3": 3, "H4": 4, "H6": 6, "H8": 8, "H12": 12,
@@ -727,8 +830,6 @@ def tf_hours(tf):
 
 
 def _atr_at_tf(pre_bars, tf_h):
-    """ATR (base sur le range haut-bas) au timeframe de l'alerte, calcule a partir
-    de bougies H1 anterieures a l'alerte, regroupees en paquets de la taille du TF."""
     if len(pre_bars) < 2:
         return None
     bucket = max(1, int(round(tf_h)))
@@ -742,6 +843,7 @@ def _atr_at_tf(pre_bars, tf_h):
         return None
     last = ranges[-EVAL_ATR_BARS:]
     return sum(last) / len(last)
+
 
 SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD"}
 SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD"}
@@ -819,17 +921,13 @@ def fetch_prices(group, asset, start_dt, end_dt):
 
 
 def evaluate_pending_outcomes():
-    """Evalue les alertes 'pending' assez anciennes, avec un STOP ADAPTATIF au
-    timeframe (SL = k*ATR du TF) et une FENETRE proportionnelle au TF. Un niveau
-    Daily est donc juge avec un stop large et plus de temps qu'un H4.
-    Regle : depuis le niveau, dans le sens du Side, win si +tp_r*SL atteint avant
-    -SL ; loss sinon ; 'invalid' seulement si la fenetre est entierement ecoulee
-    (sinon l'alerte reste 'pending' et sera reevaluee plus tard). Intrabar : SL
-    teste avant TP (conservateur). Proxy directionnel, pas le P&L reel du trade."""
+    """Évalue les alertes 'pending' avec stop adaptatif (SL = k*ATR du TF) et
+    fenêtre proportionnelle au TF. Si une cible d'obligation (target) est connue,
+    le TP devient la distance Entry→cible réelle de Syn (au lieu de tp_r arbitraire)."""
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe "
+            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
             "ORDER BY a.id LIMIT 100"
@@ -838,7 +936,7 @@ def evaluate_pending_outcomes():
     evaluated = 0
     _start = time.monotonic()
     for r in rows:
-        if time.monotonic() - _start > 20:        # budget temps : finir avant le timeout du cron
+        if time.monotonic() - _start > 20:
             break
         try:
             ts = datetime.fromisoformat(r["ts"])
@@ -871,8 +969,13 @@ def evaluate_pending_outcomes():
             sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
         else:
             sl, sl_src = risk["fallback"], "fallback"
-        tp = sl * risk["tp_r"]
+
         entry = r["price"]
+        # TP = cible d'obligation réelle si connue, sinon multiple de R
+        if r["target"] is not None and entry:
+            tp, tp_src = abs(r["target"] - entry), "obligation"
+        else:
+            tp, tp_src = sl * risk["tp_r"], "R"
         long_bias = (r["side"] == "Support")
 
         mfe = mae = 0.0
@@ -887,18 +990,18 @@ def evaluate_pending_outcomes():
                 status, r_real = "loss", -1.0
                 break
             if fav >= tp:
-                status, r_real = "win", risk["tp_r"]
+                status, r_real = "win", round(tp / sl, 2) if sl else None
                 break
 
         if status is None:
             if now >= ts + timedelta(hours=horizon_h):
                 status, r_real = "invalid", (round(mfe / sl, 2) if sl else None)
             else:
-                continue          # fenetre pas encore ecoulee -> reste 'pending'
+                continue
 
         src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
         note = (f"auto ({src}, TF={r['timeframe']}, SL={round(sl, 2)}[{sl_src}], "
-                f"TP={round(tp, 2)}, H={int(horizon_h)}h)")
+                f"TP={round(tp, 2)}[{tp_src}], H={int(horizon_h)}h)")
         with db() as conn:
             conn.execute(
                 "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, r_realized=?, "
@@ -930,11 +1033,22 @@ def webhook():
     if not raw:
         return jsonify({"error": "empty body"}), 400
 
-    parsed  = parse_fiblab_message(raw)
-    scoring = compute_score(parsed)
+    # Aiguillage : message hold (multi-lignes) vs format standard.
+    asset_url  = request.args.get("asset")
+    first_line = raw.split("\n")[0].lower()
+    if "hold" in first_line:
+        parsed = parse_hold_message(raw, asset_hint=asset_url)
+        if parsed is None:
+            parsed = parse_fiblab_message(raw)
+    else:
+        parsed = parse_fiblab_message(raw)
+    # Filet de sécurité : asset depuis l'URL si absent du message
+    if not parsed.get("asset") and asset_url:
+        parsed["asset"] = asset_url.upper()
+
+    scoring = compute_score(parsed, history=alert_history)
     group   = get_asset_group(parsed.get("asset") or "")
 
-    # Persistance + id pour le suivi d'issue
     try:
         alert_id = save_alert(parsed, scoring, group)
     except Exception as e:
@@ -956,7 +1070,6 @@ def webhook():
         profile = get_profile(user_id)
         if profile["paused"]:
             continue
-        # Frère reçoit PRIORITAIRES uniquement
         if user_id == TELEGRAM_CHAT_ID_2 and scoring["level"] != "PRIORITAIRE":
             continue
         notify, reason = should_notify(parsed, scoring, profile)
@@ -989,7 +1102,6 @@ def telegram_update():
 
 @app.route("/outcome/<int:alert_id>", methods=["POST"])
 def set_outcome(alert_id):
-    """Tague manuellement l'issue d'une alerte (en attendant l'auto-éval)."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     d = request.get_json(silent=True) or {}
@@ -1009,7 +1121,6 @@ def set_outcome(alert_id):
 
 @app.route("/stats", methods=["GET"])
 def stats():
-    """Win rate par score et par type — le coeur de la calibration future."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     with db() as conn:
@@ -1043,8 +1154,6 @@ def stats():
 
 @app.route("/evaluate", methods=["GET", "POST"])
 def evaluate_route():
-    """Lance l'évaluation des issues 'pending'. À pinger périodiquement
-    (cron-job.org, Railway cron...) ou à la main. Renvoie le nb traité."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     n = evaluate_pending_outcomes()
@@ -1055,8 +1164,6 @@ def evaluate_route():
 
 @app.route("/reeval", methods=["GET", "POST"])
 def reeval_route():
-    """Remet TOUTES les issues a 'pending' pour reevaluation avec la methode
-    adaptative en cours. A lancer une fois apres un changement de methode."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     with db() as conn:
@@ -1071,7 +1178,6 @@ def reeval_route():
 
 @app.route("/price_test", methods=["GET"])
 def price_test():
-    """Vérifie que la source de prix répond (utile si Yahoo bloque l'IP Railway)."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     end = datetime.now(timezone.utc)
@@ -1083,7 +1189,7 @@ def price_test():
 
 
 # ─────────────────────────────────────────────
-# TABLEAU DE BORD DE CALIBRATION (v2.4.1 — rendu serveur, sans JS ni CDN)
+# TABLEAU DE BORD DE CALIBRATION (rendu serveur, sans JS ni CDN)
 # ─────────────────────────────────────────────
 DASH_CSS = """<style>
 :root{--bg:#080c10;--card:#0d1117;--bd:#1c2333;--gold:#f5a623;--grn:#3fb950;--red:#f85149;--blue:#58a6ff;--pur:#a78bfa;--tx:#cdd9e5;--dim:#768390}
@@ -1133,7 +1239,6 @@ def _bar_rows(rows, color):
 
 @app.route("/stats_view", methods=["GET"])
 def stats_view():
-    """Tableau de bord de calibration — rendu 100% serveur (aucune dependance externe)."""
     if not check_secret():
         return ("unauthorized", 403)
     with db() as conn:
@@ -1216,9 +1321,6 @@ def stats_view():
 
 @app.route("/db_count", methods=["GET"])
 def db_count():
-    """NEW v2.2.0 — compte réel en base, pour prouver que le volume persiste.
-    Test : appeler /test deux-trois fois → redéployer → si ce compteur ne
-    repart pas à zéro, la persistance fonctionne."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     with db() as conn:
@@ -1234,6 +1336,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
+        "version": "2.6.0",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
@@ -1285,7 +1388,7 @@ def levels():
 
 def _test(fake: str):
     parsed  = parse_fiblab_message(fake)
-    scoring = compute_score(parsed)
+    scoring = compute_score(parsed, history=alert_history)
     group   = get_asset_group(parsed.get("asset") or "")
     try:
         save_alert(parsed, scoring, group)
@@ -1323,13 +1426,31 @@ def test_stocks():
     return _test("Origin First Touch — TSLA H4 | Side: Support | Price: 285.00 | Scope: Pure")
 
 
+@app.route("/test_hold", methods=["GET"])
+def test_hold():
+    """Test du parser hold : simule un message ACTIVATED avec cible d'obligation."""
+    raw = ("Hold ACTIVATED\nTF: 1440\nSupport\nWick Engulfment\n"
+           "Entry touched: 4310.00\nExit: 4355.00\nMove%: 1.04")
+    parsed  = parse_hold_message(raw, asset_hint="XAUUSD")
+    scoring = compute_score(parsed, history=alert_history)
+    group   = get_asset_group(parsed.get("asset") or "")
+    try:
+        save_alert(parsed, scoring, group)
+    except Exception as e:
+        print(f"[DB] _test_hold save_alert : {e}")
+    msg = format_telegram_message(parsed, scoring, get_profile(TELEGRAM_CHAT_ID))
+    sent = send_telegram(msg, TELEGRAM_CHAT_ID)
+    return jsonify({"telegram_charlie": sent, "parsed": parsed, "scoring": scoring})
+
+
 # ─────────────────────────────────────────────
 # INIT (au chargement du module → fonctionne aussi sous gunicorn)
 # ─────────────────────────────────────────────
 init_db()
-clean_seed_rows()                # v2.4.0 : retire les lignes de test SEED
+migrate_db()                     # v2.6.0 : ajoute colonnes target/move_pct si besoin
+clean_seed_rows()
 load_profiles()
-load_alert_history()             # restaure le dashboard après redéploiement
+load_alert_history()
 
 
 if __name__ == "__main__":
