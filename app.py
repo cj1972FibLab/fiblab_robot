@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.4.1)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.5.0)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.1.0 + patch :                                       ║
@@ -673,17 +673,58 @@ def handle_telegram_command(text: str, chat_id: str):
 
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
-EVAL_MIN_AGE_H = 12     # n'évalue qu'une alerte d'au moins 12h (assez de recul)
-EVAL_HORIZON_H = 72     # fenêtre d'observation après l'alerte
+EVAL_MIN_AGE_H      = 12      # age minimum d'une alerte avant 1re evaluation (h)
+EVAL_ATR_BARS       = 14      # nb de bougies (au TF de l'alerte) pour l'ATR
+EVAL_HORIZON_BARS   = 12      # fenetre d'observation = 12 bougies du TF de l'alerte
+EVAL_HORIZON_MIN_H  = 48      # plancher de la fenetre (h)
+EVAL_HORIZON_MAX_H  = 504     # plafond de la fenetre = 21 jours (h)
+EVAL_LOOKBACK_MAX_H = 504     # plafond du lookback ATR (h)
 
-# 1R = SL proxy (en points) ; win si +tp_r*SL atteint AVANT -SL
+# Stop ADAPTATIF par timeframe : SL = k * ATR(au TF de l'alerte), borne par
+# [sl_floor, sl_cap]. fallback = SL fixe si l'ATR ne peut pas etre calcule.
+# tp_r = multiple de R vise (TP = tp_r * SL).
 EVAL_RISK = {
-    "xau":    {"sl": 15.0,  "tp_r": 3.0},
-    "dax":    {"sl": 30.0,  "tp_r": 3.0},
-    "btc":    {"sl": 400.0, "tp_r": 3.0},
-    "solana": {"sl": 2.0,   "tp_r": 3.0},
-    "stocks": {"sl": 2.0,   "tp_r": 3.0},
+    "xau":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
+    "dax":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 8.0,  "sl_cap": 400.0,  "fallback": 30.0},
+    "btc":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 80.0, "sl_cap": 6000.0, "fallback": 400.0},
+    "solana": {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.5,  "sl_cap": 40.0,   "fallback": 2.0},
+    "stocks": {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
 }
+
+# Duree (heures) d'une bougie par timeframe -> dimensionne ATR, lookback et horizon
+TF_HOURS = {
+    "M1": 1, "M2": 1, "M3": 1, "M4": 1, "M5": 1, "M10": 1, "M15": 1, "M30": 1, "M45": 1,
+    "H1": 1, "H2": 2, "H3": 3, "H4": 4, "H6": 6, "H8": 8, "H12": 12,
+    "D1": 24, "1D": 24, "D": 24, "DAILY": 24,
+    "2D": 48, "3D": 72, "4D": 96, "5D": 120, "6D": 144, "7D": 168,
+    "D2": 48, "D3": 72, "D4": 96, "D5": 120, "D6": 144, "D7": 168,
+    "W1": 168, "1W": 168, "W": 168, "WEEKLY": 168, "MN": 336, "MONTHLY": 336,
+    "72m": 1, "90m": 2, "96m": 2, "144m": 2, "160m": 3, "288m": 5,
+}
+
+
+def tf_hours(tf):
+    if not tf:
+        return 4
+    return TF_HOURS.get(tf, TF_HOURS.get(tf.upper(), 4))
+
+
+def _atr_at_tf(pre_bars, tf_h):
+    """ATR (base sur le range haut-bas) au timeframe de l'alerte, calcule a partir
+    de bougies H1 anterieures a l'alerte, regroupees en paquets de la taille du TF."""
+    if len(pre_bars) < 2:
+        return None
+    bucket = max(1, int(round(tf_h)))
+    ranges = []
+    i = 0
+    while i + bucket <= len(pre_bars):
+        chunk = pre_bars[i:i + bucket]
+        ranges.append(max(b[1] for b in chunk) - min(b[2] for b in chunk))
+        i += bucket
+    if not ranges:
+        return None
+    last = ranges[-EVAL_ATR_BARS:]
+    return sum(last) / len(last)
 
 SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD"}
 SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD"}
@@ -761,14 +802,17 @@ def fetch_prices(group, asset, start_dt, end_dt):
 
 
 def evaluate_pending_outcomes():
-    """Évalue les alertes 'pending' assez anciennes. Renvoie le nb traité.
-    Depuis le niveau, dans le sens du Side : win si +tp_r*SL atteint avant -SL ;
-    loss sinon ; 'invalid' si ni l'un ni l'autre dans la fenêtre. Intrabar, on
-    teste le SL avant le TP (hypothèse conservatrice)."""
+    """Evalue les alertes 'pending' assez anciennes, avec un STOP ADAPTATIF au
+    timeframe (SL = k*ATR du TF) et une FENETRE proportionnelle au TF. Un niveau
+    Daily est donc juge avec un stop large et plus de temps qu'un H4.
+    Regle : depuis le niveau, dans le sens du Side, win si +tp_r*SL atteint avant
+    -SL ; loss sinon ; 'invalid' seulement si la fenetre est entierement ecoulee
+    (sinon l'alerte reste 'pending' et sera reevaluee plus tard). Intrabar : SL
+    teste avant TP (conservateur). Proxy directionnel, pas le P&L reel du trade."""
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price "
+            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
             "ORDER BY a.id LIMIT 100"
@@ -777,7 +821,7 @@ def evaluate_pending_outcomes():
     evaluated = 0
     _start = time.monotonic()
     for r in rows:
-        if time.monotonic() - _start > 20:   # budget temps : finir avant le timeout du cron
+        if time.monotonic() - _start > 20:        # budget temps : finir avant le timeout du cron
             break
         try:
             ts = datetime.fromisoformat(r["ts"])
@@ -791,25 +835,38 @@ def evaluate_pending_outcomes():
         if not risk:
             continue
 
-        bars = fetch_prices(r["grp"], r["asset"], ts,
-                            min(ts + timedelta(hours=EVAL_HORIZON_H), now))
-        if not bars:
-            continue   # pas de data pour l'instant → on réessaiera plus tard
+        tf_h       = tf_hours(r["timeframe"])
+        horizon_h  = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
+        lookback_h = min(EVAL_ATR_BARS * tf_h, EVAL_LOOKBACK_MAX_H)
+        end_dt     = min(ts + timedelta(hours=horizon_h), now)
+        start_dt   = ts - timedelta(hours=lookback_h)
 
-        entry = r["price"]
-        sl = risk["sl"]
+        bars = fetch_prices(r["grp"], r["asset"], start_dt, end_dt)
+        if not bars:
+            continue
+        pre  = [b for b in bars if b[0] <= ts]
+        post = [b for b in bars if b[0] > ts]
+        if not post:
+            continue
+
+        atr = _atr_at_tf(pre, tf_h)
+        if atr and atr > 0:
+            sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
+        else:
+            sl, sl_src = risk["fallback"], "fallback"
         tp = sl * risk["tp_r"]
+        entry = r["price"]
         long_bias = (r["side"] == "Support")
+
         mfe = mae = 0.0
         status = None
         r_real = None
-
-        for (_dt, hi, lo) in bars:
+        for (_dt, hi, lo) in post:
             fav = (hi - entry) if long_bias else (entry - lo)
             adv = (entry - lo) if long_bias else (hi - entry)
             mfe = max(mfe, fav)
             mae = max(mae, adv)
-            if adv >= sl:                 # SL touché d'abord (conservateur)
+            if adv >= sl:
                 status, r_real = "loss", -1.0
                 break
             if fav >= tp:
@@ -817,16 +874,19 @@ def evaluate_pending_outcomes():
                 break
 
         if status is None:
-            status = "invalid"            # ni TP ni SL dans la fenêtre
-            r_real = round(mfe / sl, 2) if sl else None
+            if now >= ts + timedelta(hours=horizon_h):
+                status, r_real = "invalid", (round(mfe / sl, 2) if sl else None)
+            else:
+                continue          # fenetre pas encore ecoulee -> reste 'pending'
 
         src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
+        note = (f"auto ({src}, TF={r['timeframe']}, SL={round(sl, 2)}[{sl_src}], "
+                f"TP={round(tp, 2)}, H={int(horizon_h)}h)")
         with db() as conn:
             conn.execute(
                 "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, r_realized=?, "
                 "note=?, updated_ts=? WHERE alert_id=?",
-                (status, round(mfe, 2), round(mae, 2), r_real,
-                 f"auto ({src}, SL={sl}, TP={tp})", now_iso(), r["id"])
+                (status, round(mfe, 2), round(mae, 2), r_real, note, now_iso(), r["id"])
             )
             conn.commit()
         evaluated += 1
@@ -974,6 +1034,22 @@ def evaluate_route():
     with db() as conn:
         remaining = conn.execute("SELECT COUNT(*) AS n FROM outcomes WHERE status='pending'").fetchone()["n"]
     return jsonify({"evaluated": n, "remaining_pending": remaining})
+
+
+@app.route("/reeval", methods=["GET", "POST"])
+def reeval_route():
+    """Remet TOUTES les issues a 'pending' pour reevaluation avec la methode
+    adaptative en cours. A lancer une fois apres un changement de methode."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE outcomes SET status='pending', mfe_pts=NULL, mae_pts=NULL, "
+            "r_realized=NULL, note=NULL WHERE status != 'pending'"
+        )
+        conn.commit()
+        n = cur.rowcount
+    return jsonify({"reset_to_pending": n})
 
 
 @app.route("/price_test", methods=["GET"])
