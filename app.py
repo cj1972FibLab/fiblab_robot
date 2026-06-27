@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.4.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.4.1)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.1.0 + patch :                                       ║
@@ -705,7 +705,7 @@ def _fetch_yahoo(symbol, start_dt, end_dt):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"period1": int(start_dt.timestamp()),
               "period2": int(end_dt.timestamp()), "interval": "1h"}
-    r = requests.get(url, params=params, timeout=15,
+    r = requests.get(url, params=params, timeout=8,
                      headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     res = (r.json().get("chart", {}).get("result") or [None])[0]
@@ -729,7 +729,7 @@ def _fetch_twelvedata(symbol, start_dt, end_dt):
               "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
               "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
               "apikey": TWELVEDATA_API_KEY, "timezone": "UTC", "outputsize": 5000}
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(url, params=params, timeout=8)
     r.raise_for_status()
     vals = r.json().get("values")
     if not vals:
@@ -770,11 +770,15 @@ def evaluate_pending_outcomes():
         rows = conn.execute(
             "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
-            "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL"
+            "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
+            "ORDER BY a.id LIMIT 100"
         ).fetchall()
 
     evaluated = 0
+    _start = time.monotonic()
     for r in rows:
+        if time.monotonic() - _start > 20:   # budget temps : finir avant le timeout du cron
+            break
         try:
             ts = datetime.fromisoformat(r["ts"])
         except Exception:
@@ -967,7 +971,9 @@ def evaluate_route():
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
     n = evaluate_pending_outcomes()
-    return jsonify({"evaluated": n})
+    with db() as conn:
+        remaining = conn.execute("SELECT COUNT(*) AS n FROM outcomes WHERE status='pending'").fetchone()["n"]
+    return jsonify({"evaluated": n, "remaining_pending": remaining})
 
 
 @app.route("/price_test", methods=["GET"])
@@ -984,95 +990,57 @@ def price_test():
 
 
 # ─────────────────────────────────────────────
-# TABLEAU DE BORD DE CALIBRATION (v2.4.0)
+# TABLEAU DE BORD DE CALIBRATION (v2.4.1 — rendu serveur, sans JS ni CDN)
 # ─────────────────────────────────────────────
-DASH_HTML = """<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FibLab — Calibration</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-:root{--bg:#080c10;--card:#0d1117;--bd:#1c2333;--gold:#f5a623;--grn:#3fb950;
---red:#f85149;--blue:#58a6ff;--pur:#a78bfa;--tx:#cdd9e5;--dim:#768390}
+DASH_CSS = """<style>
+:root{--bg:#080c10;--card:#0d1117;--bd:#1c2333;--gold:#f5a623;--grn:#3fb950;--red:#f85149;--blue:#58a6ff;--pur:#a78bfa;--tx:#cdd9e5;--dim:#768390}
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px;max-width:1100px;margin:0 auto}
+body{background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px;max-width:1000px;margin:0 auto}
 h1{font-size:1.5rem;color:var(--gold);margin-bottom:4px}
 .sub{color:var(--dim);font-size:.8rem;margin-bottom:20px}
+.refresh{float:right;font-size:.75rem;color:var(--blue);text-decoration:none;border:1px solid var(--bd);padding:5px 10px;border-radius:6px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:22px}
 .stat{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:13px}
 .lbl{font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:5px}
-.val{font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums}
+.val{font-size:1.5rem;font-weight:700}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:18px}
-.card h2{font-size:.95rem;margin-bottom:12px;color:var(--blue)}
-.note{background:rgba(88,166,255,.06);border:1px solid rgba(88,166,255,.2);border-radius:8px;padding:14px;font-size:.8rem;line-height:1.6;color:var(--tx)}
-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:8px}
+.card h2{font-size:.9rem;margin-bottom:14px;color:var(--blue)}
+.brow{display:flex;align-items:center;gap:10px;margin:7px 0;font-size:.8rem}
+.blab{width:54px;text-align:right;color:var(--tx);flex-shrink:0}
+.btrack{flex:1;height:20px;background:#0a0e14;border:1px solid var(--bd);border-radius:5px;overflow:hidden}
+.bfill{height:100%;border-radius:4px 0 0 4px;min-width:2px}
+.bval{width:172px;text-align:left;flex-shrink:0}
+.bn{color:var(--dim);font-size:.72rem}
+.note{background:rgba(88,166,255,.06);border:1px solid rgba(88,166,255,.2);border-radius:8px;padding:14px;font-size:.8rem;line-height:1.6;margin-bottom:18px}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
 th{text-align:left;padding:7px 9px;font-size:.6rem;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--bd)}
-td{padding:7px 9px;border-bottom:1px solid var(--bd);font-variant-numeric:tabular-nums}
-.empty{text-align:center;color:var(--dim);padding:40px;font-size:.9rem}
-.refresh{float:right;font-size:.75rem;color:var(--blue);text-decoration:none;border:1px solid var(--bd);padding:5px 10px;border-radius:6px}
-canvas{max-height:260px}
-</style></head><body>
-<a class="refresh" href="javascript:location.reload()">↻ Rafraîchir</a>
-<h1>🎯 Calibration du scoring</h1>
-<div class="sub">Win rate des alertes par score / type / timeframe — pour ajuster les poids sur des faits</div>
-<div id="app"></div>
-<script>
-const D = __DATA__;
-const app = document.getElementById('app');
-const C = {grid:'#1c2333', tick:'#768390', gold:'#f5a623', grn:'#3fb950', blue:'#58a6ff', pur:'#a78bfa'};
+td{padding:7px 9px;border-bottom:1px solid var(--bd)}
+.empty{text-align:center;color:var(--dim);padding:40px;font-size:.9rem;line-height:1.7}
+.muted{color:var(--dim);font-size:.8rem;padding:8px}
+code{background:#161b22;padding:2px 6px;border-radius:4px;color:var(--gold)}
+</style>"""
 
-if (D.total_eval === 0) {
-  app.innerHTML = '<div class="empty">Aucune alerte évaluée pour l\'instant.<br><br>'
-    + 'Les alertes sont notées automatiquement une fois passées 12h '
-    + '(' + (D.counts.pending||0) + ' en attente). Reviens dans un jour ou deux.</div>';
-} else {
-  const wr = D.overall_wr;
-  const wrColor = wr>=50 ? C.grn : C.gold;
-  app.innerHTML = `
-    <div class="grid">
-      <div class="stat"><div class="lbl">Évaluées</div><div class="val" style="color:${C.blue}">${D.total_eval}</div></div>
-      <div class="stat"><div class="lbl">Win rate global</div><div class="val" style="color:${wrColor}">${wr}%</div></div>
-      <div class="stat"><div class="lbl">Win</div><div class="val" style="color:${C.grn}">${D.counts.win}</div></div>
-      <div class="stat"><div class="lbl">Loss</div><div class="val" style="color:${C.red||'#f85149'}">${D.counts.loss}</div></div>
-      <div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:${C.tick}">${D.counts.invalid||0}</div></div>
-      <div class="stat"><div class="lbl">En attente</div><div class="val" style="color:${C.tick}">${D.counts.pending||0}</div></div>
-    </div>
-    <div class="card"><h2>Win rate par SCORE — le graphe clé</h2><canvas id="cScore"></canvas></div>
-    <div class="note"><b>Comment lire :</b> si ton scoring est bon, le win rate doit <b>monter avec le score</b>
-      (un 12 gagne plus qu'un 7). Si la barre d'un score faible dépasse celle d'un score fort, c'est que les
-      <b>poids sont mal calibrés</b> — c'est exactement ce qu'on ajustera. Les barres pâles = peu de données (peu fiable).</div>
-    <div class="card"><h2>Win rate par TYPE</h2><canvas id="cType"></canvas></div>
-    <div class="card"><h2>Win rate par TIMEFRAME</h2><canvas id="cTf"></canvas></div>
-    <div class="card"><h2>Détail par score</h2>
-      <table><thead><tr><th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead>
-      <tbody>${D.by_score.map(r=>`<tr><td>${r.k}</td><td style="color:${C.grn}">${r.win}</td>
-        <td style="color:#f85149">${r.loss}</td><td>${r.n}</td>
-        <td style="font-weight:700;color:${r.wr>=50?C.grn:C.gold}">${r.wr}%</td></tr>`).join('')}</tbody></table>
-    </div>`;
 
-  function barChart(id, rows, color){
-    const op = rows.map(r => r.n>=5 ? 1 : 0.4);  // pâle si < 5 trades
-    new Chart(document.getElementById(id), {
-      type:'bar',
-      data:{labels: rows.map(r=>r.k),
-        datasets:[{data: rows.map(r=>r.wr), backgroundColor: rows.map((r,i)=>color), borderRadius:4,
-          // opacité gérée via barThickness/alpha
-          backgroundColor: rows.map((r)=> r.n>=5 ? color : color+'66')}]},
-      options:{plugins:{legend:{display:false},
-        tooltip:{callbacks:{label:(c)=>{const r=rows[c.dataIndex];return ` ${r.wr}%  (${r.win}W / ${r.loss}L · n=${r.n})`;}}}},
-        scales:{y:{beginAtZero:true,max:100,grid:{color:C.grid},ticks:{color:C.tick,callback:v=>v+'%'}},
-          x:{grid:{display:false},ticks:{color:C.tick}}}}
-    });
-  }
-  barChart('cScore', D.by_score, C.gold);
-  barChart('cType',  D.by_type,  C.blue);
-  barChart('cTf',    D.by_tf,    C.pur);
-}
-</script></body></html>"""
+def _bar_rows(rows, color):
+    if not rows:
+        return '<div class="muted">aucune donn\u00e9e</div>'
+    out = []
+    for r in rows:
+        fill = color + ("55" if r["n"] < 5 else "")
+        wrc = "var(--grn)" if r["wr"] >= 50 else "var(--gold)"
+        out.append(
+            '<div class="brow">'
+            + '<div class="blab">' + esc(r["k"]) + '</div>'
+            + '<div class="btrack"><div class="bfill" style="width:' + str(r["wr"]) + '%;background:' + fill + '"></div></div>'
+            + '<div class="bval" style="color:' + wrc + '">' + str(r["wr"]) + '% '
+            + '<span class="bn">(' + str(r["win"]) + 'W/' + str(r["loss"]) + 'L \u00b7 n=' + str(r["n"]) + ')</span></div>'
+            + '</div>')
+    return "".join(out)
 
 
 @app.route("/stats_view", methods=["GET"])
 def stats_view():
-    """Tableau de bord HTML : win rate par score/type/TF (calibration des poids)."""
+    """Tableau de bord de calibration — rendu 100% serveur (aucune dependance externe)."""
     if not check_secret():
         return ("unauthorized", 403)
     with db() as conn:
@@ -1091,9 +1059,9 @@ def stats_view():
             by_type.setdefault(r["type"] or "?", {"win": 0, "loss": 0})[st] += 1
             by_tf.setdefault(r["timeframe"] or "?", {"win": 0, "loss": 0})[st] += 1
 
-    def pack(bucket, numeric=False):
+    def pack(b, numeric=False):
         items = []
-        for k, v in bucket.items():
+        for k, v in b.items():
             tot = v["win"] + v["loss"]
             items.append({"k": str(k), "_s": k, "win": v["win"], "loss": v["loss"],
                           "n": tot, "wr": round(100 * v["win"] / tot, 1) if tot else 0})
@@ -1102,17 +1070,55 @@ def stats_view():
             del it["_s"]
         return items
 
-    won = counts["win"]
+    bs, bt, btf = pack(by_score, True), pack(by_type), pack(by_tf)
     tot_eval = counts["win"] + counts["loss"]
-    data = {
-        "counts": counts,
-        "total_eval": tot_eval,
-        "overall_wr": round(100 * won / tot_eval, 1) if tot_eval else 0,
-        "by_score": pack(by_score, numeric=True),
-        "by_type":  pack(by_type),
-        "by_tf":    pack(by_tf),
-    }
-    return DASH_HTML.replace("__DATA__", json.dumps(data))
+    wr = round(100 * counts["win"] / tot_eval, 1) if tot_eval else 0
+
+    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>FibLab \u2014 Calibration</title>' + DASH_CSS + '</head><body>')
+    header = ('<a class="refresh" href="/stats_view">\u21bb Rafra\u00eechir</a>'
+              '<h1>\U0001F3AF Calibration du scoring</h1>'
+              '<div class="sub">Win rate des alertes par score / type / timeframe '
+              '\u2014 pour ajuster les poids sur des faits</div>')
+
+    if tot_eval == 0:
+        body = ('<div class="empty">Aucune alerte \u00e9valu\u00e9e pour l\'instant.<br><br>'
+                'Les alertes sont not\u00e9es automatiquement une fois pass\u00e9es 12h ('
+                + str(counts["pending"]) + ' en attente).<br>'
+                'V\u00e9rifie aussi que le cron <code>/evaluate</code> tourne sans erreur.</div>')
+        return head + header + body + '</body></html>'
+
+    wrc = "var(--grn)" if wr >= 50 else "var(--gold)"
+    cards = ('<div class="grid">'
+             '<div class="stat"><div class="lbl">\u00c9valu\u00e9es</div><div class="val" style="color:var(--blue)">' + str(tot_eval) + '</div></div>'
+             '<div class="stat"><div class="lbl">Win rate global</div><div class="val" style="color:' + wrc + '">' + str(wr) + '%</div></div>'
+             '<div class="stat"><div class="lbl">Win</div><div class="val" style="color:var(--grn)">' + str(counts["win"]) + '</div></div>'
+             '<div class="stat"><div class="lbl">Loss</div><div class="val" style="color:var(--red)">' + str(counts["loss"]) + '</div></div>'
+             '<div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:var(--dim)">' + str(counts["invalid"]) + '</div></div>'
+             '<div class="stat"><div class="lbl">En attente</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
+             '</div>')
+    note = ('<div class="note"><b>Comment lire :</b> si ton scoring est bon, le win rate doit '
+            '<b>monter avec le score</b> (un 12 gagne plus qu\'un 7). Si une barre de score faible '
+            'd\u00e9passe celle d\'un score fort, les <b>poids sont \u00e0 recalibrer</b>. '
+            'Barres p\u00e2les = moins de 5 trades (peu fiable).</div>')
+    trows = []
+    for r in bs:
+        c = "var(--grn)" if r["wr"] >= 50 else "var(--gold)"
+        trows.append('<tr><td>' + esc(r["k"]) + '</td><td style="color:var(--grn)">' + str(r["win"])
+                     + '</td><td style="color:var(--red)">' + str(r["loss"]) + '</td><td>' + str(r["n"])
+                     + '</td><td style="font-weight:700;color:' + c + '">' + str(r["wr"]) + '%</td></tr>')
+    table = ('<div class="card"><h2>D\u00e9tail par score</h2><table><thead><tr>'
+             '<th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead><tbody>'
+             + "".join(trows) + '</tbody></table></div>')
+
+    body = (cards
+            + '<div class="card"><h2>Win rate par SCORE \u2014 le graphe cl\u00e9</h2>' + _bar_rows(bs, "#f5a623") + '</div>'
+            + note
+            + '<div class="card"><h2>Win rate par TYPE</h2>' + _bar_rows(bt, "#58a6ff") + '</div>'
+            + '<div class="card"><h2>Win rate par TIMEFRAME</h2>' + _bar_rows(btf, "#a78bfa") + '</div>'
+            + table)
+    return head + header + body + '</body></html>'
 
 
 @app.route("/db_count", methods=["GET"])
