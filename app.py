@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.1)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -204,6 +204,8 @@ ASSET_GROUPS = {
     "dax":    {"DE30EUR", "GER30", "DAX40", "FDAX1!", "DE30", "GER40", "DAX"},
     "solana": {"SOLUSDT", "SOL/USD", "SOLUSDT.P", "SOLUSD"},
     "btc":    {"BTCUSDT", "BTC/USD", "BTCUSDT.P", "BTCUSD", "BTCUSDTP"},
+    "hype":   {"HYPEUSDT", "HYPEUSDT.P", "HYPEUSD", "HYPE"},
+    "sui":    {"SUIUSDT", "SUIUSDT.P", "SUIUSD", "SUI"},
     "stocks": {"TSLA", "HOOD", "CELH", "TTD", "PLTR", "AMZN", "NVDA", "AAPL", "META", "GOOGL", "MSFT", "SOFI"},
 }
 
@@ -212,6 +214,8 @@ ASSET_META = {
     "dax":    {"label": "DAX",     "emoji": "🇩🇪", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:DE30EUR"},
     "solana": {"label": "SOLANA",  "emoji": "💎", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:SOLUSDT.P"},
     "btc":    {"label": "BITCOIN", "emoji": "₿",  "tv": "https://www.tradingview.com/chart/?symbol=BITGET:BTCUSDT.P"},
+    "hype":   {"label": "HYPE",    "emoji": "🚀", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:HYPEUSDT.P"},
+    "sui":    {"label": "SUI",     "emoji": "🌊", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:SUIUSDT.P"},
     "stocks": {"label": "STOCKS",  "emoji": "📈", "tv": "https://www.tradingview.com/chart/?symbol=NASDAQ:"},
 }
 
@@ -752,6 +756,8 @@ def handle_telegram_command(text: str, chat_id: str):
             f"💎 SOL : {len(histories['solana'])}\n"
             f"₿ BTC  : {len(histories['btc'])}\n"
             f"🇩🇪 DAX: {len(histories['dax'])}\n"
+            f"🚀 HYPE: {len(histories['hype'])}\n"
+            f"🌊 SUI : {len(histories['sui'])}\n"
             f"📈 STK : {len(histories['stocks'])}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"/mode swing|scalp|both\n"
@@ -759,10 +765,11 @@ def handle_telegram_command(text: str, chat_id: str):
             f"/pause | /reprendre"
         )
 
-    elif cmd in ("/derniere", "/xau", "/solana", "/dax", "/btc", "/stocks"):
+    elif cmd in ("/derniere", "/xau", "/solana", "/dax", "/btc", "/hype", "/sui", "/stocks"):
         key    = cmd[1:] if cmd[1:] in histories else None
         hist   = histories[key] if key else alert_history
-        labels = {"xau": "🥇 XAU", "solana": "💎 Solana", "dax": "🇩🇪 DAX", "btc": "₿ BTC", "stocks": "📈 Stocks"}
+        labels = {"xau": "🥇 XAU", "solana": "💎 Solana", "dax": "🇩🇪 DAX", "btc": "₿ BTC",
+                  "hype": "🚀 HYPE", "sui": "🌊 SUI", "stocks": "📈 Stocks"}
         prefix = labels.get(key, "📊 Toutes")
         if hist:
             a  = hist[0]
@@ -805,11 +812,13 @@ EVAL_HORIZON_MAX_H  = 504
 EVAL_LOOKBACK_MAX_H = 504
 
 EVAL_RISK = {
-    "xau":    {"k": 0.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
-    "dax":    {"k": 0.0, "tp_r": 3.0, "sl_floor": 8.0,  "sl_cap": 400.0,  "fallback": 30.0},
-    "btc":    {"k": 0.0, "tp_r": 3.0, "sl_floor": 80.0, "sl_cap": 6000.0, "fallback": 400.0},
-    "solana": {"k": 0.0, "tp_r": 3.0, "sl_floor": 0.5,  "sl_cap": 40.0,   "fallback": 2.0},
-    "stocks": {"k": 0.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
+    "xau":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
+    "dax":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 8.0,  "sl_cap": 400.0,  "fallback": 30.0},
+    "btc":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 80.0, "sl_cap": 6000.0, "fallback": 400.0},
+    "solana": {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.5,  "sl_cap": 40.0,   "fallback": 2.0},
+    "hype":   {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 30.0,   "fallback": 1.5},
+    "sui":    {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.05, "sl_cap": 5.0,    "fallback": 0.3},
+    "stocks": {"k": 1.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
 }
 
 TF_HOURS = {
@@ -845,8 +854,10 @@ def _atr_at_tf(pre_bars, tf_h):
     return sum(last) / len(last)
 
 
-SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD"}
-SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD"}
+SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD",
+                 "hype": "HYPE-USD", "sui": "SUI-USD"}
+SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD",
+                 "hype": "HYPE/USD", "sui": "SUI/USD"}
 
 
 def _yahoo_symbol(group, asset):
@@ -1336,7 +1347,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.0",
+        "version": "2.6.1",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
@@ -1370,6 +1381,18 @@ def dashboard_dax():
 @app.route("/btc", methods=["GET"])
 def dashboard_btc():
     return render_template("dashboard.html", alerts=list(histories["btc"]), page="btc",
+                           counts={g: len(h) for g, h in histories.items()})
+
+
+@app.route("/hype", methods=["GET"])
+def dashboard_hype():
+    return render_template("dashboard.html", alerts=list(histories["hype"]), page="hype",
+                           counts={g: len(h) for g, h in histories.items()})
+
+
+@app.route("/sui", methods=["GET"])
+def dashboard_sui():
+    return render_template("dashboard.html", alerts=list(histories["sui"]), page="sui",
                            counts={g: len(h) for g, h in histories.items()})
 
 
