@@ -805,11 +805,11 @@ EVAL_HORIZON_MAX_H  = 504
 EVAL_LOOKBACK_MAX_H = 504
 
 EVAL_RISK = {
-    "xau":    {"k": 2.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
-    "dax":    {"k": 2.0, "tp_r": 3.0, "sl_floor": 8.0,  "sl_cap": 400.0,  "fallback": 30.0},
-    "btc":    {"k": 2.0, "tp_r": 3.0, "sl_floor": 80.0, "sl_cap": 6000.0, "fallback": 400.0},
-    "solana": {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.5,  "sl_cap": 40.0,   "fallback": 2.0},
-    "stocks": {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
+    "xau":    {"k": 0.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
+    "dax":    {"k": 0.0, "tp_r": 3.0, "sl_floor": 8.0,  "sl_cap": 400.0,  "fallback": 30.0},
+    "btc":    {"k": 0.0, "tp_r": 3.0, "sl_floor": 80.0, "sl_cap": 6000.0, "fallback": 400.0},
+    "solana": {"k": 0.0, "tp_r": 3.0, "sl_floor": 0.5,  "sl_cap": 40.0,   "fallback": 2.0},
+    "stocks": {"k": 0.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
 }
 
 TF_HOURS = {
