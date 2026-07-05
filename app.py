@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.2)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.3)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.6.3 "Rescore" :                                    ║
+║   • /rescore : recalcule score+niveau de TOUT le stock avec  ║
+║     les poids Syn ; confluence reconstruite fidèlement       ║
+║     (rejeu des alertes par ordre d'arrivée)                  ║
 ║                                                              ║
 ║  Hérité de v2.5.1 :                                          ║
 ║   • Scoring 6D/7D, persistance, killswitch, /stats_view, etc.║
@@ -1220,6 +1225,38 @@ def reeval_route():
     return jsonify({"reset_to_pending": n})
 
 
+@app.route("/rescore", methods=["GET", "POST"])
+def rescore_route():
+    """Recalcule le score ET le niveau de TOUTES les alertes stockées avec le
+    scoring courant (poids Syn + bonus). Le bonus de CONFLUENCE est reconstruit
+    fidèlement : on rejoue les alertes par ordre d'arrivée (id) et chaque alerte
+    n'est scorée que contre celles qui l'ont précédée — comme en live.
+    Ne touche PAS aux issues (win/loss) ; pour ça, voir /reeval."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, asset, timeframe, type, side, price, scope, score, level "
+            "FROM alerts ORDER BY id ASC"
+        ).fetchall()
+    hist = deque(maxlen=200)          # même capacité que l'historique live
+    rescored = changed = 0
+    with db() as conn:
+        for r in rows:
+            parsed = {"type": r["type"], "asset": r["asset"], "timeframe": r["timeframe"],
+                      "side": r["side"], "price": r["price"], "scope": r["scope"]}
+            sc = compute_score(parsed, history=hist)
+            hist.appendleft({"asset": r["asset"], "side": r["side"],
+                             "price": r["price"], "timeframe": r["timeframe"]})
+            if sc["score"] != r["score"] or sc["level"] != r["level"]:
+                changed += 1
+            conn.execute("UPDATE alerts SET score=?, level=? WHERE id=?",
+                         (sc["score"], sc["level"], r["id"]))
+            rescored += 1
+        conn.commit()
+    return jsonify({"rescored": rescored, "changed": changed})
+
+
 @app.route("/price_test", methods=["GET"])
 def price_test():
     if not check_secret():
@@ -1380,7 +1417,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.2",
+        "version": "2.6.3",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
