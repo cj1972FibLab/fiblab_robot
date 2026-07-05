@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.1)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.2)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -12,6 +12,11 @@
 ║     parser multi-lignes + 6 états + cible d'obligation (Exit)║
 ║   • Champ target (cible d'obligation) : message + calibration║
 ║   • Fallback asset via ?asset= dans l'URL du webhook hold    ║
+║                                                              ║
+║  Patch v2.6.2 "Fib0 stop réel" :                             ║
+║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
+║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
+║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
 ║                                                              ║
 ║  Hérité de v2.5.1 :                                          ║
 ║   • Scoring 6D/7D, persistance, killswitch, /stats_view, etc.║
@@ -854,6 +859,21 @@ def _atr_at_tf(pre_bars, tf_h):
     return sum(last) / len(last)
 
 
+def _fib0_from_bars(pre_bars, ts, tf_h, long_bias):
+    """Fib0 = extrême de la bougie ENGLOBÉE (celle juste avant la bougie de
+    signal, qui se clôture ~à ts). Fenêtre d'un TF précédant le signal.
+    Long → son low ; Short → son high. Reconstruit depuis les H1 (approx :
+    dépend du feed / de l'alignement de session). None si fenêtre vide."""
+    if not pre_bars:
+        return None
+    hi_bound = ts - timedelta(hours=tf_h)
+    lo_bound = ts - timedelta(hours=2 * tf_h)
+    window = [b for b in pre_bars if lo_bound < b[0] <= hi_bound]
+    if not window:
+        return None
+    return min(b[2] for b in window) if long_bias else max(b[1] for b in window)
+
+
 SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD",
                  "hype": "HYPE-USD", "sui": "SUI-USD"}
 SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD",
@@ -938,7 +958,7 @@ def evaluate_pending_outcomes():
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
-            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
+            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target, a.type "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
             "ORDER BY a.id LIMIT 100"
@@ -976,18 +996,31 @@ def evaluate_pending_outcomes():
             continue
 
         atr = _atr_at_tf(pre, tf_h)
-        if atr and atr > 0:
-            sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
-        else:
-            sl, sl_src = risk["fallback"], "fallback"
-
         entry = r["price"]
+        long_bias = (r["side"] == "Support")
+
+        # ── STOP ── Alertes HOLD : Fib0 réel (bas/haut de la bougie englobée),
+        #    sinon repli sur le stop ATR adaptatif. Fib0 rejeté s'il tombe du
+        #    mauvais côté de l'entrée ou est anormalement serré (< 0.25*ATR).
+        sl, sl_src = None, None
+        if "hold" in (r["type"] or "").lower():
+            fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
+            if fib0 is not None and entry:
+                raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
+                atr_floor = 0.25 * atr if (atr and atr > 0) else 0.0
+                if raw_sl > 0 and raw_sl >= atr_floor and raw_sl <= risk["sl_cap"]:
+                    sl, sl_src = raw_sl, "fib0"
+        if sl is None:
+            if atr and atr > 0:
+                sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
+            else:
+                sl, sl_src = risk["fallback"], "fallback"
+
         # TP = cible d'obligation réelle si connue, sinon multiple de R
         if r["target"] is not None and entry:
             tp, tp_src = abs(r["target"] - entry), "obligation"
         else:
             tp, tp_src = sl * risk["tp_r"], "R"
-        long_bias = (r["side"] == "Support")
 
         mfe = mae = 0.0
         status = None
@@ -1347,7 +1380,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.1",
+        "version": "2.6.2",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
