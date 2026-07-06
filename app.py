@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.4)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.5)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.6.5 "Export dashboard" :                           ║
+║   • /export.csv : dump CSV complet (alertes + issues + R)    ║
+║   • Boutons Export CSV / Imprimer-PDF sur /stats_view        ║
+║     (+ CSS d'impression, sans dépendance externe)            ║
 ║                                                              ║
 ║  Patch v2.6.4 "Éval priorité Hold" :                         ║
 ║   • /evaluate traite d'abord les alertes HOLD, puis les plus ║
@@ -1306,6 +1311,10 @@ td{padding:7px 9px;border-bottom:1px solid var(--bd)}
 .empty{text-align:center;color:var(--dim);padding:40px;font-size:.9rem;line-height:1.7}
 .muted{color:var(--dim);font-size:.8rem;padding:8px}
 code{background:#161b22;padding:2px 6px;border-radius:4px;color:var(--gold)}
+.actions{float:right;display:flex;gap:8px}
+.btn{font-size:.75rem;color:var(--blue);text-decoration:none;background:transparent;border:1px solid var(--bd);padding:5px 10px;border-radius:6px;cursor:pointer;font-family:inherit}
+.btn:hover{border-color:var(--blue)}
+@media print{.actions{display:none}*{-webkit-print-color-adjust:exact !important;print-color-adjust:exact !important}}
 </style>"""
 
 
@@ -1364,7 +1373,11 @@ def stats_view():
     head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab \u2014 Calibration</title>' + DASH_CSS + '</head><body>')
-    header = ('<a class="refresh" href="/stats_view">\u21bb Rafra\u00eechir</a>'
+    header = ('<div class="actions">'
+              '<a class="btn" href="/export.csv">\u2b07 CSV</a>'
+              '<button class="btn" onclick="window.print()">\U0001F5A8 Imprimer / PDF</button>'
+              '<a class="btn" href="/stats_view">\u21bb Rafra\u00eechir</a>'
+              '</div>'
               '<h1>\U0001F3AF Calibration du scoring</h1>'
               '<div class="sub">Win rate des alertes par score / type / timeframe '
               '\u2014 pour ajuster les poids sur des faits</div>')
@@ -1419,13 +1432,44 @@ def db_count():
     return jsonify({"alerts": a, "outcomes": o, "profiles": p, "db_path": DB_PATH})
 
 
+@app.route("/export.csv", methods=["GET"])
+def export_csv():
+    """Dump CSV complet : chaque alerte + son issue (statut, MFE/MAE, R réalisé,
+    note). Pour analyse tableur / partage aux collaborateurs. Content-Disposition
+    en attachment → le navigateur télécharge le fichier."""
+    if not check_secret():
+        return ("unauthorized", 403)
+    import csv, io
+    from flask import Response
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT a.id, a.ts, a.asset, a.grp, a.timeframe, a.type, a.side, a.price, "
+            "a.scope, a.score, a.level, a.target, a.move_pct, "
+            "o.status, o.mfe_pts, o.mae_pts, o.r_realized, o.note "
+            "FROM alerts a LEFT JOIN outcomes o ON a.id = o.alert_id "
+            "ORDER BY a.id"
+        ).fetchall()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "ts", "asset", "group", "timeframe", "type", "side", "price",
+                "scope", "score", "level", "target", "move_pct", "status", "mfe_pts",
+                "mae_pts", "r_realized", "note"])
+    for r in rows:
+        w.writerow([r["id"], r["ts"], r["asset"], r["grp"], r["timeframe"], r["type"],
+                    r["side"], r["price"], r["scope"], r["score"], r["level"], r["target"],
+                    r["move_pct"], r["status"], r["mfe_pts"], r["mae_pts"], r["r_realized"],
+                    r["note"]])
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="fiblab_export.csv"'})
+
+
 @app.route("/status", methods=["GET"])
 def status():
     profiles_summary = {uid: {"mode": p["mode"], "paused": p["paused"]}
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.4",
+        "version": "2.6.5",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
