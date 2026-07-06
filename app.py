@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.3)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.4)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.6.4 "Éval priorité Hold" :                         ║
+║   • /evaluate traite d'abord les alertes HOLD, puis les plus ║
+║     récentes (au lieu du plus vieux) → les cases utiles du   ║
+║     dashboard se remplissent vite ; le vieux bruit attend    ║
 ║                                                              ║
 ║  Patch v2.6.3 "Rescore" :                                    ║
 ║   • /rescore : recalcule score+niveau de TOUT le stock avec  ║
@@ -959,14 +964,17 @@ def fetch_prices(group, asset, start_dt, end_dt):
 def evaluate_pending_outcomes():
     """Évalue les alertes 'pending' avec stop adaptatif (SL = k*ATR du TF) et
     fenêtre proportionnelle au TF. Si une cible d'obligation (target) est connue,
-    le TP devient la distance Entry→cible réelle de Syn (au lieu de tp_r arbitraire)."""
+    le TP devient la distance Entry→cible réelle de Syn (au lieu de tp_r arbitraire).
+    Ordre de traitement : alertes HOLD d'abord, puis les plus récentes — pour
+    remplir en priorité les cases utiles du dashboard (le vieux bruit attend)."""
     now = datetime.now(timezone.utc)
     with db() as conn:
         rows = conn.execute(
             "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target, a.type "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
-            "ORDER BY a.id LIMIT 100"
+            "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%hold%' THEN 0 ELSE 1 END), a.id DESC "
+            "LIMIT 100"
         ).fetchall()
 
     evaluated = 0
@@ -1417,7 +1425,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.3",
+        "version": "2.6.4",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
