@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.5)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.6)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,9 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.6.6 "Dashboard bilingue FR/EN" :                   ║
+║   • /stats_view?lang=en + sélecteur de langue sur la page    ║
 ║                                                              ║
 ║  Patch v2.6.5 "Export dashboard" :                           ║
 ║   • /export.csv : dump CSV complet (alertes + issues + R)    ║
@@ -1314,13 +1317,14 @@ code{background:#161b22;padding:2px 6px;border-radius:4px;color:var(--gold)}
 .actions{float:right;display:flex;gap:8px}
 .btn{font-size:.75rem;color:var(--blue);text-decoration:none;background:transparent;border:1px solid var(--bd);padding:5px 10px;border-radius:6px;cursor:pointer;font-family:inherit}
 .btn:hover{border-color:var(--blue)}
+.btn.active{border-color:var(--blue);color:var(--gold);font-weight:700}
 @media print{.actions{display:none}*{-webkit-print-color-adjust:exact !important;print-color-adjust:exact !important}}
 </style>"""
 
 
-def _bar_rows(rows, color):
+def _bar_rows(rows, color, nodata="aucune donn\u00e9e"):
     if not rows:
-        return '<div class="muted">aucune donn\u00e9e</div>'
+        return '<div class="muted">' + nodata + '</div>'
     out = []
     for r in rows:
         fill = color + ("55" if r["n"] < 5 else "")
@@ -1335,10 +1339,40 @@ def _bar_rows(rows, color):
     return "".join(out)
 
 
+DASH_STR = {
+    "fr": {
+        "title": "\U0001F3AF Calibration du scoring",
+        "sub": "Win rate des alertes par score / type / timeframe \u2014 pour ajuster les poids sur des faits",
+        "pdf": "\U0001F5A8 Imprimer / PDF", "refresh": "\u21bb Rafra\u00eechir",
+        "evaluated": "\u00c9valu\u00e9es", "gwr": "Win rate global", "pending": "En attente",
+        "by_score": "Win rate par SCORE \u2014 le graphe cl\u00e9",
+        "by_type": "Win rate par TYPE", "by_tf": "Win rate par TIMEFRAME",
+        "detail": "D\u00e9tail par score", "nodata": "aucune donn\u00e9e",
+        "note": "<b>Comment lire :</b> si ton scoring est bon, le win rate doit <b>monter avec le score</b> (un 12 gagne plus qu'un 7). Si une barre de score faible d\u00e9passe celle d'un score fort, les <b>poids sont \u00e0 recalibrer</b>. Barres p\u00e2les = moins de 5 trades (peu fiable).",
+        "empty": "Aucune alerte \u00e9valu\u00e9e pour l'instant.<br><br>Les alertes sont not\u00e9es automatiquement une fois pass\u00e9es 12h ({p} en attente).<br>V\u00e9rifie aussi que le cron <code>/evaluate</code> tourne sans erreur.",
+    },
+    "en": {
+        "title": "\U0001F3AF Scoring calibration",
+        "sub": "Alert win rate by score / type / timeframe \u2014 to tune the weights on facts",
+        "pdf": "\U0001F5A8 Print / PDF", "refresh": "\u21bb Refresh",
+        "evaluated": "Evaluated", "gwr": "Overall win rate", "pending": "Pending",
+        "by_score": "Win rate by SCORE \u2014 the key chart",
+        "by_type": "Win rate by TYPE", "by_tf": "Win rate by TIMEFRAME",
+        "detail": "Detail by score", "nodata": "no data",
+        "note": "<b>How to read:</b> if your scoring is good, win rate should <b>rise with the score</b> (a 12 wins more than a 7). If a low-score bar beats a high-score one, the <b>weights need recalibrating</b>. Pale bars = fewer than 5 trades (unreliable).",
+        "empty": "No alert evaluated yet.<br><br>Alerts are scored automatically once they are 12h old ({p} pending).<br>Also check that the <code>/evaluate</code> cron runs without error.",
+    },
+}
+
+
 @app.route("/stats_view", methods=["GET"])
 def stats_view():
     if not check_secret():
         return ("unauthorized", 403)
+    lang = (request.args.get("lang") or "fr").lower()
+    if lang not in ("fr", "en"):
+        lang = "fr"
+    T = DASH_STR[lang]
     with db() as conn:
         rows = conn.execute(
             "SELECT a.score, a.type, a.timeframe, o.status "
@@ -1370,53 +1404,50 @@ def stats_view():
     tot_eval = counts["win"] + counts["loss"]
     wr = round(100 * counts["win"] / tot_eval, 1) if tot_eval else 0
 
-    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+    fr_cls = "btn active" if lang == "fr" else "btn"
+    en_cls = "btn active" if lang == "en" else "btn"
+    head = ('<!DOCTYPE html><html lang="' + lang + '"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab \u2014 Calibration</title>' + DASH_CSS + '</head><body>')
     header = ('<div class="actions">'
               '<a class="btn" href="/export.csv">\u2b07 CSV</a>'
-              '<button class="btn" onclick="window.print()">\U0001F5A8 Imprimer / PDF</button>'
-              '<a class="btn" href="/stats_view">\u21bb Rafra\u00eechir</a>'
+              '<button class="btn" onclick="window.print()">' + T["pdf"] + '</button>'
+              '<a class="' + fr_cls + '" href="/stats_view?lang=fr">FR</a>'
+              '<a class="' + en_cls + '" href="/stats_view?lang=en">EN</a>'
+              '<a class="btn" href="/stats_view?lang=' + lang + '">' + T["refresh"] + '</a>'
               '</div>'
-              '<h1>\U0001F3AF Calibration du scoring</h1>'
-              '<div class="sub">Win rate des alertes par score / type / timeframe '
-              '\u2014 pour ajuster les poids sur des faits</div>')
+              '<h1>' + T["title"] + '</h1>'
+              '<div class="sub">' + T["sub"] + '</div>')
 
     if tot_eval == 0:
-        body = ('<div class="empty">Aucune alerte \u00e9valu\u00e9e pour l\'instant.<br><br>'
-                'Les alertes sont not\u00e9es automatiquement une fois pass\u00e9es 12h ('
-                + str(counts["pending"]) + ' en attente).<br>'
-                'V\u00e9rifie aussi que le cron <code>/evaluate</code> tourne sans erreur.</div>')
+        body = '<div class="empty">' + T["empty"].format(p=counts["pending"]) + '</div>'
         return head + header + body + '</body></html>'
 
     wrc = "var(--grn)" if wr >= 50 else "var(--gold)"
     cards = ('<div class="grid">'
-             '<div class="stat"><div class="lbl">\u00c9valu\u00e9es</div><div class="val" style="color:var(--blue)">' + str(tot_eval) + '</div></div>'
-             '<div class="stat"><div class="lbl">Win rate global</div><div class="val" style="color:' + wrc + '">' + str(wr) + '%</div></div>'
+             '<div class="stat"><div class="lbl">' + T["evaluated"] + '</div><div class="val" style="color:var(--blue)">' + str(tot_eval) + '</div></div>'
+             '<div class="stat"><div class="lbl">' + T["gwr"] + '</div><div class="val" style="color:' + wrc + '">' + str(wr) + '%</div></div>'
              '<div class="stat"><div class="lbl">Win</div><div class="val" style="color:var(--grn)">' + str(counts["win"]) + '</div></div>'
              '<div class="stat"><div class="lbl">Loss</div><div class="val" style="color:var(--red)">' + str(counts["loss"]) + '</div></div>'
              '<div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:var(--dim)">' + str(counts["invalid"]) + '</div></div>'
-             '<div class="stat"><div class="lbl">En attente</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
+             '<div class="stat"><div class="lbl">' + T["pending"] + '</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
              '</div>')
-    note = ('<div class="note"><b>Comment lire :</b> si ton scoring est bon, le win rate doit '
-            '<b>monter avec le score</b> (un 12 gagne plus qu\'un 7). Si une barre de score faible '
-            'd\u00e9passe celle d\'un score fort, les <b>poids sont \u00e0 recalibrer</b>. '
-            'Barres p\u00e2les = moins de 5 trades (peu fiable).</div>')
+    note = '<div class="note">' + T["note"] + '</div>'
     trows = []
     for r in bs:
         c = "var(--grn)" if r["wr"] >= 50 else "var(--gold)"
         trows.append('<tr><td>' + esc(r["k"]) + '</td><td style="color:var(--grn)">' + str(r["win"])
                      + '</td><td style="color:var(--red)">' + str(r["loss"]) + '</td><td>' + str(r["n"])
                      + '</td><td style="font-weight:700;color:' + c + '">' + str(r["wr"]) + '%</td></tr>')
-    table = ('<div class="card"><h2>D\u00e9tail par score</h2><table><thead><tr>'
+    table = ('<div class="card"><h2>' + T["detail"] + '</h2><table><thead><tr>'
              '<th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead><tbody>'
              + "".join(trows) + '</tbody></table></div>')
 
     body = (cards
-            + '<div class="card"><h2>Win rate par SCORE \u2014 le graphe cl\u00e9</h2>' + _bar_rows(bs, "#f5a623") + '</div>'
+            + '<div class="card"><h2>' + T["by_score"] + '</h2>' + _bar_rows(bs, "#f5a623", T["nodata"]) + '</div>'
             + note
-            + '<div class="card"><h2>Win rate par TYPE</h2>' + _bar_rows(bt, "#58a6ff") + '</div>'
-            + '<div class="card"><h2>Win rate par TIMEFRAME</h2>' + _bar_rows(btf, "#a78bfa") + '</div>'
+            + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
+            + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
             + table)
     return head + header + body + '</body></html>'
 
@@ -1469,7 +1500,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.5",
+        "version": "2.6.6",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
