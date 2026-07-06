@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.6)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.8)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,14 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.6.8 "Repli Yahoo si Twelve Data vide" :            ║
+║   • fetch_prices bascule sur Yahoo quand Twelve Data renvoie ║
+║     vide (quota jour épuisé), pas seulement sur exception    ║
+║                                                              ║
+║  Patch v2.6.7 "Fix éval : alertes mûres d'abord" :           ║
+║   • /evaluate ne charge que les alertes >12h (filtre SQL)    ║
+║     → plus de lot gaspillé sur des alertes trop récentes     ║
 ║                                                              ║
 ║  Patch v2.6.6 "Dashboard bilingue FR/EN" :                   ║
 ║   • /stats_view?lang=en + sélecteur de langue sur la page    ║
@@ -955,12 +963,17 @@ def _fetch_twelvedata(symbol, start_dt, end_dt):
 
 
 def fetch_prices(group, asset, start_dt, end_dt):
-    """[(datetime, high, low), ...] en H1. Twelve Data si clé, sinon Yahoo."""
+    """[(datetime, high, low), ...] en H1. Twelve Data si clé, avec REPLI Yahoo
+    si Twelve Data renvoie vide (quota jour épuisé / erreur) — pas seulement en
+    cas d'exception."""
     try:
         if TWELVEDATA_API_KEY:
             sym = _twelvedata_symbol(group, asset)
             if sym:
-                return _fetch_twelvedata(sym, start_dt, end_dt)
+                bars = _fetch_twelvedata(sym, start_dt, end_dt)
+                if bars:
+                    return bars
+                # Twelve Data vide (souvent quota jour épuisé) -> bascule Yahoo
         sym = _yahoo_symbol(group, asset)
         if sym:
             return _fetch_yahoo(sym, start_dt, end_dt)
@@ -976,13 +989,19 @@ def evaluate_pending_outcomes():
     Ordre de traitement : alertes HOLD d'abord, puis les plus récentes — pour
     remplir en priorité les cases utiles du dashboard (le vieux bruit attend)."""
     now = datetime.now(timezone.utc)
+    # ne charger que les alertes assez mûres pour avoir un verdict (>= EVAL_MIN_AGE_H),
+    # AVANT le LIMIT : sinon un afflux d'alertes récentes remplit le lot et se fait
+    # zapper (age < 12h) sans jamais atteindre les alertes mûres.
+    cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
     with db() as conn:
         rows = conn.execute(
             "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target, a.type "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
+            "AND a.ts <= ? "
             "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%hold%' THEN 0 ELSE 1 END), a.id DESC "
-            "LIMIT 100"
+            "LIMIT 100",
+            (cutoff,)
         ).fetchall()
 
     evaluated = 0
@@ -1500,7 +1519,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.6",
+        "version": "2.6.8",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
