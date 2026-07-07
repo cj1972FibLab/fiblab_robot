@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.0)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.1)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.1 "Repli Yahoo aussi sur 429/exception" :        ║
+║   • fetch_prices : chaque source dans son propre try ; une   ║
+║     exception Twelve Data (429 rate limit) bascule enfin sur ║
+║     Yahoo au lieu de tout perdre                             ║
 ║                                                              ║
 ║  MAJEUR v2.7.0 "Évaluation par lot" :                        ║
 ║   • fetch prix UNE fois par ACTIF (au lieu d'un par alerte)  ║
@@ -969,21 +974,27 @@ def _fetch_twelvedata(symbol, start_dt, end_dt):
 
 def fetch_prices(group, asset, start_dt, end_dt):
     """[(datetime, high, low), ...] en H1. Twelve Data si clé, avec REPLI Yahoo
-    si Twelve Data renvoie vide (quota jour épuisé / erreur) — pas seulement en
-    cas d'exception."""
-    try:
-        if TWELVEDATA_API_KEY:
-            sym = _twelvedata_symbol(group, asset)
-            if sym:
-                bars = _fetch_twelvedata(sym, start_dt, end_dt)
-                if bars:
-                    return bars
-                # Twelve Data vide (souvent quota jour épuisé) -> bascule Yahoo
-        sym = _yahoo_symbol(group, asset)
+    dès que Twelve Data ÉCHOUE ou renvoie vide — y compris sur 429 (rate limit).
+    Chaque source est isolée dans son propre try : une exception Twelve Data ne
+    saute plus par-dessus le repli Yahoo (bug < v2.7.1)."""
+    bars = []
+    if TWELVEDATA_API_KEY:
+        sym = _twelvedata_symbol(group, asset)
         if sym:
+            try:
+                bars = _fetch_twelvedata(sym, start_dt, end_dt)
+            except Exception as e:
+                print(f"[EVAL] twelvedata {group}/{asset} : {e}")
+                bars = []
+    if bars:
+        return bars
+    # Twelve Data vide ou en échec (429 / quota) -> on tente Yahoo
+    sym = _yahoo_symbol(group, asset)
+    if sym:
+        try:
             return _fetch_yahoo(sym, start_dt, end_dt)
-    except Exception as e:
-        print(f"[EVAL] fetch_prices {group}/{asset} : {e}")
+        except Exception as e:
+            print(f"[EVAL] yahoo {group}/{asset} : {e}")
     return []
 
 
@@ -1543,7 +1554,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.0",
+        "version": "2.7.1",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
