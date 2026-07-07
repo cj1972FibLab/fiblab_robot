@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.3)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.4)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,10 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.4 "Alertes idéales seulement" :                  ║
+║   • notification filtrée aux Hold CONFIRMÉS (espérance + )   ║
+║     ; tout le reste stocké mais MUET. NOTIFY_ONLY_IDEAL      ║
 ║                                                              ║
 ║  Patch v2.7.3 "Entrée Hold = close englobante + stop plancher"║
 ║   • close des bougies récupéré (4e champ du tuple prix)      ║
@@ -601,6 +605,15 @@ TYPES_DAILY_ONLY = {"origin touched"}
 TYPES_SCORE_MIN  = {"bsut created": 6}
 TYPES_IGNORED    = {"break created"}
 
+# ── Filtre "alertes idéales" ──────────────────────────────────
+# Ne notifier QUE les types à espérance positive prouvée par la calibration :
+# les Hold CONFIRMÉS (Hold ACTIVATED + Origin Hold ACTIVATED). Tout le reste
+# (First Touch, BSUT, Created, ARMED, PROXIMITY, RNG-HIT...) reste STOCKÉ pour
+# la calibration mais MUET côté Telegram. False = ancien comportement permissif.
+# "hold activated" (substring) couvre Hold ACTIVATED ET Origin Hold ACTIVATED.
+NOTIFY_ONLY_IDEAL = True
+TYPES_IDEAL       = {"hold activated"}
+
 
 def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
     alert_type = (parsed.get("type") or "").lower()
@@ -618,6 +631,13 @@ def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
         return False, f"Mode SCALP : TF '{tf}' ignoré"
     elif mode == "both" and tf not in TF_SWING | TF_SCALP:
         return False, f"TF '{tf}' non reconnu"
+
+    # ── Alertes idéales : seuls les Hold confirmés passent (le reste = bruit,
+    #    stocké mais muet). Court-circuite toute la logique permissive ci-dessous.
+    if NOTIFY_ONLY_IDEAL:
+        if any(t in alert_type for t in TYPES_IDEAL):
+            return True, "ok (idéal)"
+        return False, "non idéal (bruit filtré)"
 
     for ignored in TYPES_IGNORED:
         if ignored in alert_type:
@@ -1623,7 +1643,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.3",
+        "version": "2.7.4",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
