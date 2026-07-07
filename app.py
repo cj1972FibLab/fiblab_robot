@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.2)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.3)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,13 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.3 "Entrée Hold = close englobante + stop plancher"║
+║   • close des bougies récupéré (4e champ du tuple prix)      ║
+║   • entrée Hold = CLÔTURE de l'englobante (confirmation), au ║
+║     lieu du niveau -> le proxy n'empoche plus le trajet grat.║
+║   • stop Fib0 plancherisé max(sl_floor, 0.5*ATR) -> tue les  ║
+║     R gonflés par un stop minuscule ; le R dégonfle vers réel║
 ║                                                              ║
 ║  Patch v2.7.2 "R / espérance sur le dashboard" :             ║
 ║   • cartes R moyen (espérance) + R total globaux             ║
@@ -945,13 +952,15 @@ def _fetch_yahoo(symbol, start_dt, end_dt):
         return []
     ts = res.get("timestamp") or []
     q = (res.get("indicators", {}).get("quote") or [{}])[0]
-    highs, lows = q.get("high") or [], q.get("low") or []
+    highs, lows, closes = q.get("high") or [], q.get("low") or [], q.get("close") or []
     bars = []
     for i, t in enumerate(ts):
         hi = highs[i] if i < len(highs) else None
         lo = lows[i] if i < len(lows) else None
+        cl = closes[i] if i < len(closes) else None
         if hi is not None and lo is not None:
-            bars.append((datetime.fromtimestamp(t, tz=timezone.utc), float(hi), float(lo)))
+            bars.append((datetime.fromtimestamp(t, tz=timezone.utc), float(hi), float(lo),
+                         float(cl) if cl is not None else float(hi)))
     return bars
 
 
@@ -970,7 +979,7 @@ def _fetch_twelvedata(symbol, start_dt, end_dt):
     for v in vals:
         try:
             dt = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            bars.append((dt, float(v["high"]), float(v["low"])))
+            bars.append((dt, float(v["high"]), float(v["low"]), float(v["close"])))
         except Exception:
             continue
     bars.sort(key=lambda x: x[0])
@@ -1075,18 +1084,26 @@ def evaluate_pending_outcomes():
                 continue
 
             atr = _atr_at_tf(pre, tf_h)
-            entry = r["price"]
             long_bias = (r["side"] == "Support")
+            is_hold = "hold" in (r["type"] or "").lower()
 
-            # ── STOP ── Hold : Fib0 réel (bas/haut bougie englobée), sinon ATR.
+            # Entrée : pour les Hold on entre sur CONFIRMATION = à la CLÔTURE de
+            # l'englobante (close de la derniere bougie <= ts), pas au niveau —
+            # sinon le proxy empoche gratuitement le trajet de l'englobante.
+            entry = r["price"]
+            if is_hold and pre and pre[-1][3] is not None and pre[-1][3] > 0:
+                entry = pre[-1][3]
+
+            # ── STOP ── Hold : Fib0 (bas/haut bougie englobée), PLANCHERISE au
+            #    max(sl_floor, 0.5*ATR) pour tuer les R gonflés par un stop minuscule.
             sl, sl_src = None, None
-            if "hold" in (r["type"] or "").lower():
+            if is_hold:
                 fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
                 if fib0 is not None and entry:
                     raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
-                    atr_floor = 0.25 * atr if (atr and atr > 0) else 0.0
-                    if raw_sl > 0 and raw_sl >= atr_floor and raw_sl <= risk["sl_cap"]:
-                        sl, sl_src = raw_sl, "fib0"
+                    if raw_sl > 0:
+                        floor = max(risk["sl_floor"], 0.5 * atr) if (atr and atr > 0) else risk["sl_floor"]
+                        sl, sl_src = min(max(raw_sl, floor), risk["sl_cap"]), "fib0"
             if sl is None:
                 if atr and atr > 0:
                     sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
@@ -1102,7 +1119,7 @@ def evaluate_pending_outcomes():
             mfe = mae = 0.0
             status = None
             r_real = None
-            for (_dt, hi, lo) in post:
+            for (_dt, hi, lo, _c) in post:
                 fav = (hi - entry) if long_bias else (entry - lo)
                 adv = (entry - lo) if long_bias else (hi - entry)
                 mfe = max(mfe, fav)
@@ -1606,7 +1623,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.2",
+        "version": "2.7.3",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
