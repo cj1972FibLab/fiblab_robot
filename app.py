@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.1)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.2)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.2 "R / espérance sur le dashboard" :             ║
+║   • cartes R moyen (espérance) + R total globaux             ║
+║   • tableau Espérance par type (R moyen, R total) trié       ║
+║     par espérance — la vraie mesure, au-delà du win rate     ║
 ║                                                              ║
 ║  Patch v2.7.1 "Repli Yahoo aussi sur 429/exception" :        ║
 ║   • fetch_prices : chaque source dans son propre try ; une   ║
@@ -1396,23 +1401,31 @@ def _bar_rows(rows, color, nodata="aucune donn\u00e9e"):
 DASH_STR = {
     "fr": {
         "title": "\U0001F3AF Calibration du scoring",
-        "sub": "Win rate des alertes par score / type / timeframe \u2014 pour ajuster les poids sur des faits",
-        "pdf": "\U0001F5A8 Imprimer / PDF", "refresh": "\u21bb Rafra\u00eechir",
-        "evaluated": "\u00c9valu\u00e9es", "gwr": "Win rate global", "pending": "En attente",
-        "by_score": "Win rate par SCORE \u2014 le graphe cl\u00e9",
+        "sub": "Win rate & espérance des alertes par score / type / timeframe — pour ajuster les poids sur des faits",
+        "pdf": "\U0001F5A8 Imprimer / PDF", "refresh": "\u21bb Rafraîchir",
+        "evaluated": "Évaluées", "gwr": "Win rate global", "pending": "En attente",
+        "rmean_card": "R moyen (espérance)", "rtotal_card": "R total",
+        "by_score": "Win rate par SCORE — le graphe clé",
         "by_type": "Win rate par TYPE", "by_tf": "Win rate par TIMEFRAME",
-        "detail": "D\u00e9tail par score", "nodata": "aucune donn\u00e9e",
-        "note": "<b>Comment lire :</b> si ton scoring est bon, le win rate doit <b>monter avec le score</b> (un 12 gagne plus qu'un 7). Si une barre de score faible d\u00e9passe celle d'un score fort, les <b>poids sont \u00e0 recalibrer</b>. Barres p\u00e2les = moins de 5 trades (peu fiable).",
-        "empty": "Aucune alerte \u00e9valu\u00e9e pour l'instant.<br><br>Les alertes sont not\u00e9es automatiquement une fois pass\u00e9es 12h ({p} en attente).<br>V\u00e9rifie aussi que le cron <code>/evaluate</code> tourne sans erreur.",
+        "detail": "Détail par score", "nodata": "aucune donnée",
+        "exp_title": "Espérance par type (R) — la vraie mesure",
+        "th_type": "Type", "th_rmean": "R moyen", "th_rtotal": "R total",
+        "rnote": "<b>R moyen = espérance par trade.</b> Positif = profitable, négatif = perdant — quel que soit le win rate. C'est CE chiffre qui compte, pas le %. Rappel : la cible d'obligation des Hold est un objectif minimum, donc un R modeste est normal. Trié par espérance décroissante.",
+        "note": "<b>Comment lire :</b> si ton scoring est bon, le win rate doit <b>monter avec le score</b> (un 12 gagne plus qu'un 7). Si une barre de score faible dépasse celle d'un score fort, les <b>poids sont à recalibrer</b>. Barres pâles = moins de 5 trades (peu fiable).",
+        "empty": "Aucune alerte évaluée pour l'instant.<br><br>Les alertes sont notées automatiquement une fois passées 12h ({p} en attente).<br>Vérifie aussi que le cron <code>/evaluate</code> tourne sans erreur.",
     },
     "en": {
         "title": "\U0001F3AF Scoring calibration",
-        "sub": "Alert win rate by score / type / timeframe \u2014 to tune the weights on facts",
+        "sub": "Alert win rate & expectancy by score / type / timeframe — to tune the weights on facts",
         "pdf": "\U0001F5A8 Print / PDF", "refresh": "\u21bb Refresh",
         "evaluated": "Evaluated", "gwr": "Overall win rate", "pending": "Pending",
-        "by_score": "Win rate by SCORE \u2014 the key chart",
+        "rmean_card": "Mean R (expectancy)", "rtotal_card": "Total R",
+        "by_score": "Win rate by SCORE — the key chart",
         "by_type": "Win rate by TYPE", "by_tf": "Win rate by TIMEFRAME",
         "detail": "Detail by score", "nodata": "no data",
+        "exp_title": "Expectancy by type (R) — the real measure",
+        "th_type": "Type", "th_rmean": "Mean R", "th_rtotal": "Total R",
+        "rnote": "<b>Mean R = expectancy per trade.</b> Positive = profitable, negative = losing — regardless of win rate. This is the number that matters, not the %. Note: the Hold obligation target is a minimum objective, so a modest R is expected. Sorted by expectancy, descending.",
         "note": "<b>How to read:</b> if your scoring is good, win rate should <b>rise with the score</b> (a 12 wins more than a 7). If a low-score bar beats a high-score one, the <b>weights need recalibrating</b>. Pale bars = fewer than 5 trades (unreliable).",
         "empty": "No alert evaluated yet.<br><br>Alerts are scored automatically once they are 12h old ({p} pending).<br>Also check that the <code>/evaluate</code> cron runs without error.",
     },
@@ -1429,12 +1442,14 @@ def stats_view():
     T = DASH_STR[lang]
     with db() as conn:
         rows = conn.execute(
-            "SELECT a.score, a.type, a.timeframe, o.status "
+            "SELECT a.score, a.type, a.timeframe, o.status, o.r_realized "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id"
         ).fetchall()
 
     counts = {"win": 0, "loss": 0, "invalid": 0, "pending": 0, "skip": 0}
     by_score, by_type, by_tf = {}, {}, {}
+    r_by_type = {}
+    r_sum_all, r_cnt_all = 0.0, 0
     for r in rows:
         st = r["status"] or "pending"
         counts[st] = counts.get(st, 0) + 1
@@ -1442,6 +1457,13 @@ def stats_view():
             by_score.setdefault(r["score"], {"win": 0, "loss": 0})[st] += 1
             by_type.setdefault(r["type"] or "?", {"win": 0, "loss": 0})[st] += 1
             by_tf.setdefault(r["timeframe"] or "?", {"win": 0, "loss": 0})[st] += 1
+            rr = r["r_realized"]
+            if rr is not None:
+                d = r_by_type.setdefault(r["type"] or "?", {"sum": 0.0, "cnt": 0})
+                d["sum"] += rr
+                d["cnt"] += 1
+                r_sum_all += rr
+                r_cnt_all += 1
 
     def pack(b, numeric=False):
         items = []
@@ -1457,12 +1479,16 @@ def stats_view():
     bs, bt, btf = pack(by_score, True), pack(by_type), pack(by_tf)
     tot_eval = counts["win"] + counts["loss"]
     wr = round(100 * counts["win"] / tot_eval, 1) if tot_eval else 0
+    mean_r_all = (r_sum_all / r_cnt_all) if r_cnt_all else 0.0
+
+    def sgn(x):
+        return ("+" if x > 0 else "") + str(x)
 
     fr_cls = "btn active" if lang == "fr" else "btn"
     en_cls = "btn active" if lang == "en" else "btn"
     head = ('<!DOCTYPE html><html lang="' + lang + '"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>FibLab \u2014 Calibration</title>' + DASH_CSS + '</head><body>')
+            '<title>FibLab — Calibration</title>' + DASH_CSS + '</head><body>')
     header = ('<div class="actions">'
               '<a class="btn" href="/export.csv">\u2b07 CSV</a>'
               '<button class="btn" onclick="window.print()">' + T["pdf"] + '</button>'
@@ -1478,14 +1504,17 @@ def stats_view():
         return head + header + body + '</body></html>'
 
     wrc = "var(--grn)" if wr >= 50 else "var(--gold)"
+    rc_all = "var(--grn)" if mean_r_all > 0 else "var(--red)"
     cards = ('<div class="grid">'
-             '<div class="stat"><div class="lbl">' + T["evaluated"] + '</div><div class="val" style="color:var(--blue)">' + str(tot_eval) + '</div></div>'
-             '<div class="stat"><div class="lbl">' + T["gwr"] + '</div><div class="val" style="color:' + wrc + '">' + str(wr) + '%</div></div>'
-             '<div class="stat"><div class="lbl">Win</div><div class="val" style="color:var(--grn)">' + str(counts["win"]) + '</div></div>'
-             '<div class="stat"><div class="lbl">Loss</div><div class="val" style="color:var(--red)">' + str(counts["loss"]) + '</div></div>'
-             '<div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:var(--dim)">' + str(counts["invalid"]) + '</div></div>'
-             '<div class="stat"><div class="lbl">' + T["pending"] + '</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
-             '</div>')
+             + '<div class="stat"><div class="lbl">' + T["evaluated"] + '</div><div class="val" style="color:var(--blue)">' + str(tot_eval) + '</div></div>'
+             + '<div class="stat"><div class="lbl">' + T["gwr"] + '</div><div class="val" style="color:' + wrc + '">' + str(wr) + '%</div></div>'
+             + '<div class="stat"><div class="lbl">' + T["rmean_card"] + '</div><div class="val" style="color:' + rc_all + '">' + sgn(round(mean_r_all, 2)) + 'R</div></div>'
+             + '<div class="stat"><div class="lbl">' + T["rtotal_card"] + '</div><div class="val" style="color:' + rc_all + '">' + sgn(round(r_sum_all, 1)) + 'R</div></div>'
+             + '<div class="stat"><div class="lbl">Win</div><div class="val" style="color:var(--grn)">' + str(counts["win"]) + '</div></div>'
+             + '<div class="stat"><div class="lbl">Loss</div><div class="val" style="color:var(--red)">' + str(counts["loss"]) + '</div></div>'
+             + '<div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:var(--dim)">' + str(counts["invalid"]) + '</div></div>'
+             + '<div class="stat"><div class="lbl">' + T["pending"] + '</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
+             + '</div>')
     note = '<div class="note">' + T["note"] + '</div>'
     trows = []
     for r in bs:
@@ -1497,10 +1526,33 @@ def stats_view():
              '<th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead><tbody>'
              + "".join(trows) + '</tbody></table></div>')
 
+    exp_items = []
+    for k, v in by_type.items():
+        n = v["win"] + v["loss"]
+        rd = r_by_type.get(k, {"sum": 0.0, "cnt": 0})
+        mean_r = (rd["sum"] / rd["cnt"]) if rd["cnt"] else 0.0
+        exp_items.append({"k": str(k), "n": n,
+                          "wr": round(100 * v["win"] / n, 1) if n else 0,
+                          "rmean": round(mean_r, 2), "rtotal": round(rd["sum"], 1)})
+    exp_items.sort(key=lambda x: x["rmean"], reverse=True)
+    exp_rows = []
+    for it in exp_items:
+        rc = "var(--grn)" if it["rmean"] > 0 else "var(--red)"
+        exp_rows.append('<tr><td>' + esc(it["k"]) + '</td><td>' + str(it["n"])
+                        + '</td><td>' + str(it["wr"]) + '%</td>'
+                        + '<td style="font-weight:700;color:' + rc + '">' + sgn(it["rmean"])
+                        + '</td><td style="color:' + rc + '">' + sgn(it["rtotal"]) + '</td></tr>')
+    exp_table = ('<div class="card"><h2>' + T["exp_title"] + '</h2>'
+                 + '<div class="note">' + T["rnote"] + '</div>'
+                 + '<table><thead><tr><th>' + T["th_type"] + '</th><th>N</th><th>Win rate</th>'
+                 + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
+                 + "".join(exp_rows) + '</tbody></table></div>')
+
     body = (cards
             + '<div class="card"><h2>' + T["by_score"] + '</h2>' + _bar_rows(bs, "#f5a623", T["nodata"]) + '</div>'
             + note
             + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
+            + exp_table
             + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
             + table)
     return head + header + body + '</body></html>'
@@ -1554,7 +1606,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.1",
+        "version": "2.7.2",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
