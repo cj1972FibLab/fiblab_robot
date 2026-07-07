@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.6.8)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.0)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  MAJEUR v2.7.0 "Évaluation par lot" :                        ║
+║   • fetch prix UNE fois par ACTIF (au lieu d'un par alerte)  ║
+║     → ~7 requêtes au lieu de ~800, fin du mur de quota       ║
+║   • logique SL/TP/Fib0 inchangée (slicing en mémoire)        ║
 ║                                                              ║
 ║  Patch v2.6.8 "Repli Yahoo si Twelve Data vide" :            ║
 ║   • fetch_prices bascule sur Yahoo quand Twelve Data renvoie ║
@@ -983,15 +988,14 @@ def fetch_prices(group, asset, start_dt, end_dt):
 
 
 def evaluate_pending_outcomes():
-    """Évalue les alertes 'pending' avec stop adaptatif (SL = k*ATR du TF) et
-    fenêtre proportionnelle au TF. Si une cible d'obligation (target) est connue,
-    le TP devient la distance Entry→cible réelle de Syn (au lieu de tp_r arbitraire).
-    Ordre de traitement : alertes HOLD d'abord, puis les plus récentes — pour
-    remplir en priorité les cases utiles du dashboard (le vieux bruit attend)."""
+    """Évalue les alertes 'pending' — ÉVALUATION PAR LOT (v2.7.0).
+    Au lieu d'un fetch de prix par alerte, on récupère l'historique de chaque
+    ACTIF une seule fois, puis on évalue toutes ses alertes en attente depuis ce
+    même jeu de données (~7 requêtes au lieu de ~800 → fin du problème de quota).
+    Stop Fib0 pour les Hold (sinon ATR adaptatif) ; TP = cible d'obligation si
+    connue. Ordre : Hold d'abord, puis plus récentes ; seules les alertes mûres
+    (>= EVAL_MIN_AGE_H) sont chargées."""
     now = datetime.now(timezone.utc)
-    # ne charger que les alertes assez mûres pour avoir un verdict (>= EVAL_MIN_AGE_H),
-    # AVANT le LIMIT : sinon un afflux d'alertes récentes remplit le lot et se fait
-    # zapper (age < 12h) sans jamais atteindre les alertes mûres.
     cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
     with db() as conn:
         rows = conn.execute(
@@ -1000,15 +1004,13 @@ def evaluate_pending_outcomes():
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
             "AND a.ts <= ? "
             "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%hold%' THEN 0 ELSE 1 END), a.id DESC "
-            "LIMIT 100",
+            "LIMIT 500",
             (cutoff,)
         ).fetchall()
 
-    evaluated = 0
-    _start = time.monotonic()
+    # Prépare et groupe les alertes par actif, en conservant l'ordre de priorité.
+    groups, order = {}, []
     for r in rows:
-        if time.monotonic() - _start > 20:
-            break
         try:
             ts = datetime.fromisoformat(r["ts"])
         except Exception:
@@ -1020,80 +1022,102 @@ def evaluate_pending_outcomes():
         risk = EVAL_RISK.get(r["grp"])
         if not risk:
             continue
-
         tf_h       = tf_hours(r["timeframe"])
         horizon_h  = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
         lookback_h = min(EVAL_ATR_BARS * tf_h, EVAL_LOOKBACK_MAX_H)
-        end_dt     = min(ts + timedelta(hours=horizon_h), now)
-        start_dt   = ts - timedelta(hours=lookback_h)
+        key = (r["grp"], r["asset"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append({"r": r, "ts": ts, "risk": risk, "tf_h": tf_h,
+                            "horizon_h": horizon_h, "lookback_h": lookback_h})
 
-        bars = fetch_prices(r["grp"], r["asset"], start_dt, end_dt)
+    evaluated = 0
+    _start = time.monotonic()
+    for key in order:
+        if time.monotonic() - _start > 18:      # garde-fou timeout (fetch + marge)
+            break
+        grp, asset = key
+        items = groups[key]
+        # UN SEUL fetch pour tout l'actif : du plus ancien besoin jusqu'à maintenant.
+        earliest = min(it["ts"] - timedelta(hours=it["lookback_h"]) for it in items)
+        floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
+        bars = fetch_prices(grp, asset, max(earliest, floor_dt), now)
         if not bars:
             continue
-        pre  = [b for b in bars if b[0] <= ts]
-        post = [b for b in bars if b[0] > ts]
-        if not post:
-            continue
 
-        atr = _atr_at_tf(pre, tf_h)
-        entry = r["price"]
-        long_bias = (r["side"] == "Support")
-
-        # ── STOP ── Alertes HOLD : Fib0 réel (bas/haut de la bougie englobée),
-        #    sinon repli sur le stop ATR adaptatif. Fib0 rejeté s'il tombe du
-        #    mauvais côté de l'entrée ou est anormalement serré (< 0.25*ATR).
-        sl, sl_src = None, None
-        if "hold" in (r["type"] or "").lower():
-            fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
-            if fib0 is not None and entry:
-                raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
-                atr_floor = 0.25 * atr if (atr and atr > 0) else 0.0
-                if raw_sl > 0 and raw_sl >= atr_floor and raw_sl <= risk["sl_cap"]:
-                    sl, sl_src = raw_sl, "fib0"
-        if sl is None:
-            if atr and atr > 0:
-                sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
-            else:
-                sl, sl_src = risk["fallback"], "fallback"
-
-        # TP = cible d'obligation réelle si connue, sinon multiple de R
-        if r["target"] is not None and entry:
-            tp, tp_src = abs(r["target"] - entry), "obligation"
-        else:
-            tp, tp_src = sl * risk["tp_r"], "R"
-
-        mfe = mae = 0.0
-        status = None
-        r_real = None
-        for (_dt, hi, lo) in post:
-            fav = (hi - entry) if long_bias else (entry - lo)
-            adv = (entry - lo) if long_bias else (hi - entry)
-            mfe = max(mfe, fav)
-            mae = max(mae, adv)
-            if adv >= sl:
-                status, r_real = "loss", -1.0
-                break
-            if fav >= tp:
-                status, r_real = "win", round(tp / sl, 2) if sl else None
-                break
-
-        if status is None:
-            if now >= ts + timedelta(hours=horizon_h):
-                status, r_real = "invalid", (round(mfe / sl, 2) if sl else None)
-            else:
+        updates = []
+        for it in items:
+            r = it["r"]; ts = it["ts"]; risk = it["risk"]; tf_h = it["tf_h"]
+            horizon_h = it["horizon_h"]
+            lb_start = ts - timedelta(hours=it["lookback_h"])
+            end_win  = min(ts + timedelta(hours=horizon_h), now)
+            # même fenêtre pre/post que l'éval par alerte → ATR/Fib0 identiques
+            pre  = [b for b in bars if lb_start <= b[0] <= ts]
+            post = [b for b in bars if ts < b[0] <= end_win]
+            if not post:
                 continue
 
-        src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
-        note = (f"auto ({src}, TF={r['timeframe']}, SL={round(sl, 2)}[{sl_src}], "
-                f"TP={round(tp, 2)}[{tp_src}], H={int(horizon_h)}h)")
-        with db() as conn:
-            conn.execute(
-                "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, r_realized=?, "
-                "note=?, updated_ts=? WHERE alert_id=?",
-                (status, round(mfe, 2), round(mae, 2), r_real, note, now_iso(), r["id"])
-            )
-            conn.commit()
-        evaluated += 1
+            atr = _atr_at_tf(pre, tf_h)
+            entry = r["price"]
+            long_bias = (r["side"] == "Support")
+
+            # ── STOP ── Hold : Fib0 réel (bas/haut bougie englobée), sinon ATR.
+            sl, sl_src = None, None
+            if "hold" in (r["type"] or "").lower():
+                fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
+                if fib0 is not None and entry:
+                    raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
+                    atr_floor = 0.25 * atr if (atr and atr > 0) else 0.0
+                    if raw_sl > 0 and raw_sl >= atr_floor and raw_sl <= risk["sl_cap"]:
+                        sl, sl_src = raw_sl, "fib0"
+            if sl is None:
+                if atr and atr > 0:
+                    sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
+                else:
+                    sl, sl_src = risk["fallback"], "fallback"
+
+            # TP = cible d'obligation réelle si connue, sinon multiple de R.
+            if r["target"] is not None and entry:
+                tp, tp_src = abs(r["target"] - entry), "obligation"
+            else:
+                tp, tp_src = sl * risk["tp_r"], "R"
+
+            mfe = mae = 0.0
+            status = None
+            r_real = None
+            for (_dt, hi, lo) in post:
+                fav = (hi - entry) if long_bias else (entry - lo)
+                adv = (entry - lo) if long_bias else (hi - entry)
+                mfe = max(mfe, fav)
+                mae = max(mae, adv)
+                if adv >= sl:
+                    status, r_real = "loss", -1.0
+                    break
+                if fav >= tp:
+                    status, r_real = "win", round(tp / sl, 2) if sl else None
+                    break
+
+            if status is None:
+                if now >= ts + timedelta(hours=horizon_h):
+                    status, r_real = "invalid", (round(mfe / sl, 2) if sl else None)
+                else:
+                    continue
+
+            src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
+            note = (f"auto ({src}, TF={r['timeframe']}, SL={round(sl, 2)}[{sl_src}], "
+                    f"TP={round(tp, 2)}[{tp_src}], H={int(horizon_h)}h)")
+            updates.append((status, round(mfe, 2), round(mae, 2), r_real, note, now_iso(), r["id"]))
+
+        if updates:
+            with db() as conn:
+                conn.executemany(
+                    "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, r_realized=?, "
+                    "note=?, updated_ts=? WHERE alert_id=?",
+                    updates
+                )
+                conn.commit()
+            evaluated += len(updates)
     return evaluated
 
 
@@ -1519,7 +1543,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.6.8",
+        "version": "2.7.0",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
