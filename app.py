@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.5)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.6)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,10 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.6 "Filtre type sur dashboard" :                  ║
+║   • /stats_view?type=hold|bsut|... : chips cliquables pour   ║
+║     isoler un type/famille (confort d'analyse)               ║
 ║                                                              ║
 ║  Patch v2.7.5 "Toggle /ideal on|off" :                       ║
 ║   • commande Telegram /ideal on|off (admin) pour activer /   ║
@@ -1439,6 +1443,10 @@ code{background:#161b22;padding:2px 6px;border-radius:4px;color:var(--gold)}
 .btn{font-size:.75rem;color:var(--blue);text-decoration:none;background:transparent;border:1px solid var(--bd);padding:5px 10px;border-radius:6px;cursor:pointer;font-family:inherit}
 .btn:hover{border-color:var(--blue)}
 .btn.active{border-color:var(--blue);color:var(--gold);font-weight:700}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 18px}
+.chip{font-size:.72rem;color:var(--dim);text-decoration:none;border:1px solid var(--bd);padding:4px 12px;border-radius:20px}
+.chip:hover{color:var(--blue);border-color:var(--blue)}
+.chip.active{background:var(--blue);color:#04121f;border-color:var(--blue);font-weight:700}
 @media print{.actions{display:none}*{-webkit-print-color-adjust:exact !important;print-color-adjust:exact !important}}
 </style>"""
 
@@ -1465,7 +1473,7 @@ DASH_STR = {
         "title": "\U0001F3AF Calibration du scoring",
         "sub": "Win rate & espérance des alertes par score / type / timeframe — pour ajuster les poids sur des faits",
         "pdf": "\U0001F5A8 Imprimer / PDF", "refresh": "\u21bb Rafraîchir",
-        "evaluated": "Évaluées", "gwr": "Win rate global", "pending": "En attente",
+        "evaluated": "Évaluées", "gwr": "Win rate global", "pending": "En attente", "flt_all": "Tout",
         "rmean_card": "R moyen (espérance)", "rtotal_card": "R total",
         "by_score": "Win rate par SCORE — le graphe clé",
         "by_type": "Win rate par TYPE", "by_tf": "Win rate par TIMEFRAME",
@@ -1480,7 +1488,7 @@ DASH_STR = {
         "title": "\U0001F3AF Scoring calibration",
         "sub": "Alert win rate & expectancy by score / type / timeframe — to tune the weights on facts",
         "pdf": "\U0001F5A8 Print / PDF", "refresh": "\u21bb Refresh",
-        "evaluated": "Evaluated", "gwr": "Overall win rate", "pending": "Pending",
+        "evaluated": "Evaluated", "gwr": "Overall win rate", "pending": "Pending", "flt_all": "All",
         "rmean_card": "Mean R (expectancy)", "rtotal_card": "Total R",
         "by_score": "Win rate by SCORE — the key chart",
         "by_type": "Win rate by TYPE", "by_tf": "Win rate by TIMEFRAME",
@@ -1502,6 +1510,8 @@ def stats_view():
     if lang not in ("fr", "en"):
         lang = "fr"
     T = DASH_STR[lang]
+    type_filter = (request.args.get("type") or "").lower().strip()
+    from urllib.parse import quote
     with db() as conn:
         rows = conn.execute(
             "SELECT a.score, a.type, a.timeframe, o.status, o.r_realized "
@@ -1513,6 +1523,8 @@ def stats_view():
     r_by_type = {}
     r_sum_all, r_cnt_all = 0.0, 0
     for r in rows:
+        if type_filter and type_filter not in (r["type"] or "").lower():
+            continue
         st = r["status"] or "pending"
         counts[st] = counts.get(st, 0) + 1
         if st in ("win", "loss"):
@@ -1548,21 +1560,33 @@ def stats_view():
 
     fr_cls = "btn active" if lang == "fr" else "btn"
     en_cls = "btn active" if lang == "en" else "btn"
+
+    def mkurl2(l, t):
+        u = "/stats_view?lang=" + l
+        if t:
+            u += "&type=" + quote(t)
+        return u
     head = ('<!DOCTYPE html><html lang="' + lang + '"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab — Calibration</title>' + DASH_CSS + '</head><body>')
     header = ('<div class="actions">'
               '<a class="btn" href="/export.csv">\u2b07 CSV</a>'
               '<button class="btn" onclick="window.print()">' + T["pdf"] + '</button>'
-              '<a class="' + fr_cls + '" href="/stats_view?lang=fr">FR</a>'
-              '<a class="' + en_cls + '" href="/stats_view?lang=en">EN</a>'
-              '<a class="btn" href="/stats_view?lang=' + lang + '">' + T["refresh"] + '</a>'
+              '<a class="' + fr_cls + '" href="' + mkurl2("fr", type_filter) + '">FR</a>'
+              '<a class="' + en_cls + '" href="' + mkurl2("en", type_filter) + '">EN</a>'
+              '<a class="btn" href="' + mkurl2(lang, type_filter) + '">' + T["refresh"] + '</a>'
               '</div>'
               '<h1>' + T["title"] + '</h1>'
               '<div class="sub">' + T["sub"] + '</div>')
 
+    _chip_defs = [("", T["flt_all"]), ("hold", "Hold"), ("bsut", "BSUT"),
+                  ("first touch", "First Touch"), ("proximity", "Proximity")]
+    chips = '<div class="chips">' + "".join(
+        '<a class="chip' + (" active" if type_filter == kw else "") + '" href="'
+        + mkurl2(lang, kw) + '">' + esc(lbl) + '</a>' for kw, lbl in _chip_defs) + '</div>'
+
     if tot_eval == 0:
-        body = '<div class="empty">' + T["empty"].format(p=counts["pending"]) + '</div>'
+        body = chips + '<div class="empty">' + T["empty"].format(p=counts["pending"]) + '</div>'
         return head + header + body + '</body></html>'
 
     wrc = "var(--grn)" if wr >= 50 else "var(--gold)"
@@ -1610,7 +1634,7 @@ def stats_view():
                  + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
                  + "".join(exp_rows) + '</tbody></table></div>')
 
-    body = (cards
+    body = (chips + cards
             + '<div class="card"><h2>' + T["by_score"] + '</h2>' + _bar_rows(bs, "#f5a623", T["nodata"]) + '</div>'
             + note
             + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
@@ -1668,7 +1692,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.5",
+        "version": "2.7.6",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
