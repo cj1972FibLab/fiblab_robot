@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.6)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.8)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,15 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.8 "Entrée éval = niveau d'origine (Fib 1)" :     ║
+║   • revert v2.7.3 : l'entrée redevient le niveau (Fib 1 =    ║
+║     Entry touched), confirmé — cohérent avec le ticket       ║
+║   • (R fiable seulement quand le dev livrera Fib 0)          ║
+║                                                              ║
+║  Patch v2.7.7 "Ticket de trade semi-auto (démo)" :           ║
+║   • sur Origin Hold ACTIVATED : ticket Telegram prêt à       ║
+║     exécuter (entrée niveau, TP Exit, SL Fib0, taille 1%)    ║
 ║                                                              ║
 ║  Patch v2.7.6 "Filtre type sur dashboard" :                  ║
 ║   • /stats_view?type=hold|bsut|... : chips cliquables pour   ║
@@ -623,6 +632,19 @@ NOTIFY_ONLY_IDEAL = True
 TYPES_IDEAL       = {"hold activated"}
 robot_state["notify_only_ideal"] = NOTIFY_ONLY_IDEAL   # état runtime (toggle /ideal)
 
+# ── Ticket de trade (semi-auto démo) ──────────────────────────
+# Sur les types tradeables (Origin Hold ACTIVATED), le bot envoie à l'admin un
+# ticket prêt : entrée = niveau (exact), TP = Exit (exact), SL = Fib0 reconstruit,
+# taille pour un risque fixe. Démo, pour se faire la main avant tout auto réel.
+TICKET_ENABLED   = True
+TICKET_CAPITAL   = 100000.0                    # capital démo (USD)
+TICKET_RISK_PCT  = 1.0                          # risque par trade (% du capital)
+TICKET_TYPES     = {"origin hold activated"}
+# Valeur du point PAR LOT, par actif — HYPOTHÈSES à VÉRIFIER selon ton broker !
+CONTRACT_VALUE   = {"xau": 100.0, "dax": 25.0, "btc": 1.0, "solana": 1.0,
+                    "hype": 1.0, "sui": 1.0, "stocks": 1.0}
+CONTRACT_DEFAULT = 1.0
+
 
 def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
     alert_type = (parsed.get("type") or "").lower()
@@ -1136,12 +1158,9 @@ def evaluate_pending_outcomes():
             long_bias = (r["side"] == "Support")
             is_hold = "hold" in (r["type"] or "").lower()
 
-            # Entrée : pour les Hold on entre sur CONFIRMATION = à la CLÔTURE de
-            # l'englobante (close de la derniere bougie <= ts), pas au niveau —
-            # sinon le proxy empoche gratuitement le trajet de l'englobante.
+            # Entrée = niveau d'origine (Fib 1 = "Entry touched"). Confirmé : Fred
+            # entre à l'origine, PAS à la close de l'englobante (revert v2.7.3).
             entry = r["price"]
-            if is_hold and pre and pre[-1][3] is not None and pre[-1][3] > 0:
-                entry = pre[-1][3]
 
             # ── STOP ── Hold : Fib0 (bas/haut bougie englobée), PLANCHERISE au
             #    max(sl_floor, 0.5*ATR) pour tuer les R gonflés par un stop minuscule.
@@ -1206,6 +1225,63 @@ def evaluate_pending_outcomes():
 # ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
+def build_trade_ticket(parsed, group):
+    """Ticket de trade pour les types tradeables (Origin Hold ACTIVATED) :
+    entrée = niveau 'Entry touched' (exact), TP = 'Exit' (exact), SL = Fib0
+    reconstruit depuis le H1 récent, taille pour un risque fixe. Retourne le
+    message Telegram, ou None si non applicable / données manquantes."""
+    atype = (parsed.get("type") or "").lower()
+    if not any(t in atype for t in TICKET_TYPES):
+        return None
+    entry  = parsed.get("price")
+    target = parsed.get("target")
+    side   = parsed.get("side")
+    if entry is None or not side:
+        return None
+    long_bias = (side == "Support")
+    risk_usd  = TICKET_CAPITAL * TICKET_RISK_PCT / 100.0
+    tf_h      = tf_hours(parsed.get("timeframe"))
+
+    # SL = Fib0 reconstruit (fetch H1 récent ; échoue proprement si feed KO).
+    now, sl = datetime.now(timezone.utc), None
+    try:
+        bars = fetch_prices(group, parsed.get("asset") or "",
+                            now - timedelta(hours=max(4 * tf_h, 12)), now)
+        if bars:
+            f0 = _fib0_from_bars(bars, now, tf_h, long_bias)
+            if f0 is not None and ((long_bias and f0 < entry) or ((not long_bias) and f0 > entry)):
+                sl = f0
+    except Exception as e:
+        print(f"[TICKET] fib0 : {e}")
+
+    dir_txt = "\U0001F7E2 LONG (achat)" if long_bias else "\U0001F534 SHORT (vente)"
+    L = ["\U0001F3AB <b>TICKET DE TRADE</b> — démo " + str(int(TICKET_CAPITAL / 1000)) + "k",
+         "<b>" + esc(parsed.get("asset") or "?") + "</b> · TF " + esc(parsed.get("timeframe") or "?")
+         + " · " + esc(parsed.get("type") or ""),
+         "━━━━━━━━━━━━━━━━━━━━",
+         "Sens   : " + dir_txt,
+         "Entrée : <b>" + str(entry) + "</b> <i>(niveau, exact)</i>"]
+    if target is not None:
+        L.append("TP     : <b>" + str(target) + "</b> <i>(obligation, exact)</i>")
+    if sl is not None:
+        stop = abs(entry - sl)
+        cval = CONTRACT_VALUE.get(group, CONTRACT_DEFAULT)
+        lots = risk_usd / (stop * cval) if (stop > 0 and cval > 0) else 0.0
+        L.append("SL     : <b>" + str(round(sl, 2)) + "</b> <i>(Fib0 reconstruit — vérifie ton chart)</i>")
+        L.append("━━━━━━━━━━━━━━━━━━━━")
+        L.append("Risque : <b>" + str(int(risk_usd)) + " $</b> (" + ("%g" % TICKET_RISK_PCT) + " %)")
+        L.append("Stop   : " + str(round(stop, 2)) + " pts")
+        L.append("Taille : <b>" + str(round(lots, 2)) + " lots</b> <i>(specs " + group + " — À VÉRIFIER)</i>")
+        if target is not None and stop > 0:
+            L.append("R:R    : <b>1:" + str(round(abs(target - entry) / stop, 2)) + "</b>")
+    else:
+        L.append("SL     : <i>Fib0 indisponible (feed KO) — lis-le sur ton chart</i>")
+        L.append("Risque : " + str(int(risk_usd)) + " $ — dimensionne à la main")
+    L.append("━━━━━━━━━━━━━━━━━━━━")
+    L.append("\u26A0\uFE0F <i>Démo. Entrée/TP exacts ; SL &amp; taille à vérifier avant d'exécuter.</i>")
+    return "\n".join(L)
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if not check_secret():
@@ -1262,6 +1338,10 @@ def webhook():
             continue
         if user_id == TELEGRAM_CHAT_ID_2 and scoring["level"] != "PRIORITAIRE":
             continue
+        if (user_id == TELEGRAM_CHAT_ID and TICKET_ENABLED
+                and any(t in (parsed.get("type") or "").lower() for t in TICKET_TYPES)):
+            results[user_id] = "-> ticket"
+            continue
         notify, reason = should_notify(parsed, scoring, profile)
         if not notify:
             results[user_id] = f"filtré: {reason}"
@@ -1269,6 +1349,15 @@ def webhook():
         tg_msg = format_telegram_message(parsed, scoring, profile)
         sent   = send_telegram(tg_msg, user_id)
         results[user_id] = "✅" if sent else "❌"
+
+    if TICKET_ENABLED and not robot_state["paused"]:
+        try:
+            ticket = build_trade_ticket(parsed, group)
+            if ticket:
+                send_telegram(ticket, TELEGRAM_CHAT_ID)
+                results["ticket"] = "sent"
+        except Exception as e:
+            print(f"[TICKET] {e}")
 
     print(f"[WEBHOOK] {scoring['level']} Score={scoring['score']} "
           f"TF={parsed.get('timeframe')} Group={group} id={alert_id} {results}")
@@ -1692,7 +1781,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.6",
+        "version": "2.7.8",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
