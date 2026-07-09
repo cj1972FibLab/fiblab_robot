@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.4)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.5)      ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,10 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.5 "Toggle /ideal on|off" :                       ║
+║   • commande Telegram /ideal on|off (admin) pour activer /   ║
+║     couper le filtre idéal sans redéployer ; état dans /status║
 ║                                                              ║
 ║  Patch v2.7.4 "Alertes idéales seulement" :                  ║
 ║   • notification filtrée aux Hold CONFIRMÉS (espérance + )   ║
@@ -613,6 +617,7 @@ TYPES_IGNORED    = {"break created"}
 # "hold activated" (substring) couvre Hold ACTIVATED ET Origin Hold ACTIVATED.
 NOTIFY_ONLY_IDEAL = True
 TYPES_IDEAL       = {"hold activated"}
+robot_state["notify_only_ideal"] = NOTIFY_ONLY_IDEAL   # état runtime (toggle /ideal)
 
 
 def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
@@ -634,7 +639,7 @@ def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
 
     # ── Alertes idéales : seuls les Hold confirmés passent (le reste = bruit,
     #    stocké mais muet). Court-circuite toute la logique permissive ci-dessous.
-    if NOTIFY_ONLY_IDEAL:
+    if robot_state.get("notify_only_ideal", NOTIFY_ONLY_IDEAL):
         if any(t in alert_type for t in TYPES_IDEAL):
             return True, "ok (idéal)"
         return False, "non idéal (bruit filtré)"
@@ -813,6 +818,24 @@ def handle_telegram_command(text: str, chat_id: str):
             etat = "ON 🛑" if robot_state["paused"] else "OFF ✅"
             msg = f"Killswitch actuel : <b>{etat}</b>\nUsage : /killswitch on | /killswitch off"
 
+    elif cmd == "/ideal":
+        if chat_id != TELEGRAM_CHAT_ID:
+            msg = "⛔ Commande réservée à l'admin."
+        elif arg == "on":
+            robot_state["notify_only_ideal"] = True
+            msg = ("🎯 <b>Filtre IDÉAL ON</b> — seuls les Hold confirmés "
+                   "(Hold ACTIVATED + Origin Hold ACTIVATED) sont notifiés.\n"
+                   "Le reste reste stocké pour la calibration, mais muet.")
+        elif arg == "off":
+            robot_state["notify_only_ideal"] = False
+            msg = ("📢 <b>Filtre IDÉAL OFF</b> — le filtre standard (score + TF) "
+                   "reprend la main. Attention au flot d'alertes.")
+        else:
+            etat = "ON 🎯" if robot_state.get("notify_only_ideal", NOTIFY_ONLY_IDEAL) else "OFF 📢"
+            msg = (f"Filtre alertes idéales : <b>{etat}</b>\n"
+                   f"Types notifiés : {', '.join(sorted(TYPES_IDEAL))}\n"
+                   f"Usage : /ideal on | /ideal off")
+
     elif cmd == "/status":
         tf_on = [k for k, v in profile["tf_custom"].items() if v]
         etat  = "⏸ PAUSE" if profile["paused"] else "✅ ACTIF"
@@ -822,6 +845,7 @@ def handle_telegram_command(text: str, chat_id: str):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"État   : {etat} {kill}\n"
             f"Mode   : <b>{profile['mode'].upper()}</b>\n"
+            f"Idéal  : {'🎯 ON' if robot_state.get('notify_only_ideal', NOTIFY_ONLY_IDEAL) else '📢 OFF'}\n"
             f"TF+    : {', '.join(tf_on) if tf_on else 'aucun'}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Alertes globales : {len(alert_history)}\n"
@@ -835,7 +859,8 @@ def handle_telegram_command(text: str, chat_id: str):
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"/mode swing|scalp|both\n"
             f"/tf_on 72 | /tf_off 72 | /tf_status\n"
-            f"/pause | /reprendre"
+            f"/pause | /reprendre\n"
+            f"/ideal on|off"
         )
 
     elif cmd in ("/derniere", "/xau", "/solana", "/dax", "/btc", "/hype", "/sui", "/stocks"):
@@ -1643,7 +1668,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.4",
+        "version": "2.7.5",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
