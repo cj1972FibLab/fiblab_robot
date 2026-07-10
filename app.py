@@ -1,7 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.20)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.21)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.21 "Journal de trading" :                        ║
+║   • /journal : comptes (UFunded 360k / DD 16k absolu,        ║
+║     Jupiter, Phantom), solde manuel, marge avant violation   ║
+║     DD avec barre de danger, trades pré-remplis depuis les   ║
+║     alertes ticketables, sorties partielles par palier,      ║
+║     champ déviation, R géométrique + P&L indicatif           ║
+║   • /balance <compte> <solde> et /journal sur Telegram       ║
 ║                                                              ║
 ║  Patch v2.7.20 "Stop paramétrable PAR ACTIF" :               ║
 ║   • /sl_fib <groupe> <fraction> : surcharge le stop d'un     ║
@@ -172,7 +180,7 @@ import time
 import sqlite3
 import requests
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, redirect, render_template
 from collections import deque
 
 app = Flask(__name__)
@@ -259,6 +267,48 @@ def init_db():
             conn.execute("ALTER TABLE profiles ADD COLUMN lang TEXT DEFAULT 'fr'")
         except Exception:
             pass
+        # v2.7.21 : JOURNAL DE TRADING
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                name     TEXT UNIQUE,
+                kind     TEXT,              -- propfirm | crypto
+                capital  REAL,              -- capital de référence
+                dd_max   REAL,              -- drawdown max ABSOLU (NULL si aucun)
+                balance  REAL,              -- solde courant, MIS À JOUR PAR L'UTILISATEUR
+                active   INTEGER DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER,
+                opened_ts  TEXT,
+                closed_ts  TEXT,
+                asset      TEXT,
+                grp        TEXT,
+                side       TEXT,             -- LONG | SHORT
+                entry      REAL,
+                sl_initial REAL,
+                risk_usd   REAL,
+                status     TEXT DEFAULT 'open',   -- open | closed | cancelled
+                exits      TEXT DEFAULT '[]',     -- JSON [{ts,price,frac,label}]
+                r_realized REAL,
+                pnl_usd    REAL,
+                setup      TEXT,             -- ex: Origin Hold ACTIVATED H4
+                deviation  TEXT,             -- pourquoi j'ai dévié du ticket
+                alert_id   INTEGER,          -- lien vers l'alerte source
+                note       TEXT,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            )
+        """)
+        # Seed des comptes au premier lancement (modifiable ensuite via /journal)
+        if conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"] == 0:
+            conn.executemany(
+                "INSERT INTO accounts (name,kind,capital,dd_max,balance) VALUES (?,?,?,?,?)",
+                [("UFunded", "propfirm", 360000.0, 16000.0, 360000.0),
+                 ("Jupiter", "crypto", 0.0, None, 0.0),
+                 ("Phantom", "crypto", 0.0, None, 0.0)])
         conn.commit()
 
 
@@ -1042,6 +1092,40 @@ def handle_telegram_command(text: str, chat_id: str):
             f"⛔ TF-  : {', '.join(inactifs)}"
         )
 
+    elif cmd == "/balance":
+        # /balance ufunded 361200  — mise à jour rapide du solde d'un compte
+        if chat_id != TELEGRAM_CHAT_ID:
+            msg = "\u26d4 Commande réservée à l'admin."
+        else:
+            arg2 = parts[2] if len(parts) > 2 else ""
+            try:
+                val = float(arg2.replace(",", ".").replace(" ", ""))
+            except (ValueError, AttributeError):
+                val = None
+            with db() as conn:
+                accts = conn.execute("SELECT * FROM accounts WHERE active=1").fetchall()
+                match = [a for a in accts if arg and a["name"].lower().startswith(arg)]
+                if len(match) == 1 and val is not None:
+                    a = match[0]
+                    conn.execute("UPDATE accounts SET balance=? WHERE id=?", (val, a["id"]))
+                    conn.commit()
+                    extra = ""
+                    if a["dd_max"]:
+                        floor = (a["capital"] or 0) - a["dd_max"]
+                        margin = val - floor
+                        extra = (f"\nMarge avant violation DD : <b>{margin:,.0f} $</b>"
+                                 f" (plancher {floor:,.0f} $)").replace(",", " ")
+                        if margin < a["dd_max"] * 0.25:
+                            extra += "\n\U0001F6A8 <b>ZONE ROUGE</b> — réduis le risque."
+                    msg = f"\U0001F4B0 <b>{a['name']}</b> : solde \u2192 <b>{val:,.0f} $</b>".replace(",", " ") + extra
+                else:
+                    lines = [f"\u2022 {a['name']} : {(a['balance'] or 0):,.0f} $".replace(",", " ") for a in accts]
+                    msg = "Soldes :\n" + "\n".join(lines) + "\n\nUsage : /balance ufunded 361200"
+
+    elif cmd == "/journal":
+        base = "https://acceptable-vision-production-a0df.up.railway.app/journal"
+        msg = f"\U0001F4D2 <a href='{base}{('?token=' + WEBHOOK_SECRET) if WEBHOOK_SECRET else ''}'>Ouvrir le journal</a>"
+
     elif cmd == "/lang":
         if arg in ("fr", "en"):
             profile["lang"] = arg
@@ -1635,6 +1719,257 @@ def build_trade_ticket(parsed, group, profile=None):
         "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>" + S["tk_chart"] + "</a>",
         S["tk_demo_warn"]]
     return "\n".join(L)
+
+
+
+# ─────────────────────────────────────────────
+# JOURNAL DE TRADING (v2.7.21)
+# ─────────────────────────────────────────────
+def _tok():
+    return ("?token=" + WEBHOOK_SECRET) if WEBHOOK_SECRET else ""
+
+
+def _trade_r(t):
+    """R réalisé (géométrique, broker-agnostique) + fraction encore ouverte.
+    R d'une sortie = frac × (exit−entry)/(entry−sl), signé par le sens."""
+    try:
+        exits = json.loads(t["exits"] or "[]")
+    except Exception:
+        exits = []
+    entry, sl = t["entry"], t["sl_initial"]
+    if entry is None or sl is None or entry == sl:
+        return 0.0, 1.0, exits
+    risk_pts = abs(entry - sl)
+    sign = 1.0 if (t["side"] or "").upper() == "LONG" else -1.0
+    r = sum(e["frac"] * sign * (e["price"] - entry) / risk_pts for e in exits)
+    open_frac = max(0.0, 1.0 - sum(e["frac"] for e in exits))
+    return r, open_frac, exits
+
+
+@app.route("/journal", methods=["GET"])
+def journal_view():
+    if not check_secret():
+        return ("unauthorized", 403)
+    tok = _tok()
+    amp = "&" if tok else "?"
+    prefill_id = request.args.get("prefill")
+    with db() as conn:
+        accts = conn.execute("SELECT * FROM accounts WHERE active=1 ORDER BY id").fetchall()
+        open_tr = conn.execute(
+            "SELECT t.*, a.name AS acct FROM trades t JOIN accounts a ON a.id=t.account_id "
+            "WHERE t.status='open' ORDER BY t.opened_ts DESC").fetchall()
+        closed_tr = conn.execute(
+            "SELECT t.*, a.name AS acct FROM trades t JOIN accounts a ON a.id=t.account_id "
+            "WHERE t.status!='open' ORDER BY t.closed_ts DESC LIMIT 30").fetchall()
+        # Alertes ticketables récentes pour le pré-remplissage
+        recents = conn.execute(
+            "SELECT id, ts, asset, grp, timeframe, type, side, price, target FROM alerts "
+            "WHERE LOWER(type) LIKE '%origin hold activated%' AND price IS NOT NULL "
+            "AND target IS NOT NULL ORDER BY id DESC LIMIT 12").fetchall()
+
+    # Valeurs de pré-remplissage depuis une alerte (mêmes maths que le ticket)
+    pf = {"asset": "", "grp": "", "side": "LONG", "entry": "", "sl": "", "setup": "", "alert_id": ""}
+    if prefill_id:
+        with db() as conn:
+            al = conn.execute("SELECT * FROM alerts WHERE id=?", (prefill_id,)).fetchone()
+        if al:
+            long_bias = (al["side"] == "Support")
+            slf = sl_fib_for(al["grp"])
+            slv = _stop_from_fib(al["price"], al["target"], long_bias, slf)
+            pf = {"asset": al["asset"] or "", "grp": al["grp"] or "",
+                  "side": "LONG" if long_bias else "SHORT",
+                  "entry": al["price"], "sl": (round(slv, 4) if slv is not None else ""),
+                  "setup": f"{al['type']} {al['timeframe'] or ''}".strip(),
+                  "alert_id": al["id"]}
+
+    def money(x):
+        return f"{x:,.0f}".replace(",", " ")
+
+    # ── Cartes comptes ──
+    acct_cards = ""
+    for a in accts:
+        bal, cap = a["balance"] or 0.0, a["capital"] or 0.0
+        dd_html = ""
+        if a["dd_max"]:
+            floor = cap - a["dd_max"]
+            margin = bal - floor
+            pctm = max(0.0, min(100.0, 100.0 * margin / a["dd_max"])) if a["dd_max"] else 0
+            col = "var(--grn)" if pctm > 50 else ("var(--gold)" if pctm > 25 else "var(--red)")
+            dd_html = (f'<div class="note">Plancher DD : <b>{money(floor)} $</b> \u00b7 '
+                       f'Marge restante : <b style="color:{col}">{money(margin)} $</b> / {money(a["dd_max"])} $</div>'
+                       f'<div style="background:#21262d;border-radius:6px;height:10px;overflow:hidden">'
+                       f'<div style="width:{pctm:.1f}%;height:10px;background:{col}"></div></div>')
+        acct_cards += (
+            f'<div class="card"><h2>{esc(a["name"])} <span style="color:var(--dim);font-size:.7em">'
+            f'{esc(a["kind"])}</span></h2>'
+            f'<div class="val" style="color:var(--blue)">{money(bal)} $</div>'
+            + dd_html +
+            f'<form method="post" action="/journal/balance{tok}" style="margin-top:8px">'
+            f'<input type="hidden" name="account_id" value="{a["id"]}">'
+            f'<input name="balance" placeholder="nouveau solde" inputmode="decimal" '
+            f'style="width:140px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;'
+            f'border-radius:6px;padding:6px"> '
+            f'<button class="btn">Mettre \u00e0 jour</button></form></div>')
+
+    # ── Trades ouverts ──
+    def trow(t, closed=False):
+        r, of, exits = _trade_r(t)
+        ex_txt = " \u00b7 ".join(f"{e.get('label','exit')} {e['price']} ({int(e['frac']*100)}%)" for e in exits) or "\u2014"
+        pnl = (t["pnl_usd"] if closed and t["pnl_usd"] is not None
+               else (r * (t["risk_usd"] or 0.0)))
+        rc = "var(--grn)" if r > 0 else ("var(--red)" if r < 0 else "var(--dim)")
+        dev = f'<div class="note">\u26a0\ufe0f D\u00e9viation : {esc(t["deviation"])}</div>' if t["deviation"] else ""
+        actions = ""
+        if not closed:
+            actions = (
+                f'<form method="post" action="/journal/trade/{t["id"]}/exit{tok}" style="margin-top:6px">'
+                f'<input name="price" placeholder="prix" inputmode="decimal" style="width:90px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
+                f'<input name="pct" placeholder="%" inputmode="numeric" style="width:50px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
+                f'<input name="label" placeholder="TP1/BE/stop" style="width:90px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
+                f'<button class="btn">Sortie partielle</button></form>'
+                f'<form method="post" action="/journal/trade/{t["id"]}/close{tok}" style="margin-top:4px">'
+                f'<input name="price" placeholder="prix de cl\u00f4ture du reste" inputmode="decimal" style="width:170px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
+                f'<button class="btn">Cl\u00f4turer</button></form>')
+        when = (t["closed_ts"] or t["opened_ts"] or "")[:16].replace("T", " ")
+        return (f'<div class="card"><b>{esc(t["asset"])}</b> \u00b7 {esc(t["side"])} \u00b7 {esc(t["acct"])}'
+                f' \u00b7 <span style="color:var(--dim)">{when}</span><br>'
+                f'Entr\u00e9e {t["entry"]} \u00b7 SL {t["sl_initial"]} \u00b7 risque {money(t["risk_usd"] or 0)} $'
+                f' \u00b7 setup : {esc(t["setup"] or "?")}<br>'
+                f'Sorties : {ex_txt}<br>'
+                f'<b style="color:{rc}">R = {r:+.2f}</b> \u00b7 P&L indicatif {pnl:+,.0f} $'
+                + (f' \u00b7 reste ouvert {int(of*100)}%' if not closed else '')
+                + dev + actions + '</div>')
+
+    open_html = "".join(trow(t) for t in open_tr) or '<div class="note">Aucun trade ouvert.</div>'
+    closed_html = "".join(trow(t, True) for t in closed_tr) or '<div class="note">Aucun trade cl\u00f4tur\u00e9.</div>'
+
+    # ── Formulaire nouveau trade + pré-remplissage ──
+    pre_links = "".join(
+        f'<a class="chip" href="/journal{tok}{amp}prefill={r["id"]}">#{r["id"]} {esc(r["asset"] or "?")} '
+        f'{esc(r["timeframe"] or "")} @{r["price"]}</a>' for r in recents) or '<span class="note">aucune</span>'
+    acct_opts = "".join(f'<option value="{a["id"]}">{esc(a["name"])}</option>' for a in accts)
+    inp = 'style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px;margin:2px;width:130px"'
+    form = (
+        f'<div class="card"><h2>Nouveau trade</h2>'
+        f'<div class="chips">{pre_links}</div>'
+        f'<form method="post" action="/journal/trade{tok}">'
+        f'<input type="hidden" name="alert_id" value="{pf["alert_id"]}">'
+        f'<select name="account_id" {inp}>{acct_opts}</select>'
+        f'<input name="asset" placeholder="actif" value="{esc(str(pf["asset"]))}" {inp}>'
+        f'<select name="side" {inp}><option{" selected" if pf["side"]=="LONG" else ""}>LONG</option>'
+        f'<option{" selected" if pf["side"]=="SHORT" else ""}>SHORT</option></select>'
+        f'<input name="entry" placeholder="entr\u00e9e" value="{pf["entry"]}" inputmode="decimal" {inp}>'
+        f'<input name="sl" placeholder="SL initial" value="{pf["sl"]}" inputmode="decimal" {inp}>'
+        f'<input name="risk_usd" placeholder="risque $" inputmode="decimal" {inp}>'
+        f'<input name="setup" placeholder="setup" value="{esc(pf["setup"])}" {inp}>'
+        f'<input name="deviation" placeholder="d\u00e9viation vs ticket (pourquoi ?)" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px;margin:2px;width:97%">'
+        f'<br><button class="btn" style="margin-top:6px">Enregistrer le trade</button></form>'
+        f'<div class="note">Pr\u00e9-remplissage : clique une alerte ci-dessus (entr\u00e9e=Fib 1, SL au /sl_fib courant). '
+        f'Si tu modifies entr\u00e9e/SL, dis pourquoi dans \u00ab d\u00e9viation \u00bb \u2014 c\u2019est la m\u00e9moire de tes \u00e9carts au plan.</div></div>')
+
+    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>FibLab \u2014 Journal</title>' + DASH_CSS + '</head><body>')
+    body = ('<h1>\U0001F4D2 Journal de trading</h1>'
+            '<div class="sub">R g\u00e9om\u00e9trique broker-agnostique \u00b7 P&L indicatif = R \u00d7 risque \u00b7 '
+            'le SOLDE des comptes est ta v\u00e9rit\u00e9, mets-le \u00e0 jour \u00e0 la main.</div>'
+            '<div class="grid">' + acct_cards + '</div>'
+            + form
+            + '<div class="card"><h2>Trades ouverts</h2>' + open_html + '</div>'
+            + '<div class="card"><h2>Historique (30 derniers)</h2>' + closed_html + '</div>')
+    return head + body + '</body></html>'
+
+
+@app.route("/journal/balance", methods=["POST"])
+def journal_balance():
+    if not check_secret():
+        return ("unauthorized", 403)
+    try:
+        aid = int(request.form["account_id"])
+        bal = float(request.form["balance"].replace(",", ".").replace(" ", ""))
+    except (KeyError, ValueError):
+        return ("bad request", 400)
+    with db() as conn:
+        conn.execute("UPDATE accounts SET balance=? WHERE id=?", (bal, aid))
+        conn.commit()
+    return redirect("/journal" + _tok())
+
+
+@app.route("/journal/trade", methods=["POST"])
+def journal_trade_new():
+    if not check_secret():
+        return ("unauthorized", 403)
+    f = request.form
+    try:
+        entry = float(f["entry"].replace(",", "."))
+        sl = float(f["sl"].replace(",", "."))
+        risk = float((f.get("risk_usd") or "0").replace(",", ".") or 0)
+    except (KeyError, ValueError):
+        return ("bad request", 400)
+    grp = get_asset_group(f.get("asset") or "")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO trades (account_id,opened_ts,asset,grp,side,entry,sl_initial,"
+            "risk_usd,setup,deviation,alert_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (int(f["account_id"]), now_iso(), f.get("asset"), grp,
+             f.get("side", "LONG"), entry, sl, risk, f.get("setup"),
+             (f.get("deviation") or None), (int(f["alert_id"]) if f.get("alert_id") else None)))
+        conn.commit()
+    return redirect("/journal" + _tok())
+
+
+@app.route("/journal/trade/<int:tid>/exit", methods=["POST"])
+def journal_trade_exit(tid):
+    if not check_secret():
+        return ("unauthorized", 403)
+    try:
+        price = float(request.form["price"].replace(",", "."))
+        frac = min(1.0, max(0.01, float(request.form["pct"]) / 100.0))
+    except (KeyError, ValueError):
+        return ("bad request", 400)
+    label = request.form.get("label") or "exit"
+    with db() as conn:
+        t = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
+        if not t or t["status"] != "open":
+            return ("not found", 404)
+        exits = json.loads(t["exits"] or "[]")
+        already = sum(e["frac"] for e in exits)
+        frac = min(frac, max(0.0, 1.0 - already))
+        exits.append({"ts": now_iso(), "price": price, "frac": round(frac, 4), "label": label})
+        conn.execute("UPDATE trades SET exits=? WHERE id=?", (json.dumps(exits), tid))
+        # cl\u00f4ture auto si tout est sorti
+        if sum(e["frac"] for e in exits) >= 0.999:
+            t2 = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
+            r, _, _ = _trade_r(t2)
+            conn.execute("UPDATE trades SET status='closed', closed_ts=?, r_realized=?, pnl_usd=? WHERE id=?",
+                         (now_iso(), round(r, 4), round(r * (t["risk_usd"] or 0.0), 2), tid))
+        conn.commit()
+    return redirect("/journal" + _tok())
+
+
+@app.route("/journal/trade/<int:tid>/close", methods=["POST"])
+def journal_trade_close(tid):
+    if not check_secret():
+        return ("unauthorized", 403)
+    try:
+        price = float(request.form["price"].replace(",", "."))
+    except (KeyError, ValueError):
+        return ("bad request", 400)
+    with db() as conn:
+        t = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
+        if not t or t["status"] != "open":
+            return ("not found", 404)
+        exits = json.loads(t["exits"] or "[]")
+        rest = max(0.0, 1.0 - sum(e["frac"] for e in exits))
+        if rest > 0:
+            exits.append({"ts": now_iso(), "price": price, "frac": round(rest, 4), "label": "close"})
+        conn.execute("UPDATE trades SET exits=? WHERE id=?", (json.dumps(exits), tid))
+        t2 = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
+        r, _, _ = _trade_r(t2)
+        conn.execute("UPDATE trades SET status='closed', closed_ts=?, r_realized=?, pnl_usd=? WHERE id=?",
+                     (now_iso(), round(r, 4), round(r * (t["risk_usd"] or 0.0), 2), tid))
+        conn.commit()
+    return redirect("/journal" + _tok())
 
 
 @app.route("/webhook", methods=["POST"])
@@ -2588,7 +2923,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.20",
+        "version": "2.7.21",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
