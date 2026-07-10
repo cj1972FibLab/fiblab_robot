@@ -1,7 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.16)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.17)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.17 "Aide dashboard + nettoyage TF" :             ║
+║   • Bloc "❓ Comment lire" repliable sur chaque module du     ║
+║     dashboard (pièges ARMED/PROXIMITY, proxy vs réel, TF     ║
+║     non mesurables, pollution par actif) — bilingue          ║
+║   • /fix_tf : remap one-shot des TF pollués M1..M5/6/7 →     ║
+║     1D..7D (Hold uniquement) + outcomes remis en pending     ║
 ║                                                              ║
 ║  Patch v2.7.16 "Dashboard global + par actif" :              ║
 ║   • /stats_view?asset=xau|dax|solana|btc|hype|sui|stocks :   ║
@@ -1687,6 +1694,44 @@ def reeval_route():
     return jsonify({"reset_to_pending": n})
 
 
+@app.route("/fix_tf", methods=["GET", "POST"])
+def fix_tf_route():
+    """v2.7.17 — Nettoyage one-shot du bug TF (pré-v2.7.14) : les Hold
+    Daily→7D avaient leur TF tronqué en M1..M5 / '6' / '7'. Remappe ces
+    lignes vers 1D..7D et remet leurs outcomes en pending (l'ancienne éval
+    portait sur un horizon faux). Limité aux types hold : un éventuel vrai
+    hold minute serait remappé à tort — assumé, aucun n'est attendu.
+    NB : les gros TF resteront majoritairement non mesurables par le proxy
+    (horizon 21j) — c'est la correction d'étiquette qui compte, pas l'éval."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    remap = {"M1": "1D", "M2": "2D", "M3": "3D", "M4": "4D", "M5": "5D",
+             "6": "6D", "7": "7D"}
+    fixed = {}
+    with db() as conn:
+        ids_all = []
+        for old, new in remap.items():
+            rows = conn.execute(
+                "SELECT id FROM alerts WHERE timeframe = ? AND LOWER(type) LIKE '%hold%'",
+                (old,)).fetchall()
+            ids = [r["id"] for r in rows]
+            if not ids:
+                continue
+            conn.execute(
+                "UPDATE alerts SET timeframe = ? WHERE id IN (%s)"
+                % ",".join("?" * len(ids)), [new] + ids)
+            fixed[old + "->" + new] = len(ids)
+            ids_all += ids
+        if ids_all:
+            conn.execute(
+                "UPDATE outcomes SET status='pending', mfe_pts=NULL, mae_pts=NULL, "
+                "r_realized=NULL, note=NULL WHERE alert_id IN (%s)"
+                % ",".join("?" * len(ids_all)), ids_all)
+        conn.commit()
+    return jsonify({"remapped": fixed, "total": len(ids_all),
+                    "outcomes_reset_to_pending": len(ids_all)})
+
+
 @app.route("/rescore", methods=["GET", "POST"])
 def rescore_route():
     """Recalcule le score ET le niveau de TOUTES les alertes stockées avec le
@@ -1800,6 +1845,13 @@ DASH_STR = {
         "by_type": "Win rate par TYPE", "by_tf": "Win rate par TIMEFRAME",
         "detail": "Détail par score", "nodata": "aucune donnée",
         "by_asset": "Win rate & espérance par ACTIF",
+        "how": "\u2753 Comment lire ce bloc",
+        "help_cards": "Ces chiffres viennent du <b>proxy</b> (simulation sur prix historiques), PAS de ton P&L réel. \u00c9valuées = alertes ayant abouti à win ou loss. <b>Ignore le win rate et le R globaux</b> : ils mélangent des types incomparables (pré-signaux gonflés inclus). La vérité est dans \u00ab Espérance par type \u00bb, ligne Origin Hold ACTIVATED.",
+        "help_type": "<b>Piège majeur :</b> ARMED / PROXIMITY / CREATED affichent des win rates énormes par <b>artefact de mesure</b> (ils \u00ab gagnent \u00bb en prenant de l'avance avant de savoir si le niveau tient). <b>Ne PAS les trader.</b> Le seul signal validé est <b>Origin Hold ACTIVATED</b> (rejet confirmé par englobante clôturée).",
+        "help_exp": "R moyen = espérance par trade <b>au stop courant /sl_fib</b> (défaut 0,5 entre entrée et Fib 0). Ta ligne de référence : <b>Origin Hold ACTIVATED</b>. Calibration connue : ~+0,07R à Fib 0, ~+0,18R à Fib 0,5 \u2014 edge réel mais mince ; spread/slippage non simulés.",
+        "help_asset": "Compare les actifs <b>à type de signal égal</b> (utilise le filtre type). Pollution connue : avant le 10/07, des alertes XAU ont été rangées en SOLANA (bug ?asset=), et des doublons existent. Les petits N (&lt;20) ne prouvent rien.",
+        "help_tf": "<b>Labels M1\u2013M5, 6, 7 = résidus d'un bug</b> (avant v2.7.14, les Hold Daily\u21927D étaient tronqués en minutes et évalués sur un horizon faux \u2014 leurs stats sont doublement invalides). Nettoyage : route /fix_tf. Par ailleurs les <b>gros TF (Daily\u2192Weekly) ne sont PAS mesurables</b> par le proxy (horizon plafonné 21j) : seules les barres intraday H1\u2192H12 avec N&ge;20 sont interprétables.",
+        "help_detail": "Même donnée que le graphe par score, en tableau. Règle : N &lt; 5 = anecdote, pas statistique. Le scoring est sain si le win rate <b>monte</b> avec le score.",
         "th_asset": "Actif", "asset_note": "Filtre par actif via les puces ci-dessus. Attention : les lignes antérieures au 10/07 peuvent porter un actif erroné (bug ?asset= corrigé en v2.7.14) — les vues par actif se fiabilisent avec les données récentes.",
         "exp_title": "Espérance par type (R) — la vraie mesure",
         "th_type": "Type", "th_rmean": "R moyen", "th_rtotal": "R total",
@@ -1817,6 +1869,13 @@ DASH_STR = {
         "by_type": "Win rate by TYPE", "by_tf": "Win rate by TIMEFRAME",
         "detail": "Detail by score", "nodata": "no data",
         "by_asset": "Win rate & expectancy by ASSET",
+        "how": "\u2753 How to read this block",
+        "help_cards": "These numbers come from the <b>proxy</b> (simulation on historical prices), NOT your real P&L. Evaluated = alerts resolved to win or loss. <b>Ignore the global win rate and R</b>: they mix incomparable types (inflated pre-signals included). The truth is in \u201cExpectancy by type\u201d, row Origin Hold ACTIVATED.",
+        "help_type": "<b>Major trap:</b> ARMED / PROXIMITY / CREATED show huge win rates due to a <b>measurement artefact</b> (they \u201cwin\u201d by taking a free head start before the level is proven). <b>Do NOT trade them.</b> The only validated signal is <b>Origin Hold ACTIVATED</b> (rejection confirmed by a closed engulfing candle).",
+        "help_exp": "Mean R = expectancy per trade <b>at the current /sl_fib stop</b> (default 0.5 between entry and Fib 0). Your reference row: <b>Origin Hold ACTIVATED</b>. Known calibration: ~+0.07R at Fib 0, ~+0.18R at Fib 0.5 \u2014 a real but thin edge; spread/slippage not simulated.",
+        "help_asset": "Compare assets <b>at equal signal type</b> (use the type filter). Known pollution: before Jul 10, some XAU alerts were filed under SOLANA (?asset= bug), and duplicates exist. Small N (&lt;20) proves nothing.",
+        "help_tf": "<b>Labels M1\u2013M5, 6, 7 are bug residue</b> (before v2.7.14, Daily\u21927D Holds were truncated to minutes and evaluated on a wrong horizon \u2014 their stats are doubly invalid). Cleanup: /fix_tf route. Also, <b>large TFs (Daily\u2192Weekly) are NOT measurable</b> by the proxy (21-day horizon cap): only intraday bars H1\u2192H12 with N&ge;20 are interpretable.",
+        "help_detail": "Same data as the score chart, as a table. Rule: N &lt; 5 = anecdote, not statistics. Scoring is healthy if win rate <b>rises</b> with score.",
         "th_asset": "Asset", "asset_note": "Filter by asset via the chips above. Note: rows before Jul 10 may carry a wrong asset (?asset= bug fixed in v2.7.14) — per-asset views become reliable with recent data.",
         "exp_title": "Expectancy by type (R) — the real measure",
         "th_type": "Type", "th_rmean": "Mean R", "th_rtotal": "Total R",
@@ -1930,6 +1989,12 @@ def stats_view():
         body = chips + '<div class="empty">' + T["empty"].format(p=counts["pending"]) + '</div>'
         return head + header + body + '</body></html>'
 
+    def hb(key):
+        # v2.7.17 : bloc d'aide repliable, sans JS (details/summary natif)
+        return ('<details style="margin:6px 0 10px"><summary style="cursor:pointer;color:var(--dim);font-size:.85em">'
+                + T["how"] + '</summary><div class="note" style="margin-top:6px">'
+                + T[key] + '</div></details>')
+
     wrc = "var(--grn)" if wr >= 50 else "var(--gold)"
     rc_all = "var(--grn)" if mean_r_all > 0 else "var(--red)"
     cards = ('<div class="grid">'
@@ -1943,13 +2008,14 @@ def stats_view():
              + '<div class="stat"><div class="lbl">' + T["pending"] + '</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
              + '</div>')
     note = '<div class="note">' + T["note"] + '</div>'
+    cards += hb("help_cards")
     trows = []
     for r in bs:
         c = "var(--grn)" if r["wr"] >= 50 else "var(--gold)"
         trows.append('<tr><td>' + esc(r["k"]) + '</td><td style="color:var(--grn)">' + str(r["win"])
                      + '</td><td style="color:var(--red)">' + str(r["loss"]) + '</td><td>' + str(r["n"])
                      + '</td><td style="font-weight:700;color:' + c + '">' + str(r["wr"]) + '%</td></tr>')
-    table = ('<div class="card"><h2>' + T["detail"] + '</h2><table><thead><tr>'
+    table = ('<div class="card"><h2>' + T["detail"] + '</h2>' + hb("help_detail") + '<table><thead><tr>'
              '<th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead><tbody>'
              + "".join(trows) + '</tbody></table></div>')
 
@@ -1970,6 +2036,7 @@ def stats_view():
                         + '<td style="font-weight:700;color:' + rc + '">' + sgn(it["rmean"])
                         + '</td><td style="color:' + rc + '">' + sgn(it["rtotal"]) + '</td></tr>')
     exp_table = ('<div class="card"><h2>' + T["exp_title"] + '</h2>'
+                 + hb("help_exp")
                  + '<div class="note">' + T["rnote"] + '</div>'
                  + '<table><thead><tr><th>' + T["th_type"] + '</th><th>N</th><th>Win rate</th>'
                  + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
@@ -1994,6 +2061,7 @@ def stats_view():
                       + '<td style="font-weight:700;color:' + rc + '">' + sgn(it["rmean"])
                       + '</td><td style="color:' + rc + '">' + sgn(it["rtotal"]) + '</td></tr>')
     asset_table = ('<div class="card"><h2>' + T["by_asset"] + '</h2>'
+                   + hb("help_asset")
                    + '<div class="note">' + T["asset_note"] + '</div>'
                    + '<table><thead><tr><th>' + T["th_asset"] + '</th><th>N</th><th>Win rate</th>'
                    + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
@@ -2005,7 +2073,7 @@ def stats_view():
             + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
             + exp_table
             + asset_table
-            + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
+            + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + hb("help_tf") + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
             + table)
     return head + header + body + '</body></html>'
 
@@ -2195,7 +2263,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.16",
+        "version": "2.7.17",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
