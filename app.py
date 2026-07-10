@@ -1,7 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.14)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.15)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.15 "Ticket ULTIME élargi + log ?asset=" :        ║
+║   • mode ultime = H4/H6/H8/H12 (même mécanique Fibo ; edge   ║
+║     validé sur l'agrégat Origin Hold ACTIVATED, PAS TF par   ║
+║     TF — le dashboard tranchera)                             ║
+║   • [WEBHOOK] RAW logge aussi le ?asset= reçu (diagnostic    ║
+║     des URL d'alerte mal configurées, token jamais loggé)    ║
 ║                                                              ║
 ║  Patch v2.7.14 "Ticker prioritaire + fix TF Daily + garde" : ║
 ║   • parse 'Ticker: XXX' dans le corps (prioritaire sur       ║
@@ -724,10 +731,11 @@ CONTRACT_VALUE   = {"xau": 100.0, "dax": 25.0, "btc": 1.0, "solana": 1.0,
 CONTRACT_DEFAULT = 1.0
 STOP_FIB_LEVELS  = [0.786, 0.5, 0.382, 0.0, -1.0]   # sweep SL : 0.786=serré -> -1=large
 # Deux modes de TF pour le ticket (bascule /ticket_tf) :
-#  - ultime : H4 seul (edge solide, rare) — défaut, pour la semaine
+#  - ultime : H4/H6/H8/H12 (swing intraday ; edge validé sur l'agrégat,
+#    pas TF par TF) — défaut, pour la semaine
 #  - large  : H1..H12 + Daily..Weekly (plus d'opportunités, non validées hors H4)
 # Filtre par LABEL normalisé (et non tf_hours, qui confond H1 et M1).
-TICKET_TF_ULTIME = {"H4"}
+TICKET_TF_ULTIME = {"H4", "H6", "H8", "H12"}   # v2.7.15 : swing intraday complet
 TICKET_TF_LARGE  = {"H1", "H2", "H4", "H6", "H8", "H12",
                     "D1", "1D", "D", "DAILY", "2D", "3D", "4D", "5D", "6D", "7D",
                     "D2", "D3", "D4", "D5", "D6", "D7", "W1", "1W", "W", "WEEKLY"}
@@ -974,7 +982,7 @@ def handle_telegram_command(text: str, chat_id: str):
             msg = "\u26d4 Commande réservée à l'admin."
         elif arg in ("ultime", "ultimate", "h4"):
             robot_state["ticket_tf_mode"] = "ultime"
-            msg = ("\U0001F3AF <b>Tickets : ULTIME</b> \u2014 H4 uniquement (edge solide, rare).\n"
+            msg = ("\U0001F3AF <b>Tickets : ULTIME</b> \u2014 H4/H6/H8/H12 (swing intraday).\n"
                    "Pose et pars, pour la semaine au bureau.")
         elif arg == "large":
             robot_state["ticket_tf_mode"] = "large"
@@ -1015,7 +1023,7 @@ def handle_telegram_command(text: str, chat_id: str):
             f"État   : {etat} {kill}\n"
             f"Mode   : <b>{profile['mode'].upper()}</b>\n"
             f"Idéal  : {'🎯 ON' if robot_state.get('notify_only_ideal', NOTIFY_ONLY_IDEAL) else '📢 OFF'}\n"
-            f"Tickets: {'\U0001F310 LARGE' if robot_state.get('ticket_tf_mode') == 'large' else '\U0001F3AF ULTIME (H4)'}\n"
+            f"Tickets: {'\U0001F310 LARGE' if robot_state.get('ticket_tf_mode') == 'large' else '\U0001F3AF ULTIME (H4-H12)'}\n"
             f"Stop   : Fib {robot_state.get('sl_fib', SL_FIB_DEFAULT):g}\n"
             f"TF+    : {', '.join(tf_on) if tf_on else 'aucun'}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1502,6 +1510,9 @@ def webhook():
     # v2.7.14 : payload brut complet en repr (une seule ligne de log Railway,
     # les \n multi-lignes ne sont plus éclatés) — indispensable au debug.
     print(("[WEBHOOK] RAW : " + repr(raw))[:500])
+    # v2.7.15 : tracer l'?asset= reçu (jamais le token) — diagnostic des
+    # alertes dont l'URL porte un mauvais actif.
+    print(f"[WEBHOOK] URL asset={request.args.get('asset')!r}")
     if not raw:
         return jsonify({"error": "empty body"}), 400
 
@@ -2133,7 +2144,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.14",
+        "version": "2.7.15",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
