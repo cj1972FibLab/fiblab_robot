@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.8)      ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.10)     ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,15 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.10 "Ticket = ordre limite au repos" :            ║
+║   • ticket reformaté en ORDRE LIMITE prêt à poser (ligne     ║
+║     copier-coller) : pose et pars, zéro surveillance         ║
+║                                                              ║
+║  MAJEUR v2.7.9 "Fib 0 dérivé de la cible (Exit=1.618)" :     ║
+║   • Fib 0 (stop) déduit de Entrée+Exit, EXACT, sans dev ni   ║
+║     reconstruction -> R fiable + ticket exact + ladder de TP ║
+║   • hypothèse : Exit = TP1 = Fib 1.618 (validé sur chart)    ║
 ║                                                              ║
 ║  Patch v2.7.8 "Entrée éval = niveau d'origine (Fib 1)" :     ║
 ║   • revert v2.7.3 : l'entrée redevient le niveau (Fib 1 =    ║
@@ -978,6 +987,23 @@ def _atr_at_tf(pre_bars, tf_h):
     return sum(last) / len(last)
 
 
+def _fib0_from_target(entry, target, long_bias):
+    """Déduit Fib 0 (le stop) de l'entrée (Fib 1) et de la cible d'obligation
+    (Exit = Fib 1.618). Le Fibo est une structure à ratio fixe : 1 unité =
+    |cible - entrée| / 0.618 ; Fib 0 = entrée + 1 unité du côté OPPOSÉ à la cible
+    (le côté du stop). Exact, sans reconstruction. None si données incohérentes."""
+    if entry is None or target is None:
+        return None
+    if long_bias and target <= entry:
+        return None
+    if (not long_bias) and target >= entry:
+        return None
+    unit = abs(target - entry) / 0.618
+    if unit <= 0:
+        return None
+    return (entry - unit) if long_bias else (entry + unit)
+
+
 def _fib0_from_bars(pre_bars, ts, tf_h, long_bias):
     """Fib0 = extrême de la bougie ENGLOBÉE (celle juste avant la bougie de
     signal, qui se clôture ~à ts). Fenêtre d'un TF précédant le signal.
@@ -1162,16 +1188,22 @@ def evaluate_pending_outcomes():
             # entre à l'origine, PAS à la close de l'englobante (revert v2.7.3).
             entry = r["price"]
 
-            # ── STOP ── Hold : Fib0 (bas/haut bougie englobée), PLANCHERISE au
-            #    max(sl_floor, 0.5*ATR) pour tuer les R gonflés par un stop minuscule.
+            # ── STOP ── Hold : Fib 0 DÉRIVÉ de la cible (Exit = Fib 1.618) = stop
+            #    EXACT. Repli sur la reconstruction H1 (plancherisée) si pas de cible.
             sl, sl_src = None, None
             if is_hold:
-                fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
-                if fib0 is not None and entry:
+                fib0 = _fib0_from_target(entry, r["target"], long_bias)
+                if fib0 is not None:
                     raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
                     if raw_sl > 0:
-                        floor = max(risk["sl_floor"], 0.5 * atr) if (atr and atr > 0) else risk["sl_floor"]
-                        sl, sl_src = min(max(raw_sl, floor), risk["sl_cap"]), "fib0"
+                        sl, sl_src = raw_sl, "fib0"          # valeur réelle : ni plancher ni cap
+                if sl is None:
+                    fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
+                    if fib0 is not None and entry:
+                        raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
+                        if raw_sl > 0:
+                            floor = max(risk["sl_floor"], 0.5 * atr) if (atr and atr > 0) else risk["sl_floor"]
+                            sl, sl_src = min(max(raw_sl, floor), risk["sl_cap"]), "fib0~"
             if sl is None:
                 if atr and atr > 0:
                     sl, sl_src = min(max(risk["k"] * atr, risk["sl_floor"]), risk["sl_cap"]), "atr"
@@ -1226,10 +1258,9 @@ def evaluate_pending_outcomes():
 # ROUTES
 # ─────────────────────────────────────────────
 def build_trade_ticket(parsed, group):
-    """Ticket de trade pour les types tradeables (Origin Hold ACTIVATED) :
-    entrée = niveau 'Entry touched' (exact), TP = 'Exit' (exact), SL = Fib0
-    reconstruit depuis le H1 récent, taille pour un risque fixe. Retourne le
-    message Telegram, ou None si non applicable / données manquantes."""
+    """ORDRE LIMITE au repos pour les types tradeables (Origin Hold ACTIVATED) :
+    limite \u00e0 l'entr\u00e9e (Fib 1), SL = Fib 0 d\u00e9riv\u00e9, ladder de TP d\u00e9riv\u00e9e,
+    taille pour un risque fixe. Format pr\u00eat \u00e0 poser, z\u00e9ro surveillance. None si N/A."""
     atype = (parsed.get("type") or "").lower()
     if not any(t in atype for t in TICKET_TYPES):
         return None
@@ -1240,45 +1271,52 @@ def build_trade_ticket(parsed, group):
         return None
     long_bias = (side == "Support")
     risk_usd  = TICKET_CAPITAL * TICKET_RISK_PCT / 100.0
-    tf_h      = tf_hours(parsed.get("timeframe"))
-
-    # SL = Fib0 reconstruit (fetch H1 récent ; échoue proprement si feed KO).
-    now, sl = datetime.now(timezone.utc), None
-    try:
-        bars = fetch_prices(group, parsed.get("asset") or "",
-                            now - timedelta(hours=max(4 * tf_h, 12)), now)
-        if bars:
-            f0 = _fib0_from_bars(bars, now, tf_h, long_bias)
-            if f0 is not None and ((long_bias and f0 < entry) or ((not long_bias) and f0 > entry)):
-                sl = f0
-    except Exception as e:
-        print(f"[TICKET] fib0 : {e}")
-
+    sl = _fib0_from_target(entry, target, long_bias)
+    asset = esc(parsed.get("asset") or "?")
+    tf    = esc(parsed.get("timeframe") or "?")
+    typ   = esc(parsed.get("type") or "")
     dir_txt = "\U0001F7E2 LONG (achat)" if long_bias else "\U0001F534 SHORT (vente)"
-    L = ["\U0001F3AB <b>TICKET DE TRADE</b> — démo " + str(int(TICKET_CAPITAL / 1000)) + "k",
-         "<b>" + esc(parsed.get("asset") or "?") + "</b> · TF " + esc(parsed.get("timeframe") or "?")
-         + " · " + esc(parsed.get("type") or ""),
-         "━━━━━━━━━━━━━━━━━━━━",
-         "Sens   : " + dir_txt,
-         "Entrée : <b>" + str(entry) + "</b> <i>(niveau, exact)</i>"]
-    if target is not None:
-        L.append("TP     : <b>" + str(target) + "</b> <i>(obligation, exact)</i>")
-    if sl is not None:
-        stop = abs(entry - sl)
-        cval = CONTRACT_VALUE.get(group, CONTRACT_DEFAULT)
-        lots = risk_usd / (stop * cval) if (stop > 0 and cval > 0) else 0.0
-        L.append("SL     : <b>" + str(round(sl, 2)) + "</b> <i>(Fib0 reconstruit — vérifie ton chart)</i>")
-        L.append("━━━━━━━━━━━━━━━━━━━━")
-        L.append("Risque : <b>" + str(int(risk_usd)) + " $</b> (" + ("%g" % TICKET_RISK_PCT) + " %)")
-        L.append("Stop   : " + str(round(stop, 2)) + " pts")
-        L.append("Taille : <b>" + str(round(lots, 2)) + " lots</b> <i>(specs " + group + " — À VÉRIFIER)</i>")
-        if target is not None and stop > 0:
-            L.append("R:R    : <b>1:" + str(round(abs(target - entry) / stop, 2)) + "</b>")
-    else:
-        L.append("SL     : <i>Fib0 indisponible (feed KO) — lis-le sur ton chart</i>")
-        L.append("Risque : " + str(int(risk_usd)) + " $ — dimensionne à la main")
-    L.append("━━━━━━━━━━━━━━━━━━━━")
-    L.append("\u26A0\uFE0F <i>Démo. Entrée/TP exacts ; SL &amp; taille à vérifier avant d'exécuter.</i>")
+    hdr = ["\U0001F4CB <b>ORDRE LIMITE</b> \u2014 d\u00e9mo " + str(int(TICKET_CAPITAL / 1000)) + "k",
+           "<b>" + asset + "</b> \u00b7 TF " + tf + " \u00b7 " + typ]
+
+    if sl is None or target is None:
+        return "\n".join(hdr + [
+            "\u2501" * 20,
+            "Sens   : " + dir_txt,
+            "Entr\u00e9e : <b>" + str(entry) + "</b> <i>(Fib 1)</i>",
+            "SL     : <i>obligation manquante \u2014 Fib 0 non d\u00e9rivable, lis sur ton chart</i>",
+            "Risque : " + str(int(risk_usd)) + " $ \u2014 dimensionne \u00e0 la main"])
+
+    stop = abs(entry - sl)
+    unit = abs(target - entry) / 0.618
+
+    def _ext(mult):
+        d = (mult - 1.0) * unit
+        return round((entry + d) if long_bias else (entry - d), 2)
+
+    cval = CONTRACT_VALUE.get(group, CONTRACT_DEFAULT)
+    lots = round(risk_usd / (stop * cval), 2) if (stop > 0 and cval > 0) else 0.0
+    verb = "LIMITE BUY" if long_bias else "LIMITE SELL"
+    rr   = round(abs(target - entry) / stop, 2) if stop > 0 else 0.0
+    bar  = "\u2501" * 20
+
+    L = hdr + [
+        bar,
+        "\u25b8 <b>" + verb + " " + str(lots) + " lot @ " + str(entry) + "</b>",
+        "   SL " + str(round(sl, 2)) + "  \u00b7  TP " + str(round(target, 2)),
+        bar,
+        "Sens   : " + dir_txt,
+        "Entr\u00e9e : <b>" + str(entry) + "</b> <i>(Fib 1 \u2014 pose la limite ici)</i>",
+        "SL     : <b>" + str(round(sl, 2)) + "</b> <i>(Fib 0)</i>",
+        "TP1 <b>" + str(round(target, 2)) + "</b> \u00b7 TP2 " + str(_ext(2.618))
+        + " \u00b7 TP3 " + str(_ext(3.618)) + " \u00b7 TP4 " + str(_ext(4.618)),
+        bar,
+        "Risque " + str(int(risk_usd)) + " $  \u00b7  Stop " + str(round(stop, 2))
+        + " pts  \u00b7  R:R 1:" + str(rr) + " (TP1)",
+        "Taille <b>" + str(lots) + " lots</b> <i>(specs " + group + " \u2014 \u00c0 V\u00c9RIFIER)</i>",
+        bar,
+        "\u23f3 <i>Pose l'ordre et pars : il se d\u00e9clenche seul si le prix revient sur le Fib 1. Sinon pas de trade (un setup qui file sans retest est manqu\u00e9).</i>",
+        "\u26a0\ufe0f <i>D\u00e9mo. V\u00e9rifie la taille (specs broker) avant de poser.</i>"]
     return "\n".join(L)
 
 
@@ -1781,7 +1819,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.8",
+        "version": "2.7.10",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
