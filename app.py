@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.15)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.16)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.16 "Dashboard global + par actif" :              ║
+║   • /stats_view?asset=xau|dax|solana|btc|hype|sui|stocks :   ║
+║     filtre toute la page sur un groupe d'actifs (puces)      ║
+║   • Tableau "par ACTIF" (win rate + espérance R), cliquable, ║
+║     visible en vue globale — respecte le filtre TYPE         ║
 ║                                                              ║
 ║  Patch v2.7.15 "Ticket ULTIME élargi + log ?asset=" :        ║
 ║   • mode ultime = H4/H6/H8/H12 (même mécanique Fibo ; edge   ║
@@ -1793,6 +1799,8 @@ DASH_STR = {
         "by_score": "Win rate par SCORE — le graphe clé",
         "by_type": "Win rate par TYPE", "by_tf": "Win rate par TIMEFRAME",
         "detail": "Détail par score", "nodata": "aucune donnée",
+        "by_asset": "Win rate & espérance par ACTIF",
+        "th_asset": "Actif", "asset_note": "Filtre par actif via les puces ci-dessus. Attention : les lignes antérieures au 10/07 peuvent porter un actif erroné (bug ?asset= corrigé en v2.7.14) — les vues par actif se fiabilisent avec les données récentes.",
         "exp_title": "Espérance par type (R) — la vraie mesure",
         "th_type": "Type", "th_rmean": "R moyen", "th_rtotal": "R total",
         "rnote": "<b>R moyen = espérance par trade.</b> Positif = profitable, négatif = perdant — quel que soit le win rate. C'est CE chiffre qui compte, pas le %. Rappel : la cible d'obligation des Hold est un objectif minimum, donc un R modeste est normal. Trié par espérance décroissante.",
@@ -1808,6 +1816,8 @@ DASH_STR = {
         "by_score": "Win rate by SCORE — the key chart",
         "by_type": "Win rate by TYPE", "by_tf": "Win rate by TIMEFRAME",
         "detail": "Detail by score", "nodata": "no data",
+        "by_asset": "Win rate & expectancy by ASSET",
+        "th_asset": "Asset", "asset_note": "Filter by asset via the chips above. Note: rows before Jul 10 may carry a wrong asset (?asset= bug fixed in v2.7.14) — per-asset views become reliable with recent data.",
         "exp_title": "Expectancy by type (R) — the real measure",
         "th_type": "Type", "th_rmean": "Mean R", "th_rtotal": "Total R",
         "rnote": "<b>Mean R = expectancy per trade.</b> Positive = profitable, negative = losing — regardless of win rate. This is the number that matters, not the %. Note: the Hold obligation target is a minimum objective, so a modest R is expected. Sorted by expectancy, descending.",
@@ -1825,20 +1835,33 @@ def stats_view():
     if lang not in ("fr", "en"):
         lang = "fr"
     T = DASH_STR[lang]
-    type_filter = (request.args.get("type") or "").lower().strip()
+    type_filter  = (request.args.get("type") or "").lower().strip()
+    asset_filter = (request.args.get("asset") or "").lower().strip()   # groupe : xau/dax/solana/...
     from urllib.parse import quote
     with db() as conn:
         rows = conn.execute(
-            "SELECT a.score, a.type, a.timeframe, o.status, o.r_realized "
+            "SELECT a.score, a.type, a.timeframe, a.grp, o.status, o.r_realized "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id"
         ).fetchall()
 
     counts = {"win": 0, "loss": 0, "invalid": 0, "pending": 0, "skip": 0}
     by_score, by_type, by_tf = {}, {}, {}
     r_by_type = {}
+    by_asset = {}          # v2.7.16 : agrégat par actif (toujours global, hors filtre asset)
     r_sum_all, r_cnt_all = 0.0, 0
     for r in rows:
         if type_filter and type_filter not in (r["type"] or "").lower():
+            continue
+        # tableau par actif : sur le périmètre du filtre TYPE uniquement
+        _g = (r["grp"] or "?")
+        _st0 = r["status"] or "pending"
+        if _st0 in ("win", "loss"):
+            d = by_asset.setdefault(_g, {"win": 0, "loss": 0, "rsum": 0.0, "rcnt": 0})
+            d[_st0] += 1
+            if r["r_realized"] is not None:
+                d["rsum"] += r["r_realized"]
+                d["rcnt"] += 1
+        if asset_filter and _g.lower() != asset_filter:
             continue
         st = r["status"] or "pending"
         counts[st] = counts.get(st, 0) + 1
@@ -1876,10 +1899,13 @@ def stats_view():
     fr_cls = "btn active" if lang == "fr" else "btn"
     en_cls = "btn active" if lang == "en" else "btn"
 
-    def mkurl2(l, t):
+    def mkurl2(l, t, a=None):
+        a = asset_filter if a is None else a
         u = "/stats_view?lang=" + l
         if t:
             u += "&type=" + quote(t)
+        if a:
+            u += "&asset=" + quote(a)
         return u
     head = ('<!DOCTYPE html><html lang="' + lang + '"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -1949,11 +1975,36 @@ def stats_view():
                  + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
                  + "".join(exp_rows) + '</tbody></table></div>')
 
+    # v2.7.16 : tableau par actif (win rate + espérance)
+    a_items = []
+    for g, v in by_asset.items():
+        n = v["win"] + v["loss"]
+        mean_r = (v["rsum"] / v["rcnt"]) if v["rcnt"] else 0.0
+        lbl = ASSET_META.get(g, {}).get("emoji", "") + " " + ASSET_META.get(g, {}).get("label", g)
+        a_items.append({"g": g, "lbl": lbl.strip(), "n": n,
+                        "wr": round(100 * v["win"] / n, 1) if n else 0,
+                        "rmean": round(mean_r, 2), "rtotal": round(v["rsum"], 1)})
+    a_items.sort(key=lambda x: x["rmean"], reverse=True)
+    a_rows = []
+    for it in a_items:
+        rc = "var(--grn)" if it["rmean"] > 0 else "var(--red)"
+        a_rows.append('<tr><td><a style="color:inherit" href="' + mkurl2(lang, type_filter, it["g"]) + '">'
+                      + esc(it["lbl"]) + '</a></td><td>' + str(it["n"])
+                      + '</td><td>' + str(it["wr"]) + '%</td>'
+                      + '<td style="font-weight:700;color:' + rc + '">' + sgn(it["rmean"])
+                      + '</td><td style="color:' + rc + '">' + sgn(it["rtotal"]) + '</td></tr>')
+    asset_table = ('<div class="card"><h2>' + T["by_asset"] + '</h2>'
+                   + '<div class="note">' + T["asset_note"] + '</div>'
+                   + '<table><thead><tr><th>' + T["th_asset"] + '</th><th>N</th><th>Win rate</th>'
+                   + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
+                   + "".join(a_rows) + '</tbody></table></div>') if a_items else ""
+
     body = (chips + cards
             + '<div class="card"><h2>' + T["by_score"] + '</h2>' + _bar_rows(bs, "#f5a623", T["nodata"]) + '</div>'
             + note
             + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
             + exp_table
+            + asset_table
             + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
             + table)
     return head + header + body + '</body></html>'
@@ -2144,7 +2195,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.15",
+        "version": "2.7.16",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
