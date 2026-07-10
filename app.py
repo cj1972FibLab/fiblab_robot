@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.12)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.13)     ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,10 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.13 "SL paramétrable (fraction Fibo)" :           ║
+║   • /sl_fib 0.786|0.5|0.382|0|-1 : stop à la fraction Fibo   ║
+║     (éval + ticket) ; défaut 0.5 (backtest : ~+0.18R)        ║
 ║                                                              ║
 ║  Patch v2.7.12 "Modes de ticket ULTIME / LARGE" :            ║
 ║   • /ticket_tf ultime (H4 seul) | large (H1..H12+Daily..W)   ║
@@ -672,6 +676,11 @@ TICKET_TF_LARGE  = {"H1", "H2", "H4", "H6", "H8", "H12",
                     "D1", "1D", "D", "DAILY", "2D", "3D", "4D", "5D", "6D", "7D",
                     "D2", "D3", "D4", "D5", "D6", "D7", "W1", "1W", "W", "WEEKLY"}
 robot_state["ticket_tf_mode"] = "ultime"        # état runtime (bascule /ticket_tf)
+# Fraction Fibo du STOP (éval + ticket), réglable via /sl_fib :
+#  0 = Fib 0 (large) · 0.382/0.5 = intermédiaire · 0.786 = serré · -1 = très large
+# Backtest /sl_sweep : le stop serré maximise l'espérance (0.5 ~+0.18R tenable).
+SL_FIB_DEFAULT = 0.5
+robot_state["sl_fib"] = SL_FIB_DEFAULT
 
 
 def _ticket_tf_set():
@@ -914,6 +923,26 @@ def handle_telegram_command(text: str, chat_id: str):
             msg = (f"Tickets TF : <b>{etat}</b>\n"
                    f"Usage : /ticket_tf ultime | /ticket_tf large")
 
+    elif cmd == "/sl_fib":
+        if chat_id != TELEGRAM_CHAT_ID:
+            msg = "\u26d4 Commande réservée à l'admin."
+        else:
+            try:
+                v = float(arg.replace(",", "."))
+            except ValueError:
+                v = None
+            if v is not None and -2.0 <= v < 1.0:
+                robot_state["sl_fib"] = v
+                rr = round(0.618 / (1.0 - v), 2) if (1.0 - v) != 0 else 0.0
+                msg = (f"\U0001F3AF <b>Stop = Fib {v:g}</b> (éval + ticket)\n"
+                       f"R:R sur TP1 = 1:{rr}\n"
+                       f"0 = Fib 0 large \u00b7 0.5 = mi-chemin \u00b7 0.786 = serré\n"
+                       f"(fais /reeval pour recalculer le dashboard à ce stop)")
+            else:
+                cur = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+                msg = (f"Stop actuel : <b>Fib {cur:g}</b>\n"
+                       f"Usage : /sl_fib 0.786 | 0.5 | 0.382 | 0 | -1")
+
     elif cmd == "/status":
         tf_on = [k for k, v in profile["tf_custom"].items() if v]
         etat  = "⏸ PAUSE" if profile["paused"] else "✅ ACTIF"
@@ -925,6 +954,7 @@ def handle_telegram_command(text: str, chat_id: str):
             f"Mode   : <b>{profile['mode'].upper()}</b>\n"
             f"Idéal  : {'🎯 ON' if robot_state.get('notify_only_ideal', NOTIFY_ONLY_IDEAL) else '📢 OFF'}\n"
             f"Tickets: {'\U0001F310 LARGE' if robot_state.get('ticket_tf_mode') == 'large' else '\U0001F3AF ULTIME (H4)'}\n"
+            f"Stop   : Fib {robot_state.get('sl_fib', SL_FIB_DEFAULT):g}\n"
             f"TF+    : {', '.join(tf_on) if tf_on else 'aucun'}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Alertes globales : {len(alert_history)}\n"
@@ -940,7 +970,8 @@ def handle_telegram_command(text: str, chat_id: str):
             f"/tf_on 72 | /tf_off 72 | /tf_status\n"
             f"/pause | /reprendre\n"
             f"/ideal on|off\n"
-            f"/ticket_tf ultime|large"
+            f"/ticket_tf ultime|large\n"
+            f"/sl_fib 0.786|0.5|0|-1"
         )
 
     elif cmd in ("/derniere", "/xau", "/solana", "/dax", "/btc", "/hype", "/sui", "/stocks"):
@@ -1047,6 +1078,23 @@ def _fib0_from_target(entry, target, long_bias):
     if unit <= 0:
         return None
     return (entry - unit) if long_bias else (entry + unit)
+
+
+def _stop_from_fib(entry, target, long_bias, f):
+    """Prix du stop à la fraction Fibo f entre l'entrée (Fib 1) et le Fib 0.
+    f=0 -> Fib 0 (large) ; 0.5 -> mi-chemin ; 0.786 -> serré ; -1 -> au-delà du
+    Fib 0. Dérivé de l'entrée + la cible (Exit=Fib 1.618). None si incohérent."""
+    if entry is None or target is None:
+        return None
+    if long_bias and target <= entry:
+        return None
+    if (not long_bias) and target >= entry:
+        return None
+    unit = abs(target - entry) / 0.618
+    dist = (1.0 - f) * unit
+    if dist <= 0:
+        return None
+    return (entry - dist) if long_bias else (entry + dist)
 
 
 def _fib0_from_bars(pre_bars, ts, tf_h, long_bias):
@@ -1237,11 +1285,12 @@ def evaluate_pending_outcomes():
             #    EXACT. Repli sur la reconstruction H1 (plancherisée) si pas de cible.
             sl, sl_src = None, None
             if is_hold:
-                fib0 = _fib0_from_target(entry, r["target"], long_bias)
-                if fib0 is not None:
-                    raw_sl = (entry - fib0) if long_bias else (fib0 - entry)
+                _slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+                stop_px = _stop_from_fib(entry, r["target"], long_bias, _slf)
+                if stop_px is not None:
+                    raw_sl = (entry - stop_px) if long_bias else (stop_px - entry)
                     if raw_sl > 0:
-                        sl, sl_src = raw_sl, "fib0"          # valeur réelle : ni plancher ni cap
+                        sl, sl_src = raw_sl, "fib" + ("%g" % _slf)   # stop à la fraction choisie
                 if sl is None:
                     fib0 = _fib0_from_bars(pre, ts, tf_h, long_bias)
                     if fib0 is not None and entry:
@@ -1318,7 +1367,8 @@ def build_trade_ticket(parsed, group):
         return None
     long_bias = (side == "Support")
     risk_usd  = TICKET_CAPITAL * TICKET_RISK_PCT / 100.0
-    sl = _fib0_from_target(entry, target, long_bias)
+    slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+    sl = _stop_from_fib(entry, target, long_bias, slf)
     asset = esc(parsed.get("asset") or "?")
     tf    = esc(parsed.get("timeframe") or "?")
     typ   = esc(parsed.get("type") or "")
@@ -1355,7 +1405,7 @@ def build_trade_ticket(parsed, group):
         bar,
         "Sens   : " + dir_txt,
         "Entr\u00e9e : <b>" + str(entry) + "</b> <i>(Fib 1 \u2014 pose la limite ici)</i>",
-        "SL     : <b>" + str(round(sl, 2)) + "</b> <i>(Fib 0)</i>",
+        "SL     : <b>" + str(round(sl, 2)) + "</b> <i>(Fib " + ("%g" % slf) + ", d\u00e9riv\u00e9)</i>",
         "TP1 <b>" + str(round(target, 2)) + "</b> \u00b7 TP2 " + str(_ext(2.618))
         + " \u00b7 TP3 " + str(_ext(3.618)) + " \u00b7 TP4 " + str(_ext(4.618)),
         bar,
@@ -2006,7 +2056,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.12",
+        "version": "2.7.13",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
