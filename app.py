@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.10)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.11)     ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,11 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.11 "Verrou H4 + lien TV + /sl_sweep" :           ║
+║   • ticket : uniquement H4 + lien TradingView                ║
+║   • /sl_sweep : backtest du stop (0.786/0.5/0.382/0/-1)      ║
+║     -> % stop touché, R:R, espérance par niveau              ║
 ║                                                              ║
 ║  Patch v2.7.10 "Ticket = ordre limite au repos" :            ║
 ║   • ticket reformaté en ORDRE LIMITE prêt à poser (ligne     ║
@@ -653,6 +658,8 @@ TICKET_TYPES     = {"origin hold activated"}
 CONTRACT_VALUE   = {"xau": 100.0, "dax": 25.0, "btc": 1.0, "solana": 1.0,
                     "hype": 1.0, "sui": 1.0, "stocks": 1.0}
 CONTRACT_DEFAULT = 1.0
+TICKET_TF_HOURS  = {4}                          # ticket UNIQUEMENT sur H4 (tf_hours == 4)
+STOP_FIB_LEVELS  = [0.786, 0.5, 0.382, 0.0, -1.0]   # sweep SL : 0.786=serré -> -1=large
 
 
 def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
@@ -1264,6 +1271,8 @@ def build_trade_ticket(parsed, group):
     atype = (parsed.get("type") or "").lower()
     if not any(t in atype for t in TICKET_TYPES):
         return None
+    if tf_hours(parsed.get("timeframe")) not in TICKET_TF_HOURS:
+        return None
     entry  = parsed.get("price")
     target = parsed.get("target")
     side   = parsed.get("side")
@@ -1285,7 +1294,8 @@ def build_trade_ticket(parsed, group):
             "Sens   : " + dir_txt,
             "Entr\u00e9e : <b>" + str(entry) + "</b> <i>(Fib 1)</i>",
             "SL     : <i>obligation manquante \u2014 Fib 0 non d\u00e9rivable, lis sur ton chart</i>",
-            "Risque : " + str(int(risk_usd)) + " $ \u2014 dimensionne \u00e0 la main"])
+            "Risque : " + str(int(risk_usd)) + " $ \u2014 dimensionne \u00e0 la main",
+            "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>Ouvrir le chart</a>"])
 
     stop = abs(entry - sl)
     unit = abs(target - entry) / 0.618
@@ -1316,6 +1326,7 @@ def build_trade_ticket(parsed, group):
         "Taille <b>" + str(lots) + " lots</b> <i>(specs " + group + " \u2014 \u00c0 V\u00c9RIFIER)</i>",
         bar,
         "\u23f3 <i>Pose l'ordre et pars : il se d\u00e9clenche seul si le prix revient sur le Fib 1. Sinon pas de trade (un setup qui file sans retest est manqu\u00e9).</i>",
+        "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>Ouvrir le chart TradingView</a>",
         "\u26a0\ufe0f <i>D\u00e9mo. V\u00e9rifie la taille (specs broker) avant de poser.</i>"]
     return "\n".join(L)
 
@@ -1377,7 +1388,8 @@ def webhook():
         if user_id == TELEGRAM_CHAT_ID_2 and scoring["level"] != "PRIORITAIRE":
             continue
         if (user_id == TELEGRAM_CHAT_ID and TICKET_ENABLED
-                and any(t in (parsed.get("type") or "").lower() for t in TICKET_TYPES)):
+                and any(t in (parsed.get("type") or "").lower() for t in TICKET_TYPES)
+                and tf_hours(parsed.get("timeframe")) in TICKET_TF_HOURS):
             results[user_id] = "-> ticket"
             continue
         notify, reason = should_notify(parsed, scoring, profile)
@@ -1771,6 +1783,143 @@ def stats_view():
     return head + header + body + '</body></html>'
 
 
+@app.route("/sl_sweep", methods=["GET"])
+def sl_sweep():
+    """Backtest : pour les Origin Hold ACTIVATED, rejoue le prix à travers
+    plusieurs niveaux de stop (fractions Fibo, de serré à au-delà du Fib 0) et
+    donne par niveau : % de stop touché, R:R, espérance. À lancer UNE fois à
+    froid (refait les fetches -> ne pas boucler, sinon rate-limit)."""
+    if not check_secret():
+        return ("unauthorized", 403)
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
+            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
+            "WHERE a.price IS NOT NULL AND a.side IS NOT NULL AND a.target IS NOT NULL "
+            "AND a.ts <= ? AND LOWER(a.type) LIKE '%origin hold activated%' "
+            "ORDER BY a.id DESC LIMIT 500",
+            (cutoff,)
+        ).fetchall()
+    groups, order = {}, []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(r["ts"])
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (now - ts).total_seconds() / 3600 < EVAL_MIN_AGE_H:
+            continue
+        if r["grp"] not in EVAL_RISK:
+            continue
+        key = (r["grp"], r["asset"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((r, ts))
+
+    agg = {f: {"win": 0, "loss": 0, "invalid": 0, "sum_r": 0.0} for f in STOP_FIB_LEVELS}
+    n_used = 0
+    _start = time.monotonic()
+    for key in order:
+        if time.monotonic() - _start > 45:
+            break
+        grp, asset = key
+        items = groups[key]
+        earliest = min(ts for _, ts in items)
+        floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
+        bars = fetch_prices(grp, asset, max(earliest - timedelta(hours=2), floor_dt), now)
+        if not bars:
+            continue
+        for r, ts in items:
+            entry, target = r["price"], r["target"]
+            long_bias = (r["side"] == "Support")
+            unit = abs(target - entry) / 0.618
+            if unit <= 0:
+                continue
+            tf_h = tf_hours(r["timeframe"])
+            horizon_h = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
+            end_win = min(ts + timedelta(hours=horizon_h), now)
+            post = [b for b in bars if ts < b[0] <= end_win]
+            if not post:
+                continue
+            tdist = abs(target - entry)
+            elapsed = now >= ts + timedelta(hours=horizon_h)
+            counted = False
+            for f in STOP_FIB_LEVELS:
+                sdist = (1.0 - f) * unit
+                if sdist <= 0:
+                    continue
+                status = None
+                for (_dt, hi, lo, _c) in post:
+                    fav = (hi - entry) if long_bias else (entry - lo)
+                    adv = (entry - lo) if long_bias else (hi - entry)
+                    if adv >= sdist:
+                        status = "loss"
+                        break
+                    if fav >= tdist:
+                        status = "win"
+                        break
+                if status is None:
+                    if elapsed:
+                        status = "invalid"
+                    else:
+                        continue
+                agg[f][status] += 1
+                if status == "win":
+                    agg[f]["sum_r"] += tdist / sdist
+                elif status == "loss":
+                    agg[f]["sum_r"] += -1.0
+                counted = True
+            if counted:
+                n_used += 1
+
+    def _lbl(f):
+        if f == 0.0:
+            return "Fib 0 (actuel)"
+        if f == -1.0:
+            return "Fib -1 (large)"
+        return "Fib " + ("%g" % f)
+
+    rowdata, best_f, best_e = [], None, None
+    for f in STOP_FIB_LEVELS:
+        a = agg[f]
+        dec = a["win"] + a["loss"]
+        wr = round(100 * a["win"] / dec, 1) if dec else 0.0
+        stop_pct = round(100 * a["loss"] / dec, 1) if dec else 0.0
+        exp = round(a["sum_r"] / dec, 3) if dec else 0.0
+        rr = round(0.618 / (1.0 - f), 2) if (1.0 - f) != 0 else 0.0
+        rowdata.append((f, rr, dec, wr, stop_pct, exp))
+        if dec and (best_e is None or exp > best_e):
+            best_e, best_f = exp, f
+
+    trows = ""
+    for f, rr, dec, wr, stop_pct, exp in rowdata:
+        ec = "var(--grn)" if exp > 0 else "var(--red)"
+        hl = " style=\"background:#132a1e\"" if f == best_f else ""
+        trows += ("<tr" + hl + "><td>" + _lbl(f) + "</td><td>1:" + str(rr) + "</td><td>"
+                  + str(dec) + "</td><td>" + str(wr) + "%</td><td>" + str(stop_pct) + "%</td>"
+                  + "<td style=\"font-weight:700;color:" + ec + "\">"
+                  + (("+" if exp > 0 else "") + str(exp)) + "R</td></tr>")
+
+    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>FibLab \u2014 SL Sweep</title>' + DASH_CSS + '</head><body>')
+    body = ("<h1>\U0001F3AF Sweep de Stop Loss</h1>"
+            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades. "
+            "Sortie mesur\u00e9e \u00e0 TP1 (1.618). Stop serr\u00e9 = meilleur R:R mais plus de stop-outs.</div>"
+            "<div class=\"card\"><table><thead><tr><th>Stop</th><th>R:R</th><th>N</th>"
+            "<th>Win rate</th><th>% stop touch\u00e9</th><th>Esp\u00e9rance</th></tr></thead><tbody>"
+            + trows + "</tbody></table></div>"
+            "<div class=\"note\">Ligne verte = meilleure esp\u00e9rance. <b>% stop touch\u00e9</b> = "
+            "ton indicateur cl\u00e9. L'esp\u00e9rance int\u00e8gre le R:R (un stop serr\u00e9 peut "
+            "gagner malgr\u00e9 plus de sorties). Mesur\u00e9 \u00e0 TP1 seulement ; les runners "
+            "TP2+ ajoutent par-dessus. \u00c9chantillon modeste \u2192 \u00e0 revalider en d\u00e9mo.</div>")
+    return head + body + "</body></html>"
+
+
 @app.route("/db_count", methods=["GET"])
 def db_count():
     if not check_secret():
@@ -1819,7 +1968,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.10",
+        "version": "2.7.11",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
