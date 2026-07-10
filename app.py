@@ -1,7 +1,19 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.17)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.19)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.19 "Notifications FR/EN par utilisateur" :       ║
+║   • /lang fr|en : langue des alertes ET du ticket, par       ║
+║     chat_id, persistée en base (survit aux redéploiements)   ║
+║   • Avert. cohérence localisé ; détails de scoring encore    ║
+║     FR (générés par compute_score — chantier séparé si       ║
+║     besoin)                                                  ║
+║                                                              ║
+║  Patch v2.7.18 "TP Ladder feedback" :                        ║
+║   • /tp_ladder : % de trades atteignant TP1/2/3/4 avant le   ║
+║     stop + espérance comparée de 3 plans de sortie (tout à   ║
+║     TP1 / 25% fixes / 25% avec stop remonté = ton playbook)  ║
 ║                                                              ║
 ║  Patch v2.7.17 "Aide dashboard + nettoyage TF" :             ║
 ║   • Bloc "❓ Comment lire" repliable sur chaque module du     ║
@@ -232,9 +244,14 @@ def init_db():
                 chat_id   TEXT PRIMARY KEY,
                 mode      TEXT,
                 paused    INTEGER,
+                lang      TEXT DEFAULT 'fr',
                 tf_custom TEXT
             )
         """)
+        try:  # v2.7.19 : migration lang sur base existante
+            conn.execute("ALTER TABLE profiles ADD COLUMN lang TEXT DEFAULT 'fr'")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -280,6 +297,7 @@ def load_profiles():
                 user_profiles[row["chat_id"]] = {
                     "paused":    bool(row["paused"]),
                     "mode":      row["mode"],
+                    "lang":      (row["lang"] if "lang" in row.keys() else None) or "fr",
                     "tf_custom": json.loads(row["tf_custom"] or "{}"),
                 }
     except Exception as e:
@@ -289,10 +307,12 @@ def load_profiles():
 def save_profile(chat_id: str, profile: dict):
     with db() as conn:
         conn.execute(
-            "INSERT INTO profiles (chat_id,mode,paused,tf_custom) VALUES (?,?,?,?) "
+            "INSERT INTO profiles (chat_id,mode,paused,lang,tf_custom) VALUES (?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
-            "mode=excluded.mode, paused=excluded.paused, tf_custom=excluded.tf_custom",
-            (chat_id, profile["mode"], int(profile["paused"]), json.dumps(profile["tf_custom"]))
+            "mode=excluded.mode, paused=excluded.paused, lang=excluded.lang, "
+            "tf_custom=excluded.tf_custom",
+            (chat_id, profile["mode"], int(profile["paused"]),
+             profile.get("lang", "fr"), json.dumps(profile["tf_custom"]))
         )
         conn.commit()
 
@@ -304,6 +324,7 @@ def default_profile():
     return {
         "paused": False,
         "mode": "swing",
+        "lang": "fr",
         "tf_custom": {"72": False, "90": False, "96": False, "144": False, "160": False, "288": False},
     }
 
@@ -847,6 +868,56 @@ def send_telegram(message: str, chat_id: str = None, retries: int = 3):
     return False
 
 
+
+# v2.7.19 — libellés des notifications/ticket Telegram, par langue de profil.
+TG_STR = {
+    "fr": {
+        "alert": "ALERTE", "score": "Score", "asset": "Asset", "level": "Niveau",
+        "type": "Type", "tf": "TF", "side": "Side", "scope": "Scope", "mode": "Mode",
+        "scoring": "Scoring", "action": "Action", "watch": "\u2192 Surveille M1 maintenant",
+        "setup_long": "\u2192 Setup <b>LONG</b> potentiel", "setup_short": "\u2192 Setup <b>SHORT</b> potentiel",
+        "obligation": "\u2192 \U0001F3AF Cible obligation", "sl_generic": "\u2192 SL vis\u00e9 : 5-10 pts",
+        "open_chart": "Ouvrir le chart", "see_chart": "voir chart",
+        "coh": "prix {p} hors gamme {g} [{lo}\u2013{hi}] \u2014 actif probablement MAL \u00c9TIQUET\u00c9 (v\u00e9rifie ?asset=/Ticker)",
+        "tk_title": "ORDRE LIMITE", "tk_demo": "d\u00e9mo", "tk_dir": "Sens", "tk_entry": "Entr\u00e9e",
+        "tk_entry_note": "(Fib 1 \u2014 pose la limite ici)", "tk_sl_note": "(Fib {f}, d\u00e9riv\u00e9)",
+        "tk_long": "\U0001F7E2 LONG (achat)", "tk_short": "\U0001F534 SHORT (vente)",
+        "tk_risk": "Risque", "tk_stop": "Stop", "tk_size": "Taille",
+        "tk_size_note": "(specs {g} \u2014 \u00c0 V\u00c9RIFIER)",
+        "tk_missing": "obligation manquante \u2014 Fib 0 non d\u00e9rivable, lis sur ton chart",
+        "tk_size_hand": "$ \u2014 dimensionne \u00e0 la main",
+        "tk_park": "\u23f3 <i>Pose l'ordre et pars : il se d\u00e9clenche seul si le prix revient sur le Fib 1. Sinon pas de trade (un setup qui file sans retest est manqu\u00e9).</i>",
+        "tk_chart": "Ouvrir le chart TradingView",
+        "tk_demo_warn": "\u26a0\ufe0f <i>D\u00e9mo. V\u00e9rifie la taille (specs broker) avant de poser.</i>",
+        "tk_no_order": "\u2014 NE PAS POSER sans v\u00e9rifier l'actif",
+    },
+    "en": {
+        "alert": "ALERT", "score": "Score", "asset": "Asset", "level": "Level",
+        "type": "Type", "tf": "TF", "side": "Side", "scope": "Scope", "mode": "Mode",
+        "scoring": "Scoring", "action": "Action", "watch": "\u2192 Watch M1 now",
+        "setup_long": "\u2192 Potential <b>LONG</b> setup", "setup_short": "\u2192 Potential <b>SHORT</b> setup",
+        "obligation": "\u2192 \U0001F3AF Obligation target", "sl_generic": "\u2192 Target SL: 5-10 pts",
+        "open_chart": "Open chart", "see_chart": "see chart",
+        "coh": "price {p} outside {g} range [{lo}\u2013{hi}] \u2014 asset likely MISLABELED (check ?asset=/Ticker)",
+        "tk_title": "LIMIT ORDER", "tk_demo": "demo", "tk_dir": "Dir.", "tk_entry": "Entry",
+        "tk_entry_note": "(Fib 1 \u2014 park the limit here)", "tk_sl_note": "(Fib {f}, derived)",
+        "tk_long": "\U0001F7E2 LONG (buy)", "tk_short": "\U0001F534 SHORT (sell)",
+        "tk_risk": "Risk", "tk_stop": "Stop", "tk_size": "Size",
+        "tk_size_note": "(specs {g} \u2014 VERIFY)",
+        "tk_missing": "missing obligation \u2014 Fib 0 not derivable, read it on your chart",
+        "tk_size_hand": "$ \u2014 size it by hand",
+        "tk_park": "\u23f3 <i>Park the order and walk away: it fills by itself if price retests Fib 1. No retest, no trade (a setup that runs without retest is a missed one).</i>",
+        "tk_chart": "Open the TradingView chart",
+        "tk_demo_warn": "\u26a0\ufe0f <i>Demo. Verify the size (broker specs) before parking.</i>",
+        "tk_no_order": "\u2014 DO NOT PARK before verifying the asset",
+    },
+}
+
+
+def tg_lang(profile):
+    return "en" if (profile or {}).get("lang") == "en" else "fr"
+
+
 def format_telegram_message(parsed: dict, scoring: dict, profile: dict = None) -> str:
     asset   = parsed.get("asset") or None
     group   = get_asset_group(asset) if asset else None
@@ -854,54 +925,55 @@ def format_telegram_message(parsed: dict, scoring: dict, profile: dict = None) -
     is_atr  = "atr" in (parsed.get("type") or "").lower()
     tv_link = get_tv_link(asset, group)
     mode    = (profile or {}).get("mode", "swing")
+    S       = TG_STR[tg_lang(profile)]   # v2.7.19
 
     side_emoji    = "🟢" if parsed.get("side") == "Support" else "🔴"
     scope_tag     = "✅ Pure" if parsed.get("scope") == "Pure" else "⬜ Non-Pure"
-    asset_display = f"{meta['emoji']} {esc(asset)}" if asset else f"{meta['emoji']} voir chart"
+    asset_display = f"{meta['emoji']} {esc(asset)}" if asset else f"{meta['emoji']} {S['see_chart']}"
 
     # Ligne cible : si une cible d'obligation est fournie (Exit du hold ou Target),
     # on l'affiche à la place du SL générique.
     target   = parsed.get("target")
     move_pct = parsed.get("move_pct")
     if target:
-        tgt_line = f"→ 🎯 Cible obligation : <b>{esc(target)}</b>"
+        tgt_line = f"{S['obligation']} : <b>{esc(target)}</b>"
         if move_pct:
             tgt_line += f"  (<b>{esc(move_pct)}%</b>)"
     else:
-        tgt_line = "→ SL visé : 5-10 pts"
+        tgt_line = S["sl_generic"]
 
-    action = (
-        f"→ Surveille M1 maintenant\n→ Setup <b>LONG</b> potentiel\n{tgt_line}"
-        if parsed.get("side") == "Support" else
-        f"→ Surveille M1 maintenant\n→ Setup <b>SHORT</b> potentiel\n{tgt_line}"
-    )
+    setup = S["setup_long"] if parsed.get("side") == "Support" else S["setup_short"]
+    action = f"{S['watch']}\n{setup}\n{tgt_line}"
 
     # v2.7.14 : avertissement de cohérence prix↔actif, bien visible
     coh_line = ""
-    if parsed.get("_coherence_warn"):
+    if parsed.get("_coherence_data"):
+        p, g, lo, hi = parsed["_coherence_data"]
+        coh_line = "\u26a0\ufe0f <b>" + esc(S["coh"].format(p=p, g=g.upper(), lo=lo, hi=hi)) + "</b>\n"
+    elif parsed.get("_coherence_warn"):
         coh_line = f"\u26a0\ufe0f <b>{esc(parsed['_coherence_warn'])}</b>\n"
 
     msg = (
-        f"{scoring['emoji']} <b>ALERTE {scoring['level']} — Score {scoring['score']}</b>\n"
+        f"{scoring['emoji']} <b>{S['alert']} {scoring['level']} — {S['score']} {scoring['score']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{coh_line}"
-        f"Asset    : <b>{asset_display}</b>\n"
-        f"Niveau   : <b>{esc(parsed.get('price', '?'))}</b>\n"
-        f"Type     : {'📡 ' if is_atr else ''}{esc(parsed.get('type', '?'))}\n"
-        f"TF       : {esc(parsed.get('timeframe', '?'))}\n"
-        f"Side     : {side_emoji} {esc(parsed.get('side', '?'))}\n"
-        f"Scope    : {scope_tag}\n"
-        f"Mode     : {esc(mode.upper())}\n"
+        f"{S['asset']:<8} : <b>{asset_display}</b>\n"
+        f"{S['level']:<8} : <b>{esc(parsed.get('price', '?'))}</b>\n"
+        f"{S['type']:<8} : {'📡 ' if is_atr else ''}{esc(parsed.get('type', '?'))}\n"
+        f"{S['tf']:<8} : {esc(parsed.get('timeframe', '?'))}\n"
+        f"{S['side']:<8} : {side_emoji} {esc(parsed.get('side', '?'))}\n"
+        f"{S['scope']:<8} : {scope_tag}\n"
+        f"{S['mode']:<8} : {esc(mode.upper())}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Scoring :\n"
+        f"{S['scoring']} :\n"
     )
     for d in scoring["details"]:
         msg += f"  • {esc(d)}\n"
 
-    tv_line = f"\n📈 <a href='{esc(tv_link)}'>Ouvrir le chart</a>" if tv_link else ""
+    tv_line = f"\n📈 <a href='{esc(tv_link)}'>{S['open_chart']}</a>" if tv_link else ""
     msg += (
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Action :\n{action}\n"
+        f"{S['action']} :\n{action}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {esc(parsed.get('timestamp', '')[:19].replace('T', ' '))} UTC"
         f"{tv_line}"
@@ -950,6 +1022,17 @@ def handle_telegram_command(text: str, chat_id: str):
             f"✅ TF+  : {', '.join(actifs) if actifs else 'aucun'}\n"
             f"⛔ TF-  : {', '.join(inactifs)}"
         )
+
+    elif cmd == "/lang":
+        if arg in ("fr", "en"):
+            profile["lang"] = arg
+            save_profile(chat_id, profile)
+            msg = ("\U0001F1EB\U0001F1F7 Notifications en <b>fran\u00e7ais</b>." if arg == "fr"
+                   else "\U0001F1EC\U0001F1E7 Notifications in <b>English</b>.")
+        else:
+            cur = profile.get("lang", "fr")
+            msg = (f"Langue actuelle / current language : <b>{cur}</b>\n"
+                   f"Usage : /lang fr | /lang en")
 
     elif cmd == "/pause":
         profile["paused"] = True
@@ -1434,7 +1517,7 @@ def evaluate_pending_outcomes():
 # ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
-def build_trade_ticket(parsed, group):
+def build_trade_ticket(parsed, group, profile=None):
     """ORDRE LIMITE au repos pour les types tradeables (Origin Hold ACTIVATED) :
     limite \u00e0 l'entr\u00e9e (Fib 1), SL = Fib 0 d\u00e9riv\u00e9, ladder de TP d\u00e9riv\u00e9e,
     taille pour un risque fixe. Format pr\u00eat \u00e0 poser, z\u00e9ro surveillance. None si N/A."""
@@ -1449,28 +1532,32 @@ def build_trade_ticket(parsed, group):
     if entry is None or not side:
         return None
     long_bias = (side == "Support")
+    S = TG_STR[tg_lang(profile)]   # v2.7.19
     risk_usd  = TICKET_CAPITAL * TICKET_RISK_PCT / 100.0
     slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
     sl = _stop_from_fib(entry, target, long_bias, slf)
     asset = esc(parsed.get("asset") or "?")
     tf    = esc(parsed.get("timeframe") or "?")
     typ   = esc(parsed.get("type") or "")
-    dir_txt = "\U0001F7E2 LONG (achat)" if long_bias else "\U0001F534 SHORT (vente)"
-    hdr = ["\U0001F4CB <b>ORDRE LIMITE</b> \u2014 d\u00e9mo " + str(int(TICKET_CAPITAL / 1000)) + "k",
+    dir_txt = S["tk_long"] if long_bias else S["tk_short"]
+    hdr = ["\U0001F4CB <b>" + S["tk_title"] + "</b> \u2014 " + S["tk_demo"] + " " + str(int(TICKET_CAPITAL / 1000)) + "k",
            "<b>" + asset + "</b> \u00b7 TF " + tf + " \u00b7 " + typ]
     # v2.7.14 : cohérence prix↔actif — NE PAS poser cet ordre sans vérifier
     if parsed.get("_coherence_warn"):
-        hdr.append("\u26a0\ufe0f <b>" + esc(parsed["_coherence_warn"])
-                   + "</b> \u2014 NE PAS POSER sans v\u00e9rifier l'actif")
+        _cw = parsed["_coherence_warn"]
+        if parsed.get("_coherence_data"):
+            p, g, lo, hi = parsed["_coherence_data"]
+            _cw = S["coh"].format(p=p, g=g.upper(), lo=lo, hi=hi)
+        hdr.append("\u26a0\ufe0f <b>" + esc(_cw) + "</b> " + S["tk_no_order"])
 
     if sl is None or target is None:
         return "\n".join(hdr + [
             "\u2501" * 20,
-            "Sens   : " + dir_txt,
-            "Entr\u00e9e : <b>" + str(entry) + "</b> <i>(Fib 1)</i>",
-            "SL     : <i>obligation manquante \u2014 Fib 0 non d\u00e9rivable, lis sur ton chart</i>",
-            "Risque : " + str(int(risk_usd)) + " $ \u2014 dimensionne \u00e0 la main",
-            "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>Ouvrir le chart</a>"])
+            S["tk_dir"] + "   : " + dir_txt,
+            S["tk_entry"] + " : <b>" + str(entry) + "</b> <i>(Fib 1)</i>",
+            "SL     : <i>" + S["tk_missing"] + "</i>",
+            S["tk_risk"] + " : " + str(int(risk_usd)) + " " + S["tk_size_hand"],
+            "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>" + S["open_chart"] + "</a>"])
 
     stop = abs(entry - sl)
     unit = abs(target - entry) / 0.618
@@ -1490,19 +1577,19 @@ def build_trade_ticket(parsed, group):
         "\u25b8 <b>" + verb + " " + str(lots) + " lot @ " + str(entry) + "</b>",
         "   SL " + str(round(sl, 2)) + "  \u00b7  TP " + str(round(target, 2)),
         bar,
-        "Sens   : " + dir_txt,
-        "Entr\u00e9e : <b>" + str(entry) + "</b> <i>(Fib 1 \u2014 pose la limite ici)</i>",
-        "SL     : <b>" + str(round(sl, 2)) + "</b> <i>(Fib " + ("%g" % slf) + ", d\u00e9riv\u00e9)</i>",
+        S["tk_dir"] + "   : " + dir_txt,
+        S["tk_entry"] + " : <b>" + str(entry) + "</b> <i>" + S["tk_entry_note"] + "</i>",
+        "SL     : <b>" + str(round(sl, 2)) + "</b> <i>" + S["tk_sl_note"].format(f=("%g" % slf)) + "</i>",
         "TP1 <b>" + str(round(target, 2)) + "</b> \u00b7 TP2 " + str(_ext(2.618))
         + " \u00b7 TP3 " + str(_ext(3.618)) + " \u00b7 TP4 " + str(_ext(4.618)),
         bar,
-        "Risque " + str(int(risk_usd)) + " $  \u00b7  Stop " + str(round(stop, 2))
+        S["tk_risk"] + " " + str(int(risk_usd)) + " $  \u00b7  " + S["tk_stop"] + " " + str(round(stop, 2))
         + " pts  \u00b7  R:R 1:" + str(rr) + " (TP1)",
-        "Taille <b>" + str(lots) + " lots</b> <i>(specs " + group + " \u2014 \u00c0 V\u00c9RIFIER)</i>",
+        S["tk_size"] + " <b>" + str(lots) + " lots</b> <i>" + S["tk_size_note"].format(g=group) + "</i>",
         bar,
-        "\u23f3 <i>Pose l'ordre et pars : il se d\u00e9clenche seul si le prix revient sur le Fib 1. Sinon pas de trade (un setup qui file sans retest est manqu\u00e9).</i>",
-        "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>Ouvrir le chart TradingView</a>",
-        "\u26a0\ufe0f <i>D\u00e9mo. V\u00e9rifie la taille (specs broker) avant de poser.</i>"]
+        S["tk_park"],
+        "\U0001F4C8 <a href='" + esc(get_tv_link(parsed.get("asset") or "", group)) + "'>" + S["tk_chart"] + "</a>",
+        S["tk_demo_warn"]]
     return "\n".join(L)
 
 
@@ -1551,6 +1638,9 @@ def webhook():
     coh = asset_coherence_warning(parsed, group)
     if coh:
         parsed["_coherence_warn"] = coh
+        _rng = PRICE_RANGES.get(group)
+        if _rng and parsed.get("price") is not None:
+            parsed["_coherence_data"] = (parsed["price"], group, _rng[0], _rng[1])
         print(f"[COHERENCE] \u26a0\ufe0f {coh} | asset={parsed.get('asset')} raw={raw[:80]!r}")
 
     try:
@@ -1591,7 +1681,7 @@ def webhook():
 
     if TICKET_ENABLED and not robot_state["paused"]:
         try:
-            ticket = build_trade_ticket(parsed, group)
+            ticket = build_trade_ticket(parsed, group, get_profile(TELEGRAM_CHAT_ID))
             if ticket:
                 send_telegram(ticket, TELEGRAM_CHAT_ID)
                 results["ticket"] = "sent"
@@ -2215,6 +2305,190 @@ def sl_sweep():
     return head + body + "</body></html>"
 
 
+@app.route("/tp_ladder", methods=["GET"])
+def tp_ladder():
+    """v2.7.18 — Feedback de la LADDER TP : pour chaque Origin Hold ACTIVATED,
+    rejoue le prix et mesure quels paliers (TP1=1.618, TP2=2.618, TP3=3.618,
+    TP4=4.618) sont atteints avant le stop. Compare 3 plans de sortie :
+      A) tout-dehors à TP1 (référence, = l'éval actuelle)
+      B) 4×25% aux paliers, stop INITIAL fixe
+      C) 4×25% aux paliers, stop remonté après chaque palier (BE puis palier
+         précédent) — ton playbook réel
+    Reste ouvert en fin d'horizon = clôturé au dernier close (mark-to-market).
+    Même règle conservatrice que /sl_sweep : dans une même bougie, l'adverse
+    est réputé toucher AVANT le favorable. Stop au /sl_fib courant.
+    À lancer 1× à froid (refait les fetches)."""
+    if not check_secret():
+        return ("unauthorized", 403)
+    slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
+            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
+            "WHERE a.price IS NOT NULL AND a.side IS NOT NULL AND a.target IS NOT NULL "
+            "AND a.ts <= ? AND LOWER(a.type) LIKE '%origin hold activated%' "
+            "ORDER BY a.id DESC LIMIT 500",
+            (cutoff,)
+        ).fetchall()
+    groups, order = {}, []
+    for r in rows:
+        try:
+            ts = datetime.fromisoformat(r["ts"])
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (now - ts).total_seconds() / 3600 < EVAL_MIN_AGE_H:
+            continue
+        if r["grp"] not in EVAL_RISK:
+            continue
+        key = (r["grp"], r["asset"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((r, ts))
+
+    # Distances des paliers depuis l'entrée, en unités Fibo : TPn = (n-1)+0.618
+    TP_MULT = [0.618, 1.618, 2.618, 3.618]
+    tiers_reached = [0, 0, 0, 0]        # cumulatif : a atteint TPn
+    stopped_before_tp1 = 0
+    open_at_horizon = 0
+    n_used = 0
+    sum_r = {"A": 0.0, "B": 0.0, "C": 0.0}
+    _start = time.monotonic()
+    for key in order:
+        if time.monotonic() - _start > 45:
+            break
+        grp, asset = key
+        items = groups[key]
+        earliest = min(ts for _, ts in items)
+        floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
+        bars = fetch_prices(grp, asset, max(earliest - timedelta(hours=2), floor_dt), now)
+        if not bars:
+            continue
+        for r, ts in items:
+            entry, target = r["price"], r["target"]
+            long_bias = (r["side"] == "Support")
+            unit = abs(target - entry) / 0.618
+            if unit <= 0:
+                continue
+            sdist = (1.0 - slf) * unit
+            if sdist <= 0:
+                continue
+            tf_h = tf_hours(r["timeframe"])
+            horizon_h = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
+            end_win = min(ts + timedelta(hours=horizon_h), now)
+            post = [b for b in bars if ts < b[0] <= end_win]
+            if not post:
+                continue
+            tp_d = [m * unit for m in TP_MULT]
+            # Rejeu unique : MFE séquentiel + stops mobiles du plan C
+            hit = 0                       # nb de paliers encaissés
+            # niveaux de stop (distance signée vs entrée, en points ; négatif = perte)
+            # plan C : initial -sdist ; après TP1 -> 0 (BE) ; TP2 -> +tp_d[0] ; TP3 -> +tp_d[1]
+            c_stop = -sdist
+            a_done = b_done = c_done = False
+            rA = rB = rC = None
+            last_close = post[-1][3]
+            for (_dt, hi, lo, _c) in post:
+                fav = (hi - entry) if long_bias else (entry - lo)
+                adv = (entry - lo) if long_bias else (hi - entry)
+                # conservateur : adverse d'abord
+                # Plan A/B : stop initial fixe
+                if not a_done and adv >= sdist:
+                    rA = -1.0
+                    a_done = True
+                if not b_done and adv >= sdist:
+                    # encaissé jusque-là + reste stoppé à -1
+                    rB = sum(tp_d[i] for i in range(hit)) / (4 * sdist) + (4 - hit) * (-1.0) / 4
+                    b_done = True
+                # Plan C : stop mobile (c_stop = distance signée vs entrée ;
+                # négatif = zone de perte, 0 = BE, positif = palier encaissé)
+                if not c_done:
+                    if c_stop <= 0:
+                        c_hit = adv >= -c_stop
+                    else:
+                        # stop en gain : touché si le prix retrace jusqu'à entry±c_stop
+                        c_hit = ((entry + c_stop) >= lo) if long_bias else ((entry - c_stop) <= hi)
+                    if c_hit:
+                        rC = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * c_stop) / (4 * sdist)
+                        c_done = True
+                # favorable ensuite : paliers atteints
+                new_hit = hit
+                while new_hit < 4 and fav >= tp_d[new_hit]:
+                    new_hit += 1
+                if new_hit > hit:
+                    for i in range(hit, new_hit):
+                        tiers_reached[i] += 1
+                    hit = new_hit
+                    if not a_done and hit >= 1:
+                        rA = tp_d[0] / sdist
+                        a_done = True
+                    if not b_done and hit >= 4:
+                        rB = sum(tp_d) / (4 * sdist)
+                        b_done = True
+                    if not c_done:
+                        # remonter le stop : BE après TP1, palier n-1 ensuite
+                        c_stop = 0.0 if hit == 1 else tp_d[hit - 2]
+                        if hit >= 4:
+                            rC = sum(tp_d) / (4 * sdist)
+                            c_done = True
+                if a_done and b_done and c_done:
+                    break
+            # fin d'horizon : positions restantes soldées au dernier close (M2M)
+            m2m = ((last_close - entry) if long_bias else (entry - last_close))
+            if rA is None:
+                rA = m2m / sdist
+                open_at_horizon += 1
+            if rB is None:
+                rB = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * m2m) / (4 * sdist)
+            if rC is None:
+                rC = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * m2m) / (4 * sdist)
+            if hit == 0 and rA == -1.0:
+                stopped_before_tp1 += 1
+            sum_r["A"] += rA
+            sum_r["B"] += rB
+            sum_r["C"] += rC
+            n_used += 1
+
+    def pct(x):
+        return round(100 * x / n_used, 1) if n_used else 0.0
+    tier_rows = "".join(
+        "<tr><td>TP" + str(i + 1) + " (Fib " + ("%g" % (i + 1.618 if i else 1.618)) + ")</td><td>"
+        + str(tiers_reached[i]) + "</td><td style=\"font-weight:700\">" + str(pct(tiers_reached[i]))
+        + "%</td></tr>" for i in range(4))
+    plan_rows = ""
+    for k, lbl in (("A", "A \u2014 tout-dehors \u00e0 TP1"),
+                   ("B", "B \u2014 4\u00d725% paliers, stop fixe"),
+                   ("C", "C \u2014 4\u00d725% paliers, stop remont\u00e9 (ton plan)")):
+        e = round(sum_r[k] / n_used, 3) if n_used else 0.0
+        ec = "var(--grn)" if e > 0 else "var(--red)"
+        plan_rows += ("<tr><td>" + lbl + "</td><td style=\"font-weight:700;color:" + ec + "\">"
+                      + (("+" if e > 0 else "") + str(e)) + "R</td></tr>")
+    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>FibLab \u2014 TP Ladder</title>' + DASH_CSS + '</head><body>')
+    body = ("<h1>\U0001F3AF Ladder TP \u2014 feedback</h1>"
+            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades \u00b7 stop /sl_fib "
+            + ("%g" % slf) + " \u00b7 " + str(pct(stopped_before_tp1)) + "% stopp\u00e9s avant TP1 \u00b7 "
+            + str(open_at_horizon) + " sold\u00e9s en fin d'horizon (M2M)</div>"
+            "<div class=\"card\"><h2>Paliers atteints (avant stop initial)</h2>"
+            "<table><thead><tr><th>Palier</th><th>N</th><th>% des trades</th></tr></thead><tbody>"
+            + tier_rows + "</tbody></table></div>"
+            "<div class=\"card\"><h2>Esp\u00e9rance par plan de sortie</h2>"
+            "<table><thead><tr><th>Plan</th><th>Esp\u00e9rance</th></tr></thead><tbody>"
+            + plan_rows + "</tbody></table></div>"
+            "<div class=\"note\"><b>Lecture :</b> les % de paliers sont mesur\u00e9s au stop initial "
+            "(un trade stopp\u00e9 apr\u00e8s TP1 compte TP1 atteint). Plans B/C : reste sold\u00e9 au dernier "
+            "close si l'horizon expire. <b>Proxy</b> : feed H1, sans spread/slippage, m\u00eame r\u00e8gle "
+            "conservatrice que /sl_sweep (adverse avant favorable dans la bougie). Le plan C approxime "
+            "ton playbook (BE apr\u00e8s TP1, puis palier pr\u00e9c\u00e9dent) \u2014 tes ajustements manuels "
+            "r\u00e9els peuvent diverger.</div>")
+    return head + body + "</body></html>"
+
+
 @app.route("/db_count", methods=["GET"])
 def db_count():
     if not check_secret():
@@ -2263,7 +2537,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.17",
+        "version": "2.7.19",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
