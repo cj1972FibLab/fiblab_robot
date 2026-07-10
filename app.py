@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.11)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.12)     ║
 ║         Charlie Joe 1972 — Juin 2026                         ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
@@ -17,6 +17,10 @@
 ║   • Stop d'éval des alertes HOLD = Fib0 calculé (bas/haut    ║
 ║     de la bougie englobée) au lieu du stop ATR à l'aveugle   ║
 ║   • Repli auto sur l'ATR si bougie manquante / feed KO       ║
+║                                                              ║
+║  Patch v2.7.12 "Modes de ticket ULTIME / LARGE" :            ║
+║   • /ticket_tf ultime (H4 seul) | large (H1..H12+Daily..W)   ║
+║   • filtre par label normalisé (distingue H1 de M1)          ║
 ║                                                              ║
 ║  Patch v2.7.11 "Verrou H4 + lien TV + /sl_sweep" :           ║
 ║   • ticket : uniquement H4 + lien TradingView                ║
@@ -658,8 +662,24 @@ TICKET_TYPES     = {"origin hold activated"}
 CONTRACT_VALUE   = {"xau": 100.0, "dax": 25.0, "btc": 1.0, "solana": 1.0,
                     "hype": 1.0, "sui": 1.0, "stocks": 1.0}
 CONTRACT_DEFAULT = 1.0
-TICKET_TF_HOURS  = {4}                          # ticket UNIQUEMENT sur H4 (tf_hours == 4)
 STOP_FIB_LEVELS  = [0.786, 0.5, 0.382, 0.0, -1.0]   # sweep SL : 0.786=serré -> -1=large
+# Deux modes de TF pour le ticket (bascule /ticket_tf) :
+#  - ultime : H4 seul (edge solide, rare) — défaut, pour la semaine
+#  - large  : H1..H12 + Daily..Weekly (plus d'opportunités, non validées hors H4)
+# Filtre par LABEL normalisé (et non tf_hours, qui confond H1 et M1).
+TICKET_TF_ULTIME = {"H4"}
+TICKET_TF_LARGE  = {"H1", "H2", "H4", "H6", "H8", "H12",
+                    "D1", "1D", "D", "DAILY", "2D", "3D", "4D", "5D", "6D", "7D",
+                    "D2", "D3", "D4", "D5", "D6", "D7", "W1", "1W", "W", "WEEKLY"}
+robot_state["ticket_tf_mode"] = "ultime"        # état runtime (bascule /ticket_tf)
+
+
+def _ticket_tf_set():
+    return TICKET_TF_LARGE if robot_state.get("ticket_tf_mode") == "large" else TICKET_TF_ULTIME
+
+
+def _ticket_tf_ok(tf):
+    return normalize_timeframe(str(tf or "").strip()).upper() in _ticket_tf_set()
 
 
 def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
@@ -878,6 +898,22 @@ def handle_telegram_command(text: str, chat_id: str):
                    f"Types notifiés : {', '.join(sorted(TYPES_IDEAL))}\n"
                    f"Usage : /ideal on | /ideal off")
 
+    elif cmd == "/ticket_tf":
+        if chat_id != TELEGRAM_CHAT_ID:
+            msg = "\u26d4 Commande réservée à l'admin."
+        elif arg in ("ultime", "ultimate", "h4"):
+            robot_state["ticket_tf_mode"] = "ultime"
+            msg = ("\U0001F3AF <b>Tickets : ULTIME</b> \u2014 H4 uniquement (edge solide, rare).\n"
+                   "Pose et pars, pour la semaine au bureau.")
+        elif arg == "large":
+            robot_state["ticket_tf_mode"] = "large"
+            msg = ("\U0001F310 <b>Tickets : LARGE</b> \u2014 H1/H2/H4/H6/H8/H12 + Daily\u2192Weekly.\n"
+                   "Plus d'opportunit\u00e9s (non valid\u00e9es hors H4) \u2014 pour les jours off.")
+        else:
+            etat = "LARGE \U0001F310" if robot_state.get("ticket_tf_mode") == "large" else "ULTIME \U0001F3AF"
+            msg = (f"Tickets TF : <b>{etat}</b>\n"
+                   f"Usage : /ticket_tf ultime | /ticket_tf large")
+
     elif cmd == "/status":
         tf_on = [k for k, v in profile["tf_custom"].items() if v]
         etat  = "⏸ PAUSE" if profile["paused"] else "✅ ACTIF"
@@ -888,6 +924,7 @@ def handle_telegram_command(text: str, chat_id: str):
             f"État   : {etat} {kill}\n"
             f"Mode   : <b>{profile['mode'].upper()}</b>\n"
             f"Idéal  : {'🎯 ON' if robot_state.get('notify_only_ideal', NOTIFY_ONLY_IDEAL) else '📢 OFF'}\n"
+            f"Tickets: {'\U0001F310 LARGE' if robot_state.get('ticket_tf_mode') == 'large' else '\U0001F3AF ULTIME (H4)'}\n"
             f"TF+    : {', '.join(tf_on) if tf_on else 'aucun'}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"Alertes globales : {len(alert_history)}\n"
@@ -902,7 +939,8 @@ def handle_telegram_command(text: str, chat_id: str):
             f"/mode swing|scalp|both\n"
             f"/tf_on 72 | /tf_off 72 | /tf_status\n"
             f"/pause | /reprendre\n"
-            f"/ideal on|off"
+            f"/ideal on|off\n"
+            f"/ticket_tf ultime|large"
         )
 
     elif cmd in ("/derniere", "/xau", "/solana", "/dax", "/btc", "/hype", "/sui", "/stocks"):
@@ -1271,7 +1309,7 @@ def build_trade_ticket(parsed, group):
     atype = (parsed.get("type") or "").lower()
     if not any(t in atype for t in TICKET_TYPES):
         return None
-    if tf_hours(parsed.get("timeframe")) not in TICKET_TF_HOURS:
+    if not _ticket_tf_ok(parsed.get("timeframe")):
         return None
     entry  = parsed.get("price")
     target = parsed.get("target")
@@ -1389,7 +1427,7 @@ def webhook():
             continue
         if (user_id == TELEGRAM_CHAT_ID and TICKET_ENABLED
                 and any(t in (parsed.get("type") or "").lower() for t in TICKET_TYPES)
-                and tf_hours(parsed.get("timeframe")) in TICKET_TF_HOURS):
+                and _ticket_tf_ok(parsed.get("timeframe"))):
             results[user_id] = "-> ticket"
             continue
         notify, reason = should_notify(parsed, scoring, profile)
@@ -1968,7 +2006,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.11",
+        "version": "2.7.12",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
