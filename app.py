@@ -1,7 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.13)     ║
-║         Charlie Joe 1972 — Juin 2026                         ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.14)     ║
+║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.14 "Ticker prioritaire + fix TF Daily + garde" : ║
+║   • parse 'Ticker: XXX' dans le corps (prioritaire sur       ║
+║     ?asset= de l'URL) — hold ET standard                     ║
+║   • FIX : regex TF du parser hold tronquait '1D'→'1'→M1      ║
+║     (Daily/2D/3D/W jetés comme scalp minute) → capture '1D'  ║
+║   • Garde-fou cohérence prix↔actif : ⚠️ visible (Telegram +  ║
+║     ticket + log) si le prix sort de la gamme de l'actif.    ║
+║     FLAG SEULEMENT, jamais d'auto-correction (gammes crypto  ║
+║     se recouvrent → une correction auto serait pire)         ║
+║   • Log du payload brut complet ([WEBHOOK] RAW) pour debug   ║
 ║                                                              ║
 ║  Base v2.5.1 + patch v2.6.0 "Syn-calibrated scoring" :       ║
 ║   • TYPE_SCORES re-pondérés sur les probabilités de Syn      ║
@@ -327,6 +338,37 @@ def get_asset_group(asset: str) -> str:
     return None
 
 
+# v2.7.14 — Garde-fou cohérence prix↔actif. Gammes HEURISTIQUES larges (à
+# ajuster si un actif migre). FLAG SEULEMENT : pas d'auto-correction, car les
+# gammes crypto se recouvrent (SOL~79, HYPE~66) → corriger à l'aveugle serait
+# pire que signaler. But : attraper un XAU à 4106 étiqueté SOLUSDT.P.
+PRICE_RANGES = {
+    "xau":    (1500, 8000),
+    "dax":    (8000, 60000),
+    "solana": (10, 2000),
+    "btc":    (10000, 1000000),
+    "hype":   (0.5, 500),
+    "sui":    (0.05, 50),
+}
+
+
+def asset_coherence_warning(parsed: dict, group: str):
+    """None si cohérent/inconnu ; sinon un texte d'alerte (prix hors gamme
+    de l'actif étiqueté → probable mauvais ?asset= ou alerte mal configurée)."""
+    try:
+        price = parsed.get("price")
+        rng = PRICE_RANGES.get(group)
+        if price is None or rng is None:
+            return None
+        lo, hi = rng
+        if lo <= float(price) <= hi:
+            return None
+        return (f"prix {price} hors gamme {group.upper()} [{lo}\u2013{hi}] "
+                f"\u2014 actif probablement MAL \u00c9TIQUET\u00c9 (v\u00e9rifie ?asset=/Ticker)")
+    except Exception:
+        return None
+
+
 def get_tv_link(asset: str, group: str) -> str:
     if not group:
         return ""
@@ -421,16 +463,21 @@ def parse_hold_message(raw: str, asset_hint: str = None) -> dict:
     Retourne None si ce n'est pas un message hold (laisse la main au parser std).
     Le champ 'Exit' devient la cible d'obligation (target)."""
     lines = [l.strip() for l in raw.replace("\\n", "\n").split("\n") if l.strip()]
-    if not lines or "hold" not in lines[0].lower():
+    # v2.7.14 : une éventuelle ligne 'Ticker: XXX' en tête ne doit pas masquer
+    # la détection du type hold — le type = première ligne NON-Ticker.
+    type_lines = [l for l in lines if not l.lower().startswith("ticker:")]
+    if not type_lines or "hold" not in type_lines[0].lower():
         return None
-    res = {"raw": raw.strip(), "type": lines[0].strip(), "asset": None,
+    res = {"raw": raw.strip(), "type": type_lines[0].strip(), "asset": None,
            "timeframe": None, "side": None, "price": None, "target": None,
            "move_pct": None, "scope": "Pure", "timestamp": now_iso()}
     body = "\n".join(lines)
 
-    m = re.search(r"TF:\s*(\d+)", body)
+    # v2.7.14 FIX : capturer '1D'/'3D'/'1W' entiers (l'ancien \d+ tronquait
+    # '1D' en '1' → normalisé M1 → Daily jeté comme scalp minute).
+    m = re.search(r"TF:\s*([0-9]+[A-Za-z]*)", body)
     if m:
-        res["timeframe"] = normalize_timeframe(m.group(1))
+        res["timeframe"] = normalize_timeframe(m.group(1).upper())
     for l in lines:
         if l in ("Support", "Resistance"):
             res["side"] = l
@@ -445,7 +492,12 @@ def parse_hold_message(raw: str, asset_hint: str = None) -> dict:
     m = re.search(r"Move%:\s*([\d.]+)", body)
     if m:
         res["move_pct"] = float(m.group(1))
-    if asset_hint:
+    # v2.7.14 : le ticker du CORPS ('Ticker: XAUUSD') prime sur le ?asset= de
+    # l'URL (source du bug XAU étiqueté SOLUSDT.P — URL partagée mal configurée).
+    m = re.search(r"^Ticker:\s*([A-Za-z0-9./!_:-]+)", body, re.MULTILINE)
+    if m:
+        res["asset"] = m.group(1).upper()
+    elif asset_hint:
         res["asset"] = asset_hint.upper()
     return res
 
@@ -498,6 +550,10 @@ def parse_fiblab_message(raw: str) -> dict:
     m = re.search(r'Target:\s*([\d.]+)', rest, re.IGNORECASE)   # cible optionnelle (pipe)
     if m:
         result["target"] = float(m.group(1))
+    # v2.7.14 : 'Ticker: XXX' dans le corps prime sur l'asset détecté par regex.
+    m = re.search(r"^Ticker:\s*([A-Za-z0-9./!_:-]+)", raw, re.MULTILINE)
+    if m:
+        result["asset"] = m.group(1).upper()
     return result
 
 
@@ -799,9 +855,15 @@ def format_telegram_message(parsed: dict, scoring: dict, profile: dict = None) -
         f"→ Surveille M1 maintenant\n→ Setup <b>SHORT</b> potentiel\n{tgt_line}"
     )
 
+    # v2.7.14 : avertissement de cohérence prix↔actif, bien visible
+    coh_line = ""
+    if parsed.get("_coherence_warn"):
+        coh_line = f"\u26a0\ufe0f <b>{esc(parsed['_coherence_warn'])}</b>\n"
+
     msg = (
         f"{scoring['emoji']} <b>ALERTE {scoring['level']} — Score {scoring['score']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{coh_line}"
         f"Asset    : <b>{asset_display}</b>\n"
         f"Niveau   : <b>{esc(parsed.get('price', '?'))}</b>\n"
         f"Type     : {'📡 ' if is_atr else ''}{esc(parsed.get('type', '?'))}\n"
@@ -1375,6 +1437,10 @@ def build_trade_ticket(parsed, group):
     dir_txt = "\U0001F7E2 LONG (achat)" if long_bias else "\U0001F534 SHORT (vente)"
     hdr = ["\U0001F4CB <b>ORDRE LIMITE</b> \u2014 d\u00e9mo " + str(int(TICKET_CAPITAL / 1000)) + "k",
            "<b>" + asset + "</b> \u00b7 TF " + tf + " \u00b7 " + typ]
+    # v2.7.14 : cohérence prix↔actif — NE PAS poser cet ordre sans vérifier
+    if parsed.get("_coherence_warn"):
+        hdr.append("\u26a0\ufe0f <b>" + esc(parsed["_coherence_warn"])
+                   + "</b> \u2014 NE PAS POSER sans v\u00e9rifier l'actif")
 
     if sl is None or target is None:
         return "\n".join(hdr + [
@@ -1433,13 +1499,18 @@ def webhook():
             pass
 
     print(f"[WEBHOOK] Reçu : {raw[:100]}")
+    # v2.7.14 : payload brut complet en repr (une seule ligne de log Railway,
+    # les \n multi-lignes ne sont plus éclatés) — indispensable au debug.
+    print(("[WEBHOOK] RAW : " + repr(raw))[:500])
     if not raw:
         return jsonify({"error": "empty body"}), 400
 
     # Aiguillage : message hold (multi-lignes) vs format standard.
-    asset_url  = request.args.get("asset")
-    first_line = raw.split("\n")[0].lower()
-    if "hold" in first_line:
+    # v2.7.14 : 'hold' cherché sur les 2 premières lignes (une ligne
+    # 'Ticker: XXX' peut désormais précéder le type).
+    asset_url = request.args.get("asset")
+    head = "\n".join(raw.split("\n")[:2]).lower()
+    if "hold" in head:
         parsed = parse_hold_message(raw, asset_hint=asset_url)
         if parsed is None:
             parsed = parse_fiblab_message(raw)
@@ -1451,6 +1522,12 @@ def webhook():
 
     scoring = compute_score(parsed, history=alert_history)
     group   = get_asset_group(parsed.get("asset") or "")
+
+    # v2.7.14 : garde-fou cohérence prix↔actif (flag, jamais de correction)
+    coh = asset_coherence_warning(parsed, group)
+    if coh:
+        parsed["_coherence_warn"] = coh
+        print(f"[COHERENCE] \u26a0\ufe0f {coh} | asset={parsed.get('asset')} raw={raw[:80]!r}")
 
     try:
         alert_id = save_alert(parsed, scoring, group)
@@ -2056,7 +2133,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.13",
+        "version": "2.7.14",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
