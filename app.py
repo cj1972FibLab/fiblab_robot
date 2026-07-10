@@ -1,7 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.19)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.20)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.20 "Stop paramétrable PAR ACTIF" :               ║
+║   • /sl_fib <groupe> <fraction> : surcharge le stop d'un     ║
+║     actif (éval + ticket + tp_ladder) ; off pour retirer ;   ║
+║     les autres restent au global. Runtime (reset au deploy)  ║
+║   • /sl_sweep?asset=<groupe> : sweep restreint à un actif —  ║
+║     la SEULE base légitime pour choisir une surcharge        ║
 ║                                                              ║
 ║  Patch v2.7.19 "Notifications FR/EN par utilisateur" :       ║
 ║   • /lang fr|en : langue des alertes ET du ticket, par       ║
@@ -779,6 +786,18 @@ robot_state["ticket_tf_mode"] = "ultime"        # état runtime (bascule /ticket
 # Backtest /sl_sweep : le stop serré maximise l'espérance (0.5 ~+0.18R tenable).
 SL_FIB_DEFAULT = 0.5
 robot_state["sl_fib"] = SL_FIB_DEFAULT
+# v2.7.20 : surcharge PAR ACTIF (groupe -> fraction). Vide par défaut = tout le
+# monde au global. Runtime (reset au redéploiement), comme /ideal et /ticket_tf.
+robot_state["sl_fib_asset"] = {}
+
+
+def sl_fib_for(group):
+    """Fraction Fibo du stop pour un groupe : surcharge par actif si définie,
+    sinon le réglage global /sl_fib."""
+    ov = robot_state.get("sl_fib_asset", {})
+    if group in ov:
+        return ov[group]
+    return robot_state.get("sl_fib", SL_FIB_DEFAULT)
 
 
 def _ticket_tf_set():
@@ -1093,21 +1112,46 @@ def handle_telegram_command(text: str, chat_id: str):
         if chat_id != TELEGRAM_CHAT_ID:
             msg = "\u26d4 Commande réservée à l'admin."
         else:
-            try:
-                v = float(arg.replace(",", "."))
-            except ValueError:
-                v = None
-            if v is not None and -2.0 <= v < 1.0:
-                robot_state["sl_fib"] = v
-                rr = round(0.618 / (1.0 - v), 2) if (1.0 - v) != 0 else 0.0
-                msg = (f"\U0001F3AF <b>Stop = Fib {v:g}</b> (éval + ticket)\n"
-                       f"R:R sur TP1 = 1:{rr}\n"
-                       f"0 = Fib 0 large \u00b7 0.5 = mi-chemin \u00b7 0.786 = serré\n"
-                       f"(fais /reeval pour recalculer le dashboard à ce stop)")
+            # v2.7.20 : /sl_fib 0.5 (global) | /sl_fib xau 0 | /sl_fib xau off
+            arg2 = parts[2] if len(parts) > 2 else ""
+            grp_arg = arg if arg in ASSET_META else None
+
+            def _pf(s):
+                try:
+                    return float(s.replace(",", "."))
+                except (ValueError, AttributeError):
+                    return None
+
+            if grp_arg and arg2 == "off":
+                robot_state.setdefault("sl_fib_asset", {}).pop(grp_arg, None)
+                msg = (f"\U0001F3AF Surcharge <b>{grp_arg}</b> retirée \u2192 stop global "
+                       f"Fib {robot_state.get('sl_fib', SL_FIB_DEFAULT):g}.\n(/reeval pour recalculer)")
+            elif grp_arg:
+                v = _pf(arg2)
+                if v is not None and -2.0 <= v < 1.0:
+                    robot_state.setdefault("sl_fib_asset", {})[grp_arg] = v
+                    rr = round(0.618 / (1.0 - v), 2) if (1.0 - v) != 0 else 0.0
+                    msg = (f"\U0001F3AF <b>{grp_arg} : stop = Fib {v:g}</b> (éval + ticket)\n"
+                           f"R:R sur TP1 = 1:{rr} \u00b7 les autres actifs restent au global.\n"
+                           f"\u26a0\ufe0f Justifie-le par /sl_sweep?asset={grp_arg} (n\u226530) — "
+                           f"pas à l'intuition.\n(/reeval pour recalculer)")
+                else:
+                    msg = f"Usage : /sl_fib {grp_arg} 0.786 | 0.5 | 0 | -1 | off"
             else:
-                cur = robot_state.get("sl_fib", SL_FIB_DEFAULT)
-                msg = (f"Stop actuel : <b>Fib {cur:g}</b>\n"
-                       f"Usage : /sl_fib 0.786 | 0.5 | 0.382 | 0 | -1")
+                v = _pf(arg)
+                if v is not None and -2.0 <= v < 1.0:
+                    robot_state["sl_fib"] = v
+                    rr = round(0.618 / (1.0 - v), 2) if (1.0 - v) != 0 else 0.0
+                    msg = (f"\U0001F3AF <b>Stop global = Fib {v:g}</b> (éval + ticket)\n"
+                           f"R:R sur TP1 = 1:{rr}\n"
+                           f"0 = Fib 0 large \u00b7 0.5 = mi-chemin \u00b7 0.786 = serré\n"
+                           f"(fais /reeval pour recalculer le dashboard à ce stop)")
+                else:
+                    cur = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+                    ov = robot_state.get("sl_fib_asset", {})
+                    ov_txt = ("\nSurcharges : " + ", ".join(f"{k}={v:g}" for k, v in ov.items())) if ov else ""
+                    msg = (f"Stop global : <b>Fib {cur:g}</b>{ov_txt}\n"
+                           f"Usage : /sl_fib 0.5 (global) \u00b7 /sl_fib xau 0.786 \u00b7 /sl_fib xau off")
 
     elif cmd == "/status":
         tf_on = [k for k, v in profile["tf_custom"].items() if v]
@@ -1451,7 +1495,7 @@ def evaluate_pending_outcomes():
             #    EXACT. Repli sur la reconstruction H1 (plancherisée) si pas de cible.
             sl, sl_src = None, None
             if is_hold:
-                _slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+                _slf = sl_fib_for(r["grp"])   # v2.7.20 : stop par actif
                 stop_px = _stop_from_fib(entry, r["target"], long_bias, _slf)
                 if stop_px is not None:
                     raw_sl = (entry - stop_px) if long_bias else (stop_px - entry)
@@ -1534,7 +1578,7 @@ def build_trade_ticket(parsed, group, profile=None):
     long_bias = (side == "Support")
     S = TG_STR[tg_lang(profile)]   # v2.7.19
     risk_usd  = TICKET_CAPITAL * TICKET_RISK_PCT / 100.0
-    slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+    slf = sl_fib_for(group)   # v2.7.20 : stop par actif
     sl = _stop_from_fib(entry, target, long_bias, slf)
     asset = esc(parsed.get("asset") or "?")
     tf    = esc(parsed.get("timeframe") or "?")
@@ -2199,6 +2243,9 @@ def sl_sweep():
             continue
         if r["grp"] not in EVAL_RISK:
             continue
+        _af = (request.args.get("asset") or "").lower().strip()
+        if _af and (r["grp"] or "").lower() != _af:
+            continue
         key = (r["grp"], r["asset"])
         if key not in groups:
             groups[key] = []
@@ -2292,7 +2339,9 @@ def sl_sweep():
     head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab \u2014 SL Sweep</title>' + DASH_CSS + '</head><body>')
-    body = ("<h1>\U0001F3AF Sweep de Stop Loss</h1>"
+    _af = (request.args.get("asset") or "").lower().strip()
+    _af_lbl = (" \u2014 filtre actif : <b>" + esc(_af.upper()) + "</b>") if _af else ""
+    body = ("<h1>\U0001F3AF Sweep de Stop Loss" + _af_lbl + "</h1>"
             "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades. "
             "Sortie mesur\u00e9e \u00e0 TP1 (1.618). Stop serr\u00e9 = meilleur R:R mais plus de stop-outs.</div>"
             "<div class=\"card\"><table><thead><tr><th>Stop</th><th>R:R</th><th>N</th>"
@@ -2320,7 +2369,9 @@ def tp_ladder():
     À lancer 1× à froid (refait les fetches)."""
     if not check_secret():
         return ("unauthorized", 403)
-    slf = robot_state.get("sl_fib", SL_FIB_DEFAULT)
+    slf_desc = "global %g" % robot_state.get("sl_fib", SL_FIB_DEFAULT)
+    if robot_state.get("sl_fib_asset"):
+        slf_desc += " + overrides " + json.dumps(robot_state["sl_fib_asset"])
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
     with db() as conn:
@@ -2374,7 +2425,7 @@ def tp_ladder():
             unit = abs(target - entry) / 0.618
             if unit <= 0:
                 continue
-            sdist = (1.0 - slf) * unit
+            sdist = (1.0 - sl_fib_for(grp)) * unit   # v2.7.20
             if sdist <= 0:
                 continue
             tf_h = tf_hours(r["timeframe"])
@@ -2471,8 +2522,8 @@ def tp_ladder():
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab \u2014 TP Ladder</title>' + DASH_CSS + '</head><body>')
     body = ("<h1>\U0001F3AF Ladder TP \u2014 feedback</h1>"
-            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades \u00b7 stop /sl_fib "
-            + ("%g" % slf) + " \u00b7 " + str(pct(stopped_before_tp1)) + "% stopp\u00e9s avant TP1 \u00b7 "
+            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades \u00b7 stop "
+            + esc(slf_desc) + " \u00b7 " + str(pct(stopped_before_tp1)) + "% stopp\u00e9s avant TP1 \u00b7 "
             + str(open_at_horizon) + " sold\u00e9s en fin d'horizon (M2M)</div>"
             "<div class=\"card\"><h2>Paliers atteints (avant stop initial)</h2>"
             "<table><thead><tr><th>Palier</th><th>N</th><th>% des trades</th></tr></thead><tbody>"
@@ -2537,7 +2588,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.19",
+        "version": "2.7.20",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
