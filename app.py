@@ -1,7 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.22)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.23)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.23 "Journal v2 — modèle Journal De Trading 2026":║
+║   • Vue MENSUELLE par compte : $ P&L, % du capital, capital  ║
+║     courant, R, leçon, screenshot, totaux (ratio, WR)        ║
+║   • Saisie rapide d'un trade clôturé + option "appliquer au  ║
+║     solde" ; clôture d'un trade robot avec P&L réel broker   ║
+║   • DD propfirm CORRIGÉ : plancher = HWM − DD max (HWM       ║
+║     éditable, monté auto quand le solde dépasse)             ║
+║   • Équity (P&L cumulé) + stats par stratégie                ║
 ║                                                              ║
 ║  Patch v2.7.22 "Précision des tickets" :                     ║
 ║   • SL/TP/stop arrondis selon la magnitude du prix :         ║
@@ -280,6 +289,7 @@ def init_db():
                 capital  REAL,              -- capital de référence
                 dd_max   REAL,              -- drawdown max ABSOLU (NULL si aucun)
                 balance  REAL,              -- solde courant, MIS À JOUR PAR L'UTILISATEUR
+                hwm      REAL,              -- High Water Mark (plancher DD = hwm - dd_max)
                 active   INTEGER DEFAULT 1
             )
         """)
@@ -310,9 +320,16 @@ def init_db():
         if conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"] == 0:
             conn.executemany(
                 "INSERT INTO accounts (name,kind,capital,dd_max,balance) VALUES (?,?,?,?,?)",
-                [("UFunded", "propfirm", 360000.0, 16000.0, 360000.0),
+                [("UFunded", "propfirm", 360000.0, 16000.0, 353064.0),
                  ("Jupiter", "crypto", 0.0, None, 0.0),
                  ("Phantom", "crypto", 0.0, None, 0.0)])
+        for mig in ("ALTER TABLE accounts ADD COLUMN hwm REAL",
+                    "ALTER TABLE trades ADD COLUMN screenshot TEXT"):
+            try:
+                conn.execute(mig)
+            except Exception:
+                pass
+        conn.execute("UPDATE accounts SET hwm = 360000.0 WHERE name='UFunded' AND hwm IS NULL")
         conn.commit()
 
 
@@ -1733,27 +1750,45 @@ def build_trade_ticket(parsed, group, profile=None):
 
 
 # ─────────────────────────────────────────────
-# JOURNAL DE TRADING (v2.7.21)
+# JOURNAL DE TRADING v2 (v2.7.23) — modèle "Journal De Trading 2026"
+#   vue mensuelle · P&L $ · capital courant · leçons · screenshots ·
+#   HWM propfirm (plancher = HWM − DD max) · équity · stats par stratégie
 # ─────────────────────────────────────────────
+_INP = ('style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;'
+        'border-radius:6px;padding:6px;margin:2px"')
+
+
 def _tok():
     return ("?token=" + WEBHOOK_SECRET) if WEBHOOK_SECRET else ""
 
 
+def _money(x):
+    try:
+        return f"{x:,.0f}".replace(",", "\u202f")
+    except (TypeError, ValueError):
+        return "?"
+
+
 def _trade_r(t):
-    """R réalisé (géométrique, broker-agnostique) + fraction encore ouverte.
-    R d'une sortie = frac × (exit−entry)/(entry−sl), signé par le sens."""
+    """R réalisé (géométrique) + fraction ouverte, depuis les sorties JSON."""
     try:
         exits = json.loads(t["exits"] or "[]")
     except Exception:
         exits = []
     entry, sl = t["entry"], t["sl_initial"]
     if entry is None or sl is None or entry == sl:
-        return 0.0, 1.0, exits
+        return None, max(0.0, 1.0 - sum(e.get("frac", 0) for e in exits)), exits
     risk_pts = abs(entry - sl)
     sign = 1.0 if (t["side"] or "").upper() == "LONG" else -1.0
     r = sum(e["frac"] * sign * (e["price"] - entry) / risk_pts for e in exits)
-    open_frac = max(0.0, 1.0 - sum(e["frac"] for e in exits))
-    return r, open_frac, exits
+    return r, max(0.0, 1.0 - sum(e["frac"] for e in exits)), exits
+
+
+def _month_bounds(mstr):
+    y, m = int(mstr[:4]), int(mstr[5:7])
+    lo = f"{y:04d}-{m:02d}-01"
+    y2, m2 = (y + 1, 1) if m == 12 else (y, m + 1)
+    return lo, f"{y2:04d}-{m2:02d}-01"
 
 
 @app.route("/journal", methods=["GET"])
@@ -1762,131 +1797,244 @@ def journal_view():
         return ("unauthorized", 403)
     tok = _tok()
     amp = "&" if tok else "?"
+    month = request.args.get("m") or datetime.now(timezone.utc).strftime("%Y-%m")
+    acct_f = request.args.get("acct")
     prefill_id = request.args.get("prefill")
+    lo, hi = _month_bounds(month)
+
     with db() as conn:
         accts = conn.execute("SELECT * FROM accounts WHERE active=1 ORDER BY id").fetchall()
+        q = ("SELECT t.*, a.name AS acct FROM trades t JOIN accounts a ON a.id=t.account_id "
+             "WHERE t.status='closed' AND t.closed_ts >= ? AND t.closed_ts < ? ")
+        args = [lo, hi]
+        if acct_f:
+            q += "AND t.account_id = ? "
+            args.append(int(acct_f))
+        closed = conn.execute(q + "ORDER BY t.closed_ts", args).fetchall()
         open_tr = conn.execute(
             "SELECT t.*, a.name AS acct FROM trades t JOIN accounts a ON a.id=t.account_id "
             "WHERE t.status='open' ORDER BY t.opened_ts DESC").fetchall()
-        closed_tr = conn.execute(
-            "SELECT t.*, a.name AS acct FROM trades t JOIN accounts a ON a.id=t.account_id "
-            "WHERE t.status!='open' ORDER BY t.closed_ts DESC LIMIT 30").fetchall()
-        # Alertes ticketables récentes pour le pré-remplissage
+        all_closed = conn.execute(
+            "SELECT t.account_id, t.closed_ts, t.pnl_usd, t.setup, t.asset FROM trades t "
+            "WHERE t.status='closed' ORDER BY t.closed_ts").fetchall()
         recents = conn.execute(
-            "SELECT id, ts, asset, grp, timeframe, type, side, price, target FROM alerts "
+            "SELECT id, asset, timeframe, type, side, price, target, grp FROM alerts "
             "WHERE LOWER(type) LIKE '%origin hold activated%' AND price IS NOT NULL "
-            "AND target IS NOT NULL ORDER BY id DESC LIMIT 12").fetchall()
+            "AND target IS NOT NULL ORDER BY id DESC LIMIT 10").fetchall()
 
-    # Valeurs de pré-remplissage depuis une alerte (mêmes maths que le ticket)
-    pf = {"asset": "", "grp": "", "side": "LONG", "entry": "", "sl": "", "setup": "", "alert_id": ""}
+    # préremplissage depuis une alerte (mêmes maths que le ticket)
+    pf = {"asset": "", "side": "LONG", "entry": "", "sl": "", "setup": "", "alert_id": ""}
     if prefill_id:
         with db() as conn:
             al = conn.execute("SELECT * FROM alerts WHERE id=?", (prefill_id,)).fetchone()
         if al:
-            long_bias = (al["side"] == "Support")
-            slf = sl_fib_for(al["grp"])
-            slv = _stop_from_fib(al["price"], al["target"], long_bias, slf)
-            pf = {"asset": al["asset"] or "", "grp": al["grp"] or "",
-                  "side": "LONG" if long_bias else "SHORT",
-                  "entry": al["price"], "sl": (round(slv, 4) if slv is not None else ""),
-                  "setup": f"{al['type']} {al['timeframe'] or ''}".strip(),
-                  "alert_id": al["id"]}
+            lb = (al["side"] == "Support")
+            slv = _stop_from_fib(al["price"], al["target"], lb, sl_fib_for(al["grp"]))
+            pf = {"asset": al["asset"] or "", "side": "LONG" if lb else "SHORT",
+                  "entry": al["price"], "sl": (round(slv, 6) if slv is not None else ""),
+                  "setup": f"{al['type']} {al['timeframe'] or ''}".strip(), "alert_id": al["id"]}
 
-    def money(x):
-        return f"{x:,.0f}".replace(",", " ")
-
-    # ── Cartes comptes ──
-    acct_cards = ""
+    # ═ Cartes comptes (HWM propfirm) ═
+    cards = ""
     for a in accts:
-        bal, cap = a["balance"] or 0.0, a["capital"] or 0.0
+        bal = a["balance"] or 0.0
         dd_html = ""
         if a["dd_max"]:
-            floor = cap - a["dd_max"]
+            hwm = a["hwm"] or a["capital"] or 0.0
+            floor = hwm - a["dd_max"]
             margin = bal - floor
-            pctm = max(0.0, min(100.0, 100.0 * margin / a["dd_max"])) if a["dd_max"] else 0
+            pctm = max(0.0, min(100.0, 100.0 * margin / a["dd_max"]))
             col = "var(--grn)" if pctm > 50 else ("var(--gold)" if pctm > 25 else "var(--red)")
-            dd_html = (f'<div class="note">Plancher DD : <b>{money(floor)} $</b> \u00b7 '
-                       f'Marge restante : <b style="color:{col}">{money(margin)} $</b> / {money(a["dd_max"])} $</div>'
-                       f'<div style="background:#21262d;border-radius:6px;height:10px;overflow:hidden">'
-                       f'<div style="width:{pctm:.1f}%;height:10px;background:{col}"></div></div>')
-        acct_cards += (
-            f'<div class="card"><h2>{esc(a["name"])} <span style="color:var(--dim);font-size:.7em">'
-            f'{esc(a["kind"])}</span></h2>'
-            f'<div class="val" style="color:var(--blue)">{money(bal)} $</div>'
-            + dd_html +
-            f'<form method="post" action="/journal/balance{tok}" style="margin-top:8px">'
+            dd_html = (
+                f'<div class="note">HWM <b>{_money(hwm)} $</b> \u00b7 plancher <b>{_money(floor)} $</b><br>'
+                f'Marge avant violation : <b style="color:{col};font-size:1.15em">{_money(margin)} $</b> / {_money(a["dd_max"])} $</div>'
+                f'<div style="background:#21262d;border-radius:6px;height:10px;overflow:hidden">'
+                f'<div style="width:{pctm:.1f}%;height:10px;background:{col}"></div></div>'
+                f'<form method="post" action="/journal/account{tok}" style="margin-top:6px">'
+                f'<input type="hidden" name="account_id" value="{a["id"]}">'
+                f'<input name="hwm" placeholder="nouveau HWM" inputmode="decimal" {_INP} size="10">'
+                f'<button class="btn">HWM</button></form>')
+        cards += (
+            f'<div class="card"><h2>{esc(a["name"])} <span style="color:var(--dim);font-size:.68em">{esc(a["kind"])}</span></h2>'
+            f'<div class="val" style="color:var(--blue)">{_money(bal)} $</div>' + dd_html +
+            f'<form method="post" action="/journal/balance{tok}" style="margin-top:6px">'
             f'<input type="hidden" name="account_id" value="{a["id"]}">'
-            f'<input name="balance" placeholder="nouveau solde" inputmode="decimal" '
-            f'style="width:140px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;'
-            f'border-radius:6px;padding:6px"> '
-            f'<button class="btn">Mettre \u00e0 jour</button></form></div>')
+            f'<input name="balance" placeholder="nouveau solde" inputmode="decimal" {_INP} size="10"> '
+            f'<button class="btn">Solde</button></form></div>')
 
-    # ── Trades ouverts ──
-    def trow(t, closed=False):
-        r, of, exits = _trade_r(t)
-        ex_txt = " \u00b7 ".join(f"{e.get('label','exit')} {e['price']} ({int(e['frac']*100)}%)" for e in exits) or "\u2014"
-        pnl = (t["pnl_usd"] if closed and t["pnl_usd"] is not None
-               else (r * (t["risk_usd"] or 0.0)))
-        rc = "var(--grn)" if r > 0 else ("var(--red)" if r < 0 else "var(--dim)")
-        dev = f'<div class="note">\u26a0\ufe0f D\u00e9viation : {esc(t["deviation"])}</div>' if t["deviation"] else ""
-        actions = ""
-        if not closed:
-            actions = (
-                f'<form method="post" action="/journal/trade/{t["id"]}/exit{tok}" style="margin-top:6px">'
-                f'<input name="price" placeholder="prix" inputmode="decimal" style="width:90px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
-                f'<input name="pct" placeholder="%" inputmode="numeric" style="width:50px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
-                f'<input name="label" placeholder="TP1/BE/stop" style="width:90px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
-                f'<button class="btn">Sortie partielle</button></form>'
-                f'<form method="post" action="/journal/trade/{t["id"]}/close{tok}" style="margin-top:4px">'
-                f'<input name="price" placeholder="prix de cl\u00f4ture du reste" inputmode="decimal" style="width:170px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:4px"> '
-                f'<button class="btn">Cl\u00f4turer</button></form>')
-        when = (t["closed_ts"] or t["opened_ts"] or "")[:16].replace("T", " ")
-        return (f'<div class="card"><b>{esc(t["asset"])}</b> \u00b7 {esc(t["side"])} \u00b7 {esc(t["acct"])}'
-                f' \u00b7 <span style="color:var(--dim)">{when}</span><br>'
-                f'Entr\u00e9e {t["entry"]} \u00b7 SL {t["sl_initial"]} \u00b7 risque {money(t["risk_usd"] or 0)} $'
-                f' \u00b7 setup : {esc(t["setup"] or "?")}<br>'
-                f'Sorties : {ex_txt}<br>'
-                f'<b style="color:{rc}">R = {r:+.2f}</b> \u00b7 P&L indicatif {pnl:+,.0f} $'
-                + (f' \u00b7 reste ouvert {int(of*100)}%' if not closed else '')
-                + dev + actions + '</div>')
+    # ═ Navigation mois + filtre compte ═
+    y, m = int(month[:4]), int(month[5:7])
+    pm = f"{y-1}-12" if m == 1 else f"{y}-{m-1:02d}"
+    nm = f"{y+1}-01" if m == 12 else f"{y}-{m+1:02d}"
+    MOIS = ["", "JANVIER", "FÉVRIER", "MARS", "AVRIL", "MAI", "JUIN", "JUILLET",
+            "AOÛT", "SEPTEMBRE", "OCTOBRE", "NOVEMBRE", "DÉCEMBRE"]
 
-    open_html = "".join(trow(t) for t in open_tr) or '<div class="note">Aucun trade ouvert.</div>'
-    closed_html = "".join(trow(t, True) for t in closed_tr) or '<div class="note">Aucun trade cl\u00f4tur\u00e9.</div>'
+    def _u(mm, aa=None):
+        aa = acct_f if aa is None else aa
+        u = f"/journal{tok}{amp}m={mm}"
+        if aa:
+            u += f"&acct={aa}"
+        return u
+    nav = (f'<div class="chips"><a class="chip" href="{_u(pm)}">\u2190 {MOIS[int(pm[5:7])]}</a>'
+           f'<span class="chip active">{MOIS[m]} {y}</span>'
+           f'<a class="chip" href="{_u(nm)}">{MOIS[int(nm[5:7])]} \u2192</a></div>'
+           '<div class="chips"><a class="chip' + ('' if acct_f else ' active') + f'" href="{_u(month, "")}">Tous comptes</a>'
+           + "".join(f'<a class="chip{" active" if acct_f == str(a["id"]) else ""}" href="{_u(month, a["id"])}">{esc(a["name"])}</a>'
+                     for a in accts) + '</div>')
 
-    # ── Formulaire nouveau trade + pré-remplissage ──
-    pre_links = "".join(
-        f'<a class="chip" href="/journal{tok}{amp}prefill={r["id"]}">#{r["id"]} {esc(r["asset"] or "?")} '
-        f'{esc(r["timeframe"] or "")} @{r["price"]}</a>' for r in recents) or '<span class="note">aucune</span>'
+    # ═ Tableau mensuel (modèle Kasper : P&L $, %, capital courant, leçon, image) ═
+    cap_start = None
+    if acct_f:
+        a0 = next((a for a in accts if str(a["id"]) == acct_f), None)
+        if a0:
+            future = sum(t["pnl_usd"] or 0 for t in all_closed
+                         if t["account_id"] == int(acct_f) and (t["closed_ts"] or "") >= lo)
+            cap_start = (a0["balance"] or 0.0) - future
+    running = cap_start
+    rows_html, tot_p, tot_l, wins, losses = [], 0.0, 0.0, 0, 0
+    for i, t in enumerate(closed, 1):
+        pnl = t["pnl_usd"] or 0.0
+        if pnl >= 0:
+            tot_p += pnl; wins += 1
+        else:
+            tot_l += pnl; losses += 1
+        pc = ""
+        if running is not None and running > 0:
+            pc = f"{100*pnl/running:+.2f}%"
+            running += pnl
+        r, _, _ = _trade_r(t)
+        rtxt = f"{r:+.2f}R" if r is not None else "\u2014"
+        col = "var(--grn)" if pnl >= 0 else "var(--red)"
+        img = f' \u00b7 <a href="{esc(t["screenshot"])}" target="_blank">\U0001F4F7 chart</a>' if t["screenshot"] else ""
+        dev = f'<br><span style="color:var(--gold)">\u26a0\ufe0f {esc(t["deviation"])}</span>' if t["deviation"] else ""
+        note = f'<br><span class="note" style="padding:0;border:0;background:none">{esc(t["note"])}</span>' if t["note"] else ""
+        rows_html.append(
+            f'<tr><td>{i}</td><td>{(t["closed_ts"] or "")[:10]}</td><td><b>{esc(t["asset"] or "?")}</b> {esc(t["side"] or "")}</td>'
+            f'<td>{esc(t["setup"] or "?")}</td>'
+            f'<td style="font-weight:700;color:{col}">{pnl:+,.0f} $</td>'
+            f'<td style="color:{col}">{pc}</td><td>{_money(running) + " $" if running is not None else "\u2014"}</td>'
+            f'<td>{rtxt}</td><td style="max-width:230px">{esc(t["acct"])}{img}{dev}{note}</td></tr>')
+    n_cl = wins + losses
+    wr = f"{100*wins/n_cl:.0f}%" if n_cl else "\u2014"
+    ratio = f"{(tot_p/abs(tot_l)):.2f}" if tot_l else "\u221e" if tot_p else "\u2014"
+    res = tot_p + tot_l
+    res_pc = f" ({100*res/cap_start:+.2f}%)" if cap_start else ""
+    month_tbl = (
+        '<div class="card"><h2>' + MOIS[m] + f' {y}' + (f' \u2014 capital d\u00e9part {_money(cap_start)} $' if cap_start else '') + '</h2>'
+        '<table><thead><tr><th>#</th><th>Date</th><th>Trade</th><th>Strat\u00e9gie</th><th>$ P&L</th>'
+        '<th>%</th><th>Capital</th><th>R</th><th>Compte \u00b7 le\u00e7on</th></tr></thead><tbody>'
+        + ("".join(rows_html) or '<tr><td colspan="9" class="note">Aucun trade cl\u00f4tur\u00e9 ce mois.</td></tr>')
+        + '</tbody></table>'
+        + f'<div class="note" style="margin-top:8px"><b>R\u00e9sultat : <span style="color:{"var(--grn)" if res>=0 else "var(--red)"}">{res:+,.0f} $</span>{res_pc}</b>'
+          f' \u00b7 profits {tot_p:+,.0f} \u00b7 pertes {tot_l:+,.0f} \u00b7 ratio {ratio}'
+          f' \u00b7 win rate {wr} ({wins}W/{losses}L)</div></div>')
+
+    # ═ Équity (cumul P&L clôturés, tous mois) ═
+    eq_pts, cum = [], 0.0
+    for t in all_closed:
+        if acct_f and t["account_id"] != int(acct_f):
+            continue
+        cum += t["pnl_usd"] or 0.0
+        eq_pts.append(cum)
+    eq_html = ""
+    if len(eq_pts) >= 2:
+        w, h = 700, 120
+        mn, mx = min(min(eq_pts), 0), max(max(eq_pts), 0)
+        rng = (mx - mn) or 1
+        pts = " ".join(f"{i*w/(len(eq_pts)-1):.1f},{h-(v-mn)/rng*h:.1f}" for i, v in enumerate(eq_pts))
+        zero_y = h - (0 - mn) / rng * h
+        eq_html = ('<div class="card"><h2>\u00c9quity \u2014 P&L cumul\u00e9 (' + str(len(eq_pts)) + ' trades)</h2>'
+                   f'<svg viewBox="0 0 {w} {h}" style="width:100%;height:auto">'
+                   f'<line x1="0" y1="{zero_y:.1f}" x2="{w}" y2="{zero_y:.1f}" stroke="#30363d" stroke-dasharray="4 4"/>'
+                   f'<polyline points="{pts}" fill="none" stroke="{"#3fb950" if cum >= 0 else "#f85149"}" stroke-width="2"/></svg>'
+                   f'<div class="note">Cumul : <b>{cum:+,.0f} $</b> (P&L saisis \u2014 le solde des comptes reste ta v\u00e9rit\u00e9)</div></div>')
+
+    # ═ Stats par stratégie ═
+    strat = {}
+    for t in all_closed:
+        if acct_f and t["account_id"] != int(acct_f):
+            continue
+        k = (t["setup"] or "?").strip() or "?"
+        d = strat.setdefault(k, {"n": 0, "w": 0, "pnl": 0.0})
+        d["n"] += 1
+        d["pnl"] += t["pnl_usd"] or 0.0
+        if (t["pnl_usd"] or 0) >= 0:
+            d["w"] += 1
+    strat_rows = "".join(
+        f'<tr><td>{esc(k)}</td><td>{d["n"]}</td><td>{100*d["w"]/d["n"]:.0f}%</td>'
+        f'<td style="color:{"var(--grn)" if d["pnl"]>=0 else "var(--red)"};font-weight:700">{d["pnl"]:+,.0f} $</td></tr>'
+        for k, d in sorted(strat.items(), key=lambda x: -x[1]["pnl"]))
+    strat_html = ('<div class="card"><h2>Par strat\u00e9gie</h2><table><thead><tr><th>Strat\u00e9gie</th>'
+                  '<th>N</th><th>Win rate</th><th>P&L</th></tr></thead><tbody>' + strat_rows
+                  + '</tbody></table></div>') if strat_rows else ""
+
+    # ═ Formulaires : saisie rapide clôturé + trade ouvert (prefill robot) ═
     acct_opts = "".join(f'<option value="{a["id"]}">{esc(a["name"])}</option>' for a in accts)
-    inp = 'style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px;margin:2px;width:130px"'
-    form = (
-        f'<div class="card"><h2>Nouveau trade</h2>'
-        f'<div class="chips">{pre_links}</div>'
+    quick = (
+        f'<div class="card"><h2>\u270f\ufe0f Trade clôturé (saisie rapide)</h2>'
+        f'<form method="post" action="/journal/trade_closed{tok}">'
+        f'<select name="account_id" {_INP}>{acct_opts}</select>'
+        f'<input name="asset" placeholder="actif" {_INP} size="9">'
+        f'<select name="side" {_INP}><option>LONG</option><option>SHORT</option></select>'
+        f'<input name="setup" placeholder="strat\u00e9gie / setup" {_INP} size="18">'
+        f'<input name="pnl" placeholder="$ P&L (\u2212 si perte)" inputmode="decimal" {_INP} size="12">'
+        f'<input name="date" placeholder="AAAA-MM-JJ (vide=auj.)" {_INP} size="14">'
+        f'<input name="screenshot" placeholder="lien screenshot TradingView" {_INP} size="26">'
+        f'<input name="note" placeholder="commentaire / le\u00e7on" {_INP} style="width:96%">'
+        f'<label class="note" style="display:block;margin:4px 0">'
+        f'<input type="checkbox" name="apply_balance" value="1" checked> appliquer au solde du compte</label>'
+        f'<button class="btn">Enregistrer</button></form></div>')
+    pre_links = "".join(
+        f'<a class="chip" href="/journal{tok}{amp}m={month}{"&acct="+acct_f if acct_f else ""}&prefill={r["id"]}">'
+        f'#{r["id"]} {esc(r["asset"] or "?")} {esc(r["timeframe"] or "")} @{r["price"]}</a>' for r in recents)
+    open_form = (
+        f'<div class="card"><h2>\U0001F4CB Trade ouvert (depuis un ticket du robot)</h2>'
+        f'<div class="chips">{pre_links or "<span class=note>aucune alerte ticketable r\u00e9cente</span>"}</div>'
         f'<form method="post" action="/journal/trade{tok}">'
         f'<input type="hidden" name="alert_id" value="{pf["alert_id"]}">'
-        f'<select name="account_id" {inp}>{acct_opts}</select>'
-        f'<input name="asset" placeholder="actif" value="{esc(str(pf["asset"]))}" {inp}>'
-        f'<select name="side" {inp}><option{" selected" if pf["side"]=="LONG" else ""}>LONG</option>'
+        f'<select name="account_id" {_INP}>{acct_opts}</select>'
+        f'<input name="asset" placeholder="actif" value="{esc(str(pf["asset"]))}" {_INP} size="9">'
+        f'<select name="side" {_INP}><option{" selected" if pf["side"]=="LONG" else ""}>LONG</option>'
         f'<option{" selected" if pf["side"]=="SHORT" else ""}>SHORT</option></select>'
-        f'<input name="entry" placeholder="entr\u00e9e" value="{pf["entry"]}" inputmode="decimal" {inp}>'
-        f'<input name="sl" placeholder="SL initial" value="{pf["sl"]}" inputmode="decimal" {inp}>'
-        f'<input name="risk_usd" placeholder="risque $" inputmode="decimal" {inp}>'
-        f'<input name="setup" placeholder="setup" value="{esc(pf["setup"])}" {inp}>'
-        f'<input name="deviation" placeholder="d\u00e9viation vs ticket (pourquoi ?)" style="background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px;margin:2px;width:97%">'
-        f'<br><button class="btn" style="margin-top:6px">Enregistrer le trade</button></form>'
-        f'<div class="note">Pr\u00e9-remplissage : clique une alerte ci-dessus (entr\u00e9e=Fib 1, SL au /sl_fib courant). '
-        f'Si tu modifies entr\u00e9e/SL, dis pourquoi dans \u00ab d\u00e9viation \u00bb \u2014 c\u2019est la m\u00e9moire de tes \u00e9carts au plan.</div></div>')
+        f'<input name="entry" placeholder="entr\u00e9e" value="{pf["entry"]}" inputmode="decimal" {_INP} size="9">'
+        f'<input name="sl" placeholder="SL" value="{pf["sl"]}" inputmode="decimal" {_INP} size="9">'
+        f'<input name="risk_usd" placeholder="risque $" inputmode="decimal" {_INP} size="8">'
+        f'<input name="setup" placeholder="setup" value="{esc(pf["setup"])}" {_INP} size="20">'
+        f'<input name="deviation" placeholder="d\u00e9viation vs ticket \u2014 pourquoi ?" {_INP} style="width:96%">'
+        f'<button class="btn" style="margin-top:4px">Ouvrir le trade</button></form></div>')
+
+    # ═ Trades ouverts ═
+    op_html = ""
+    for t in open_tr:
+        r, of, exits = _trade_r(t)
+        ex_txt = " \u00b7 ".join(f'{e.get("label","exit")} {e["price"]} ({int(e["frac"]*100)}%)' for e in exits) or "\u2014"
+        rtxt = f"{r:+.2f}R" if r is not None else "?"
+        op_html += (
+            f'<div class="card"><b>{esc(t["asset"])}</b> {esc(t["side"])} \u00b7 {esc(t["acct"])} \u00b7 '
+            f'entr\u00e9e {t["entry"]} \u00b7 SL {t["sl_initial"]} \u00b7 risque {_money(t["risk_usd"] or 0)} $'
+            f'<br>Sorties : {ex_txt} \u00b7 <b>{rtxt}</b> \u00b7 reste {int(of*100)}%'
+            + (f'<br><span style="color:var(--gold)">\u26a0\ufe0f {esc(t["deviation"])}</span>' if t["deviation"] else "")
+            + f'<form method="post" action="/journal/trade/{t["id"]}/exit{tok}" style="margin-top:6px">'
+              f'<input name="price" placeholder="prix" inputmode="decimal" {_INP} size="8">'
+              f'<input name="pct" placeholder="%" inputmode="numeric" {_INP} size="4">'
+              f'<input name="label" placeholder="TP1/BE" {_INP} size="7">'
+              f'<button class="btn">Sortie partielle</button></form>'
+              f'<form method="post" action="/journal/trade/{t["id"]}/close{tok}" style="margin-top:4px">'
+              f'<input name="price" placeholder="prix du reste" inputmode="decimal" {_INP} size="10">'
+              f'<input name="pnl" placeholder="$ P&L r\u00e9el (broker)" inputmode="decimal" {_INP} size="12">'
+              f'<input name="note" placeholder="le\u00e7on" {_INP} size="16">'
+              f'<label class="note"><input type="checkbox" name="apply_balance" value="1" checked> \u2192 solde</label> '
+              f'<button class="btn">Cl\u00f4turer</button></form></div>')
+    open_sec = f'<div class="card"><h2>Trades ouverts ({len(open_tr)})</h2>{op_html}</div>' if open_tr else ""
 
     head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab \u2014 Journal</title>' + DASH_CSS + '</head><body>')
     body = ('<h1>\U0001F4D2 Journal de trading</h1>'
-            '<div class="sub">R g\u00e9om\u00e9trique broker-agnostique \u00b7 P&L indicatif = R \u00d7 risque \u00b7 '
-            'le SOLDE des comptes est ta v\u00e9rit\u00e9, mets-le \u00e0 jour \u00e0 la main.</div>'
-            '<div class="grid">' + acct_cards + '</div>'
-            + form
-            + '<div class="card"><h2>Trades ouverts</h2>' + open_html + '</div>'
-            + '<div class="card"><h2>Historique (30 derniers)</h2>' + closed_html + '</div>')
+            '<div class="sub">P&L en $ = ta saisie (v\u00e9rit\u00e9 broker) \u00b7 % et capital courant calcul\u00e9s \u00b7 '
+            'R affich\u00e9 quand entr\u00e9e/SL connus.</div>'
+            '<div class="grid">' + cards + '</div>' + nav + month_tbl + open_sec
+            + quick + open_form + eq_html + strat_html)
     return head + body + '</body></html>'
 
 
@@ -1901,6 +2049,51 @@ def journal_balance():
         return ("bad request", 400)
     with db() as conn:
         conn.execute("UPDATE accounts SET balance=? WHERE id=?", (bal, aid))
+        conn.execute("UPDATE accounts SET hwm=? WHERE id=? AND dd_max IS NOT NULL "
+                     "AND (hwm IS NULL OR hwm < ?)", (bal, aid, bal))
+        conn.commit()
+    return redirect("/journal" + _tok())
+
+
+@app.route("/journal/account", methods=["POST"])
+def journal_account():
+    if not check_secret():
+        return ("unauthorized", 403)
+    try:
+        aid = int(request.form["account_id"])
+        hwm = float(request.form["hwm"].replace(",", ".").replace(" ", ""))
+    except (KeyError, ValueError):
+        return ("bad request", 400)
+    with db() as conn:
+        conn.execute("UPDATE accounts SET hwm=? WHERE id=?", (hwm, aid))
+        conn.commit()
+    return redirect("/journal" + _tok())
+
+
+@app.route("/journal/trade_closed", methods=["POST"])
+def journal_trade_closed():
+    """Saisie rapide d'un trade déjà clôturé (le flux principal du modèle 2026)."""
+    if not check_secret():
+        return ("unauthorized", 403)
+    f = request.form
+    try:
+        pnl = float(f["pnl"].replace(",", ".").replace(" ", ""))
+        aid = int(f["account_id"])
+    except (KeyError, ValueError):
+        return ("bad request", 400)
+    d = (f.get("date") or "").strip()
+    ts = (d + "T12:00:00+00:00") if re.match(r"^\d{4}-\d{2}-\d{2}$", d) else now_iso()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO trades (account_id,opened_ts,closed_ts,asset,grp,side,setup,"
+            "pnl_usd,status,note,screenshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (aid, ts, ts, f.get("asset"), get_asset_group(f.get("asset") or ""),
+             f.get("side", "LONG"), f.get("setup"), pnl, "closed",
+             (f.get("note") or None), (f.get("screenshot") or None)))
+        if f.get("apply_balance"):
+            conn.execute("UPDATE accounts SET balance = COALESCE(balance,0) + ? WHERE id=?", (pnl, aid))
+            conn.execute("UPDATE accounts SET hwm=balance WHERE id=? AND dd_max IS NOT NULL "
+                         "AND (hwm IS NULL OR hwm < balance)", (aid,))
         conn.commit()
     return redirect("/journal" + _tok())
 
@@ -1916,14 +2109,14 @@ def journal_trade_new():
         risk = float((f.get("risk_usd") or "0").replace(",", ".") or 0)
     except (KeyError, ValueError):
         return ("bad request", 400)
-    grp = get_asset_group(f.get("asset") or "")
     with db() as conn:
         conn.execute(
             "INSERT INTO trades (account_id,opened_ts,asset,grp,side,entry,sl_initial,"
             "risk_usd,setup,deviation,alert_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (int(f["account_id"]), now_iso(), f.get("asset"), grp,
-             f.get("side", "LONG"), entry, sl, risk, f.get("setup"),
-             (f.get("deviation") or None), (int(f["alert_id"]) if f.get("alert_id") else None)))
+            (int(f["account_id"]), now_iso(), f.get("asset"),
+             get_asset_group(f.get("asset") or ""), f.get("side", "LONG"), entry, sl,
+             risk, f.get("setup"), (f.get("deviation") or None),
+             (int(f["alert_id"]) if f.get("alert_id") else None)))
         conn.commit()
     return redirect("/journal" + _tok())
 
@@ -1937,47 +2130,58 @@ def journal_trade_exit(tid):
         frac = min(1.0, max(0.01, float(request.form["pct"]) / 100.0))
     except (KeyError, ValueError):
         return ("bad request", 400)
-    label = request.form.get("label") or "exit"
     with db() as conn:
-        t = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
-        if not t or t["status"] != "open":
+        t = conn.execute("SELECT * FROM trades WHERE id=? AND status='open'", (tid,)).fetchone()
+        if not t:
             return ("not found", 404)
         exits = json.loads(t["exits"] or "[]")
-        already = sum(e["frac"] for e in exits)
-        frac = min(frac, max(0.0, 1.0 - already))
-        exits.append({"ts": now_iso(), "price": price, "frac": round(frac, 4), "label": label})
+        frac = min(frac, max(0.0, 1.0 - sum(e["frac"] for e in exits)))
+        exits.append({"ts": now_iso(), "price": price, "frac": round(frac, 4),
+                      "label": request.form.get("label") or "exit"})
         conn.execute("UPDATE trades SET exits=? WHERE id=?", (json.dumps(exits), tid))
-        # cl\u00f4ture auto si tout est sorti
-        if sum(e["frac"] for e in exits) >= 0.999:
-            t2 = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
-            r, _, _ = _trade_r(t2)
-            conn.execute("UPDATE trades SET status='closed', closed_ts=?, r_realized=?, pnl_usd=? WHERE id=?",
-                         (now_iso(), round(r, 4), round(r * (t["risk_usd"] or 0.0), 2), tid))
         conn.commit()
     return redirect("/journal" + _tok())
 
 
 @app.route("/journal/trade/<int:tid>/close", methods=["POST"])
 def journal_trade_close(tid):
+    """Clôture : prix du reste + P&L $ réel optionnel (prioritaire sur R×risque)."""
     if not check_secret():
         return ("unauthorized", 403)
-    try:
-        price = float(request.form["price"].replace(",", "."))
-    except (KeyError, ValueError):
-        return ("bad request", 400)
+    f = request.form
     with db() as conn:
-        t = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
-        if not t or t["status"] != "open":
+        t = conn.execute("SELECT * FROM trades WHERE id=? AND status='open'", (tid,)).fetchone()
+        if not t:
             return ("not found", 404)
         exits = json.loads(t["exits"] or "[]")
         rest = max(0.0, 1.0 - sum(e["frac"] for e in exits))
-        if rest > 0:
-            exits.append({"ts": now_iso(), "price": price, "frac": round(rest, 4), "label": "close"})
+        if rest > 0 and f.get("price"):
+            try:
+                exits.append({"ts": now_iso(), "price": float(f["price"].replace(",", ".")),
+                              "frac": round(rest, 4), "label": "close"})
+            except ValueError:
+                pass
         conn.execute("UPDATE trades SET exits=? WHERE id=?", (json.dumps(exits), tid))
         t2 = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
         r, _, _ = _trade_r(t2)
-        conn.execute("UPDATE trades SET status='closed', closed_ts=?, r_realized=?, pnl_usd=? WHERE id=?",
-                     (now_iso(), round(r, 4), round(r * (t["risk_usd"] or 0.0), 2), tid))
+        pnl = None
+        if f.get("pnl"):
+            try:
+                pnl = float(f["pnl"].replace(",", ".").replace(" ", ""))
+            except ValueError:
+                pnl = None
+        if pnl is None:
+            pnl = round((r or 0.0) * (t["risk_usd"] or 0.0), 2)
+        conn.execute(
+            "UPDATE trades SET status='closed', closed_ts=?, r_realized=?, pnl_usd=?, "
+            "note=COALESCE(?, note) WHERE id=?",
+            (now_iso(), (round(r, 4) if r is not None else None), pnl,
+             (f.get("note") or None), tid))
+        if f.get("apply_balance"):
+            conn.execute("UPDATE accounts SET balance = COALESCE(balance,0) + ? WHERE id=?",
+                         (pnl, t["account_id"]))
+            conn.execute("UPDATE accounts SET hwm=balance WHERE id=? AND dd_max IS NOT NULL "
+                         "AND (hwm IS NULL OR hwm < balance)", (t["account_id"],))
         conn.commit()
     return redirect("/journal" + _tok())
 
@@ -2933,7 +3137,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.22",
+        "version": "2.7.23",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
