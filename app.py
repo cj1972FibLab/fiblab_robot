@@ -2147,6 +2147,3 @@ def stats():
         "by_type":  enrich(by_type),
         "by_tf":    enrich(by_tf),
     })
-
-
-@ap
