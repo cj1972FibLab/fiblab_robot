@@ -1,7 +1,23 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.23)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.25)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.25 "Filtres personnels par destinataire" :       ║
+║   • /assets sol,xau | all : ne recevoir que ses actifs       ║
+║   • /score 12 : seuil de score minimum personnel             ║
+║   • /signaux origin | all : ne recevoir que les Origin Hold  ║
+║     ACTIVATED (le seul signal validé) — tickets inclus       ║
+║   • Persistés en base, indépendants par chat_id              ║
+║                                                              ║
+║  Patch v2.7.24 "Risque & capital PAR UTILISATEUR" :          ║
+║   • /capital 360000 et /risque 0.5 (alias /risk) : chaque    ║
+║     destinataire règle son capital et son % de risque,       ║
+║     persistés en base (survivent aux redéploiements)         ║
+║   • Le ticket d'ordre est désormais envoyé À CHAQUE          ║
+║     destinataire éligible, dimensionné sur SON profil        ║
+║     (capital, risque, langue) — plus seulement à l'admin     ║
+║   • Garde-fou : risque borné à 5% max                        ║
 ║                                                              ║
 ║  Patch v2.7.23 "Journal v2 — modèle Journal De Trading 2026":║
 ║   • Vue MENSUELLE par compte : $ P&L, % du capital, capital  ║
@@ -276,10 +292,16 @@ def init_db():
                 tf_custom TEXT
             )
         """)
-        try:  # v2.7.19 : migration lang sur base existante
-            conn.execute("ALTER TABLE profiles ADD COLUMN lang TEXT DEFAULT 'fr'")
-        except Exception:
-            pass
+        for _mig in ("ALTER TABLE profiles ADD COLUMN lang TEXT DEFAULT 'fr'",
+                     "ALTER TABLE profiles ADD COLUMN capital REAL",
+                     "ALTER TABLE profiles ADD COLUMN risk_pct REAL",
+                     "ALTER TABLE profiles ADD COLUMN assets TEXT",
+                     "ALTER TABLE profiles ADD COLUMN score_min INTEGER",
+                     "ALTER TABLE profiles ADD COLUMN signals TEXT"):
+            try:
+                conn.execute(_mig)
+            except Exception:
+                pass
         # v2.7.21 : JOURNAL DE TRADING
         conn.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
@@ -376,6 +398,11 @@ def load_profiles():
                     "paused":    bool(row["paused"]),
                     "mode":      row["mode"],
                     "lang":      (row["lang"] if "lang" in row.keys() else None) or "fr",
+                    "capital":   (row["capital"] if "capital" in row.keys() else None) or TICKET_CAPITAL,
+                    "risk_pct":  (row["risk_pct"] if "risk_pct" in row.keys() else None) or TICKET_RISK_PCT,
+                    "assets":    (json.loads(row["assets"]) if "assets" in row.keys() and row["assets"] else None),
+                    "score_min": (row["score_min"] if "score_min" in row.keys() else None) or 0,
+                    "signals":   (row["signals"] if "signals" in row.keys() else None) or "all",
                     "tf_custom": json.loads(row["tf_custom"] or "{}"),
                 }
     except Exception as e:
@@ -385,12 +412,19 @@ def load_profiles():
 def save_profile(chat_id: str, profile: dict):
     with db() as conn:
         conn.execute(
-            "INSERT INTO profiles (chat_id,mode,paused,lang,tf_custom) VALUES (?,?,?,?,?) "
+            "INSERT INTO profiles (chat_id,mode,paused,lang,capital,risk_pct,assets,"
+            "score_min,signals,tf_custom) VALUES (?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "mode=excluded.mode, paused=excluded.paused, lang=excluded.lang, "
-            "tf_custom=excluded.tf_custom",
+            "capital=excluded.capital, risk_pct=excluded.risk_pct, "
+            "assets=excluded.assets, score_min=excluded.score_min, "
+            "signals=excluded.signals, tf_custom=excluded.tf_custom",
             (chat_id, profile["mode"], int(profile["paused"]),
-             profile.get("lang", "fr"), json.dumps(profile["tf_custom"]))
+             profile.get("lang", "fr"), profile.get("capital", TICKET_CAPITAL),
+             profile.get("risk_pct", TICKET_RISK_PCT),
+             (json.dumps(profile["assets"]) if profile.get("assets") else None),
+             int(profile.get("score_min", 0)), profile.get("signals", "all"),
+             json.dumps(profile["tf_custom"]))
         )
         conn.commit()
 
@@ -403,6 +437,11 @@ def default_profile():
         "paused": False,
         "mode": "swing",
         "lang": "fr",
+        "capital": TICKET_CAPITAL,      # v2.7.24 : capital de dimensionnement, par utilisateur
+        "risk_pct": TICKET_RISK_PCT,    # v2.7.24 : % de risque par trade, par utilisateur
+        "assets": None,                 # v2.7.25 : liste de groupes suivis (None = tous)
+        "score_min": 0,                 # v2.7.25 : score minimum pour être notifié
+        "signals": "all",               # v2.7.25 : all | origin (Origin Hold ACTIVATED seul)
         "tf_custom": {"72": False, "90": False, "96": False, "144": False, "160": False, "288": False},
     }
 
@@ -879,6 +918,20 @@ def _ticket_tf_ok(tf):
     return normalize_timeframe(str(tf or "").strip()).upper() in _ticket_tf_set()
 
 
+
+
+def user_filter(parsed, scoring, group, profile):
+    """v2.7.25 — filtres personnels du destinataire. (None, None) = passe."""
+    assets = profile.get("assets")
+    if assets and group not in assets:
+        return False, f"actif '{group}' hors filtre"
+    if scoring["score"] < (profile.get("score_min") or 0):
+        return False, f"score {scoring['score']} < seuil {profile['score_min']}"
+    if profile.get("signals") == "origin" and \
+            "origin hold activated" not in (parsed.get("type") or "").lower():
+        return False, "filtre 'origin' : type ignoré"
+    return True, None
+
 def should_notify(parsed: dict, scoring: dict, profile: dict) -> tuple:
     alert_type = (parsed.get("type") or "").lower()
     tf         = (parsed.get("timeframe") or "").upper()
@@ -1146,6 +1199,111 @@ def handle_telegram_command(text: str, chat_id: str):
     elif cmd == "/journal":
         base = "https://acceptable-vision-production-a0df.up.railway.app/journal"
         msg = f"\U0001F4D2 <a href='{base}{('?token=' + WEBHOOK_SECRET) if WEBHOOK_SECRET else ''}'>Ouvrir le journal</a>"
+
+    elif cmd == "/assets":
+        _en = profile.get("lang") == "en"
+        _alias = {"sol": "solana", "gold": "xau", "or": "xau", "de30": "dax",
+                  "de40": "dax", "bitcoin": "btc", "wbtc": "btc"}
+        if arg in ("all", "tous", "tout"):
+            profile["assets"] = None
+            save_profile(chat_id, profile)
+            msg = "\u2705 All assets." if _en else "\u2705 Tous les actifs."
+        elif arg:
+            toks = [t.strip() for t in " ".join(parts[1:]).replace(";", ",").split(",") if t.strip()]
+            groups, bad = [], []
+            for t in toks:
+                g = _alias.get(t, t)
+                (groups if g in ASSET_META else bad).append(g)
+            if groups and not bad:
+                profile["assets"] = sorted(set(groups))
+                save_profile(chat_id, profile)
+                lst = ", ".join(profile["assets"])
+                msg = (f"\u2705 You will only receive: <b>{lst}</b>" if _en
+                       else f"\u2705 Tu ne recevras que : <b>{lst}</b>")
+            else:
+                ok = ", ".join(sorted(ASSET_META.keys()))
+                msg = ((f"\u26a0\ufe0f Unknown: {', '.join(bad)}. Valid: {ok}" if _en
+                        else f"\u26a0\ufe0f Inconnu : {', '.join(bad)}. Valides : {ok}") if bad
+                       else f"Usage : /assets sol,xau \u00b7 /assets all")
+        else:
+            cur = ", ".join(profile["assets"]) if profile.get("assets") else ("all" if _en else "tous")
+            msg = (f"Assets: <b>{cur}</b>\nUsage : /assets sol,btc \u00b7 /assets all" if _en
+                   else f"Actifs suivis : <b>{cur}</b>\nUsage : /assets sol,btc \u00b7 /assets all")
+
+    elif cmd == "/score":
+        _en = profile.get("lang") == "en"
+        try:
+            v = int(arg)
+        except ValueError:
+            v = None
+        if v is not None and 0 <= v <= 20:
+            profile["score_min"] = v
+            save_profile(chat_id, profile)
+            msg = (f"\U0001F3AF Minimum score: <b>{v}</b> (0 = everything)." if _en
+                   else f"\U0001F3AF Score minimum : <b>{v}</b> (0 = tout).")
+        else:
+            msg = (f"Current minimum score: <b>{profile.get('score_min', 0)}</b>\nUsage : /score 12 \u00b7 /score 0" if _en
+                   else f"Score minimum actuel : <b>{profile.get('score_min', 0)}</b>\nUsage : /score 12 \u00b7 /score 0")
+
+    elif cmd in ("/signaux", "/signals"):
+        _en = profile.get("lang") == "en"
+        if arg in ("origin", "origine"):
+            profile["signals"] = "origin"
+            save_profile(chat_id, profile)
+            msg = ("\U0001F3AF Only <b>Origin Hold ACTIVATED</b> \u2014 the only validated signal." if _en
+                   else "\U0001F3AF Uniquement <b>Origin Hold ACTIVATED</b> \u2014 le seul signal validé.")
+        elif arg in ("all", "tous", "tout"):
+            profile["signals"] = "all"
+            save_profile(chat_id, profile)
+            msg = ("\u2705 All confirmed signals (per /ideal filter)." if _en
+                   else "\u2705 Tous les signaux confirmés (selon le filtre /ideal).")
+        else:
+            cur = profile.get("signals", "all")
+            msg = (f"Signals: <b>{cur}</b>\nUsage : /signals origin \u00b7 /signals all" if _en
+                   else f"Signaux : <b>{cur}</b>\nUsage : /signaux origin \u00b7 /signaux all")
+
+    elif cmd in ("/capital", "/risque", "/risk"):
+        _en = profile.get("lang") == "en"
+
+        def _pfv(s):
+            try:
+                return float(s.replace(",", ".").replace(" ", "").replace("k", "000").replace("K", "000"))
+            except (ValueError, AttributeError):
+                return None
+        v = _pfv(arg)
+        if cmd == "/capital":
+            if v is not None and 100 <= v <= 100000000:
+                profile["capital"] = v
+                save_profile(chat_id, profile)
+                r = profile.get("risk_pct", TICKET_RISK_PCT)
+                msg = ((f"\U0001F4B0 Capital set to <b>{v:,.0f} $</b> \u2014 tickets sized at "
+                        f"{r:g}% = <b>{v*r/100:,.0f} $</b> risk per trade.")
+                       if _en else
+                       (f"\U0001F4B0 Capital r\u00e9gl\u00e9 \u00e0 <b>{v:,.0f} $</b> \u2014 tickets "
+                        f"dimensionn\u00e9s \u00e0 {r:g}% = <b>{v*r/100:,.0f} $</b> de risque par trade.")).replace(",", "\u202f")
+            else:
+                c = profile.get("capital", TICKET_CAPITAL)
+                msg = (f"Current capital: <b>{c:,.0f} $</b>\nUsage : /capital 360000 (ou 360k)"
+                       if _en else
+                       f"Capital actuel : <b>{c:,.0f} $</b>\nUsage : /capital 360000 (ou 360k)").replace(",", "\u202f")
+        else:
+            if v is not None and 0.01 <= v <= 5.0:
+                profile["risk_pct"] = v
+                save_profile(chat_id, profile)
+                c = profile.get("capital", TICKET_CAPITAL)
+                msg = ((f"\U0001F3AF Risk set to <b>{v:g}%</b> = <b>{c*v/100:,.0f} $</b> per trade "
+                        f"(capital {c:,.0f} $).")
+                       if _en else
+                       (f"\U0001F3AF Risque r\u00e9gl\u00e9 \u00e0 <b>{v:g}%</b> = <b>{c*v/100:,.0f} $</b> par trade "
+                        f"(capital {c:,.0f} $).")).replace(",", "\u202f")
+            elif v is not None:
+                msg = ("\u26a0\ufe0f Risk must be between 0.01% and 5%." if _en
+                       else "\u26a0\ufe0f Le risque doit \u00eatre entre 0,01% et 5%.")
+            else:
+                r = profile.get("risk_pct", TICKET_RISK_PCT)
+                msg = (f"Current risk: <b>{r:g}%</b>\nUsage : /risque 0.5 (ou /risk 0.5)"
+                       if _en else
+                       f"Risque actuel : <b>{r:g}%</b>\nUsage : /risque 0.5 | 1 | 0.3")
 
     elif cmd == "/lang":
         if arg in ("fr", "en"):
@@ -1682,14 +1840,16 @@ def build_trade_ticket(parsed, group, profile=None):
         return None
     long_bias = (side == "Support")
     S = TG_STR[tg_lang(profile)]   # v2.7.19
-    risk_usd  = TICKET_CAPITAL * TICKET_RISK_PCT / 100.0
+    _cap = float((profile or {}).get("capital") or TICKET_CAPITAL)   # v2.7.24
+    _rp  = float((profile or {}).get("risk_pct") or TICKET_RISK_PCT)
+    risk_usd  = _cap * _rp / 100.0
     slf = sl_fib_for(group)   # v2.7.20 : stop par actif
     sl = _stop_from_fib(entry, target, long_bias, slf)
     asset = esc(parsed.get("asset") or "?")
     tf    = esc(parsed.get("timeframe") or "?")
     typ   = esc(parsed.get("type") or "")
     dir_txt = S["tk_long"] if long_bias else S["tk_short"]
-    hdr = ["\U0001F4CB <b>" + S["tk_title"] + "</b> \u2014 " + S["tk_demo"] + " " + str(int(TICKET_CAPITAL / 1000)) + "k",
+    hdr = ["\U0001F4CB <b>" + S["tk_title"] + "</b> \u2014 " + S["tk_demo"] + " " + str(int(_cap / 1000)) + "k \u00b7 " + ("%g" % _rp) + "%",
            "<b>" + asset + "</b> \u00b7 TF " + tf + " \u00b7 " + typ]
     # v2.7.14 : cohérence prix↔actif — NE PAS poser cet ordre sans vérifier
     if parsed.get("_coherence_warn"):
@@ -1944,1328 +2104,4 @@ def journal_view():
         pts = " ".join(f"{i*w/(len(eq_pts)-1):.1f},{h-(v-mn)/rng*h:.1f}" for i, v in enumerate(eq_pts))
         zero_y = h - (0 - mn) / rng * h
         eq_html = ('<div class="card"><h2>\u00c9quity \u2014 P&L cumul\u00e9 (' + str(len(eq_pts)) + ' trades)</h2>'
-                   f'<svg viewBox="0 0 {w} {h}" style="width:100%;height:auto">'
-                   f'<line x1="0" y1="{zero_y:.1f}" x2="{w}" y2="{zero_y:.1f}" stroke="#30363d" stroke-dasharray="4 4"/>'
-                   f'<polyline points="{pts}" fill="none" stroke="{"#3fb950" if cum >= 0 else "#f85149"}" stroke-width="2"/></svg>'
-                   f'<div class="note">Cumul : <b>{cum:+,.0f} $</b> (P&L saisis \u2014 le solde des comptes reste ta v\u00e9rit\u00e9)</div></div>')
-
-    # ═ Stats par stratégie ═
-    strat = {}
-    for t in all_closed:
-        if acct_f and t["account_id"] != int(acct_f):
-            continue
-        k = (t["setup"] or "?").strip() or "?"
-        d = strat.setdefault(k, {"n": 0, "w": 0, "pnl": 0.0})
-        d["n"] += 1
-        d["pnl"] += t["pnl_usd"] or 0.0
-        if (t["pnl_usd"] or 0) >= 0:
-            d["w"] += 1
-    strat_rows = "".join(
-        f'<tr><td>{esc(k)}</td><td>{d["n"]}</td><td>{100*d["w"]/d["n"]:.0f}%</td>'
-        f'<td style="color:{"var(--grn)" if d["pnl"]>=0 else "var(--red)"};font-weight:700">{d["pnl"]:+,.0f} $</td></tr>'
-        for k, d in sorted(strat.items(), key=lambda x: -x[1]["pnl"]))
-    strat_html = ('<div class="card"><h2>Par strat\u00e9gie</h2><table><thead><tr><th>Strat\u00e9gie</th>'
-                  '<th>N</th><th>Win rate</th><th>P&L</th></tr></thead><tbody>' + strat_rows
-                  + '</tbody></table></div>') if strat_rows else ""
-
-    # ═ Formulaires : saisie rapide clôturé + trade ouvert (prefill robot) ═
-    acct_opts = "".join(f'<option value="{a["id"]}">{esc(a["name"])}</option>' for a in accts)
-    quick = (
-        f'<div class="card"><h2>\u270f\ufe0f Trade clôturé (saisie rapide)</h2>'
-        f'<form method="post" action="/journal/trade_closed{tok}">'
-        f'<select name="account_id" {_INP}>{acct_opts}</select>'
-        f'<input name="asset" placeholder="actif" {_INP} size="9">'
-        f'<select name="side" {_INP}><option>LONG</option><option>SHORT</option></select>'
-        f'<input name="setup" placeholder="strat\u00e9gie / setup" {_INP} size="18">'
-        f'<input name="pnl" placeholder="$ P&L (\u2212 si perte)" inputmode="decimal" {_INP} size="12">'
-        f'<input name="date" placeholder="AAAA-MM-JJ (vide=auj.)" {_INP} size="14">'
-        f'<input name="screenshot" placeholder="lien screenshot TradingView" {_INP} size="26">'
-        f'<input name="note" placeholder="commentaire / le\u00e7on" {_INP} style="width:96%">'
-        f'<label class="note" style="display:block;margin:4px 0">'
-        f'<input type="checkbox" name="apply_balance" value="1" checked> appliquer au solde du compte</label>'
-        f'<button class="btn">Enregistrer</button></form></div>')
-    pre_links = "".join(
-        f'<a class="chip" href="/journal{tok}{amp}m={month}{"&acct="+acct_f if acct_f else ""}&prefill={r["id"]}">'
-        f'#{r["id"]} {esc(r["asset"] or "?")} {esc(r["timeframe"] or "")} @{r["price"]}</a>' for r in recents)
-    open_form = (
-        f'<div class="card"><h2>\U0001F4CB Trade ouvert (depuis un ticket du robot)</h2>'
-        f'<div class="chips">{pre_links or "<span class=note>aucune alerte ticketable r\u00e9cente</span>"}</div>'
-        f'<form method="post" action="/journal/trade{tok}">'
-        f'<input type="hidden" name="alert_id" value="{pf["alert_id"]}">'
-        f'<select name="account_id" {_INP}>{acct_opts}</select>'
-        f'<input name="asset" placeholder="actif" value="{esc(str(pf["asset"]))}" {_INP} size="9">'
-        f'<select name="side" {_INP}><option{" selected" if pf["side"]=="LONG" else ""}>LONG</option>'
-        f'<option{" selected" if pf["side"]=="SHORT" else ""}>SHORT</option></select>'
-        f'<input name="entry" placeholder="entr\u00e9e" value="{pf["entry"]}" inputmode="decimal" {_INP} size="9">'
-        f'<input name="sl" placeholder="SL" value="{pf["sl"]}" inputmode="decimal" {_INP} size="9">'
-        f'<input name="risk_usd" placeholder="risque $" inputmode="decimal" {_INP} size="8">'
-        f'<input name="setup" placeholder="setup" value="{esc(pf["setup"])}" {_INP} size="20">'
-        f'<input name="deviation" placeholder="d\u00e9viation vs ticket \u2014 pourquoi ?" {_INP} style="width:96%">'
-        f'<button class="btn" style="margin-top:4px">Ouvrir le trade</button></form></div>')
-
-    # ═ Trades ouverts ═
-    op_html = ""
-    for t in open_tr:
-        r, of, exits = _trade_r(t)
-        ex_txt = " \u00b7 ".join(f'{e.get("label","exit")} {e["price"]} ({int(e["frac"]*100)}%)' for e in exits) or "\u2014"
-        rtxt = f"{r:+.2f}R" if r is not None else "?"
-        op_html += (
-            f'<div class="card"><b>{esc(t["asset"])}</b> {esc(t["side"])} \u00b7 {esc(t["acct"])} \u00b7 '
-            f'entr\u00e9e {t["entry"]} \u00b7 SL {t["sl_initial"]} \u00b7 risque {_money(t["risk_usd"] or 0)} $'
-            f'<br>Sorties : {ex_txt} \u00b7 <b>{rtxt}</b> \u00b7 reste {int(of*100)}%'
-            + (f'<br><span style="color:var(--gold)">\u26a0\ufe0f {esc(t["deviation"])}</span>' if t["deviation"] else "")
-            + f'<form method="post" action="/journal/trade/{t["id"]}/exit{tok}" style="margin-top:6px">'
-              f'<input name="price" placeholder="prix" inputmode="decimal" {_INP} size="8">'
-              f'<input name="pct" placeholder="%" inputmode="numeric" {_INP} size="4">'
-              f'<input name="label" placeholder="TP1/BE" {_INP} size="7">'
-              f'<button class="btn">Sortie partielle</button></form>'
-              f'<form method="post" action="/journal/trade/{t["id"]}/close{tok}" style="margin-top:4px">'
-              f'<input name="price" placeholder="prix du reste" inputmode="decimal" {_INP} size="10">'
-              f'<input name="pnl" placeholder="$ P&L r\u00e9el (broker)" inputmode="decimal" {_INP} size="12">'
-              f'<input name="note" placeholder="le\u00e7on" {_INP} size="16">'
-              f'<label class="note"><input type="checkbox" name="apply_balance" value="1" checked> \u2192 solde</label> '
-              f'<button class="btn">Cl\u00f4turer</button></form></div>')
-    open_sec = f'<div class="card"><h2>Trades ouverts ({len(open_tr)})</h2>{op_html}</div>' if open_tr else ""
-
-    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>FibLab \u2014 Journal</title>' + DASH_CSS + '</head><body>')
-    body = ('<h1>\U0001F4D2 Journal de trading</h1>'
-            '<div class="sub">P&L en $ = ta saisie (v\u00e9rit\u00e9 broker) \u00b7 % et capital courant calcul\u00e9s \u00b7 '
-            'R affich\u00e9 quand entr\u00e9e/SL connus.</div>'
-            '<div class="grid">' + cards + '</div>' + nav + month_tbl + open_sec
-            + quick + open_form + eq_html + strat_html)
-    return head + body + '</body></html>'
-
-
-@app.route("/journal/balance", methods=["POST"])
-def journal_balance():
-    if not check_secret():
-        return ("unauthorized", 403)
-    try:
-        aid = int(request.form["account_id"])
-        bal = float(request.form["balance"].replace(",", ".").replace(" ", ""))
-    except (KeyError, ValueError):
-        return ("bad request", 400)
-    with db() as conn:
-        conn.execute("UPDATE accounts SET balance=? WHERE id=?", (bal, aid))
-        conn.execute("UPDATE accounts SET hwm=? WHERE id=? AND dd_max IS NOT NULL "
-                     "AND (hwm IS NULL OR hwm < ?)", (bal, aid, bal))
-        conn.commit()
-    return redirect("/journal" + _tok())
-
-
-@app.route("/journal/account", methods=["POST"])
-def journal_account():
-    if not check_secret():
-        return ("unauthorized", 403)
-    try:
-        aid = int(request.form["account_id"])
-        hwm = float(request.form["hwm"].replace(",", ".").replace(" ", ""))
-    except (KeyError, ValueError):
-        return ("bad request", 400)
-    with db() as conn:
-        conn.execute("UPDATE accounts SET hwm=? WHERE id=?", (hwm, aid))
-        conn.commit()
-    return redirect("/journal" + _tok())
-
-
-@app.route("/journal/trade_closed", methods=["POST"])
-def journal_trade_closed():
-    """Saisie rapide d'un trade déjà clôturé (le flux principal du modèle 2026)."""
-    if not check_secret():
-        return ("unauthorized", 403)
-    f = request.form
-    try:
-        pnl = float(f["pnl"].replace(",", ".").replace(" ", ""))
-        aid = int(f["account_id"])
-    except (KeyError, ValueError):
-        return ("bad request", 400)
-    d = (f.get("date") or "").strip()
-    ts = (d + "T12:00:00+00:00") if re.match(r"^\d{4}-\d{2}-\d{2}$", d) else now_iso()
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO trades (account_id,opened_ts,closed_ts,asset,grp,side,setup,"
-            "pnl_usd,status,note,screenshot) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (aid, ts, ts, f.get("asset"), get_asset_group(f.get("asset") or ""),
-             f.get("side", "LONG"), f.get("setup"), pnl, "closed",
-             (f.get("note") or None), (f.get("screenshot") or None)))
-        if f.get("apply_balance"):
-            conn.execute("UPDATE accounts SET balance = COALESCE(balance,0) + ? WHERE id=?", (pnl, aid))
-            conn.execute("UPDATE accounts SET hwm=balance WHERE id=? AND dd_max IS NOT NULL "
-                         "AND (hwm IS NULL OR hwm < balance)", (aid,))
-        conn.commit()
-    return redirect("/journal" + _tok())
-
-
-@app.route("/journal/trade", methods=["POST"])
-def journal_trade_new():
-    if not check_secret():
-        return ("unauthorized", 403)
-    f = request.form
-    try:
-        entry = float(f["entry"].replace(",", "."))
-        sl = float(f["sl"].replace(",", "."))
-        risk = float((f.get("risk_usd") or "0").replace(",", ".") or 0)
-    except (KeyError, ValueError):
-        return ("bad request", 400)
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO trades (account_id,opened_ts,asset,grp,side,entry,sl_initial,"
-            "risk_usd,setup,deviation,alert_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (int(f["account_id"]), now_iso(), f.get("asset"),
-             get_asset_group(f.get("asset") or ""), f.get("side", "LONG"), entry, sl,
-             risk, f.get("setup"), (f.get("deviation") or None),
-             (int(f["alert_id"]) if f.get("alert_id") else None)))
-        conn.commit()
-    return redirect("/journal" + _tok())
-
-
-@app.route("/journal/trade/<int:tid>/exit", methods=["POST"])
-def journal_trade_exit(tid):
-    if not check_secret():
-        return ("unauthorized", 403)
-    try:
-        price = float(request.form["price"].replace(",", "."))
-        frac = min(1.0, max(0.01, float(request.form["pct"]) / 100.0))
-    except (KeyError, ValueError):
-        return ("bad request", 400)
-    with db() as conn:
-        t = conn.execute("SELECT * FROM trades WHERE id=? AND status='open'", (tid,)).fetchone()
-        if not t:
-            return ("not found", 404)
-        exits = json.loads(t["exits"] or "[]")
-        frac = min(frac, max(0.0, 1.0 - sum(e["frac"] for e in exits)))
-        exits.append({"ts": now_iso(), "price": price, "frac": round(frac, 4),
-                      "label": request.form.get("label") or "exit"})
-        conn.execute("UPDATE trades SET exits=? WHERE id=?", (json.dumps(exits), tid))
-        conn.commit()
-    return redirect("/journal" + _tok())
-
-
-@app.route("/journal/trade/<int:tid>/close", methods=["POST"])
-def journal_trade_close(tid):
-    """Clôture : prix du reste + P&L $ réel optionnel (prioritaire sur R×risque)."""
-    if not check_secret():
-        return ("unauthorized", 403)
-    f = request.form
-    with db() as conn:
-        t = conn.execute("SELECT * FROM trades WHERE id=? AND status='open'", (tid,)).fetchone()
-        if not t:
-            return ("not found", 404)
-        exits = json.loads(t["exits"] or "[]")
-        rest = max(0.0, 1.0 - sum(e["frac"] for e in exits))
-        if rest > 0 and f.get("price"):
-            try:
-                exits.append({"ts": now_iso(), "price": float(f["price"].replace(",", ".")),
-                              "frac": round(rest, 4), "label": "close"})
-            except ValueError:
-                pass
-        conn.execute("UPDATE trades SET exits=? WHERE id=?", (json.dumps(exits), tid))
-        t2 = conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
-        r, _, _ = _trade_r(t2)
-        pnl = None
-        if f.get("pnl"):
-            try:
-                pnl = float(f["pnl"].replace(",", ".").replace(" ", ""))
-            except ValueError:
-                pnl = None
-        if pnl is None:
-            pnl = round((r or 0.0) * (t["risk_usd"] or 0.0), 2)
-        conn.execute(
-            "UPDATE trades SET status='closed', closed_ts=?, r_realized=?, pnl_usd=?, "
-            "note=COALESCE(?, note) WHERE id=?",
-            (now_iso(), (round(r, 4) if r is not None else None), pnl,
-             (f.get("note") or None), tid))
-        if f.get("apply_balance"):
-            conn.execute("UPDATE accounts SET balance = COALESCE(balance,0) + ? WHERE id=?",
-                         (pnl, t["account_id"]))
-            conn.execute("UPDATE accounts SET hwm=balance WHERE id=? AND dd_max IS NOT NULL "
-                         "AND (hwm IS NULL OR hwm < balance)", (t["account_id"],))
-        conn.commit()
-    return redirect("/journal" + _tok())
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-
-    raw = request.get_data(as_text=True).strip()
-    if raw.startswith("{"):
-        try:
-            data = json.loads(raw)
-            raw  = data.get("message", data.get("text", raw))
-        except Exception:
-            pass
-
-    print(f"[WEBHOOK] Reçu : {raw[:100]}")
-    # v2.7.14 : payload brut complet en repr (une seule ligne de log Railway,
-    # les \n multi-lignes ne sont plus éclatés) — indispensable au debug.
-    print(("[WEBHOOK] RAW : " + repr(raw))[:500])
-    # v2.7.15 : tracer l'?asset= reçu (jamais le token) — diagnostic des
-    # alertes dont l'URL porte un mauvais actif.
-    print(f"[WEBHOOK] URL asset={request.args.get('asset')!r}")
-    if not raw:
-        return jsonify({"error": "empty body"}), 400
-
-    # Aiguillage : message hold (multi-lignes) vs format standard.
-    # v2.7.14 : 'hold' cherché sur les 2 premières lignes (une ligne
-    # 'Ticker: XXX' peut désormais précéder le type).
-    asset_url = request.args.get("asset")
-    head = "\n".join(raw.split("\n")[:2]).lower()
-    if "hold" in head:
-        parsed = parse_hold_message(raw, asset_hint=asset_url)
-        if parsed is None:
-            parsed = parse_fiblab_message(raw)
-    else:
-        parsed = parse_fiblab_message(raw)
-    # Filet de sécurité : asset depuis l'URL si absent du message
-    if not parsed.get("asset") and asset_url:
-        parsed["asset"] = asset_url.upper()
-
-    scoring = compute_score(parsed, history=alert_history)
-    group   = get_asset_group(parsed.get("asset") or "")
-
-    # v2.7.14 : garde-fou cohérence prix↔actif (flag, jamais de correction)
-    coh = asset_coherence_warning(parsed, group)
-    if coh:
-        parsed["_coherence_warn"] = coh
-        _rng = PRICE_RANGES.get(group)
-        if _rng and parsed.get("price") is not None:
-            parsed["_coherence_data"] = (parsed["price"], group, _rng[0], _rng[1])
-        print(f"[COHERENCE] \u26a0\ufe0f {coh} | asset={parsed.get('asset')} raw={raw[:80]!r}")
-
-    try:
-        alert_id = save_alert(parsed, scoring, group)
-    except Exception as e:
-        print(f"[DB] save_alert : {e}")
-        alert_id = None
-
-    entry = {**parsed, **scoring, "id": alert_id}
-    alert_history.appendleft(entry)
-    if group and group in histories:
-        histories[group].appendleft(entry)
-
-    if robot_state["paused"]:
-        return jsonify({"status": "killswitch", "id": alert_id}), 200
-
-    results = {}
-    for user_id in [TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID_2]:
-        if not user_id:
-            continue
-        profile = get_profile(user_id)
-        if profile["paused"]:
-            continue
-        if user_id == TELEGRAM_CHAT_ID_2 and scoring["level"] != "PRIORITAIRE":
-            continue
-        if (user_id == TELEGRAM_CHAT_ID and TICKET_ENABLED
-                and any(t in (parsed.get("type") or "").lower() for t in TICKET_TYPES)
-                and _ticket_tf_ok(parsed.get("timeframe"))):
-            results[user_id] = "-> ticket"
-            continue
-        notify, reason = should_notify(parsed, scoring, profile)
-        if not notify:
-            results[user_id] = f"filtré: {reason}"
-            continue
-        tg_msg = format_telegram_message(parsed, scoring, profile)
-        sent   = send_telegram(tg_msg, user_id)
-        results[user_id] = "✅" if sent else "❌"
-
-    if TICKET_ENABLED and not robot_state["paused"]:
-        try:
-            ticket = build_trade_ticket(parsed, group, get_profile(TELEGRAM_CHAT_ID))
-            if ticket:
-                send_telegram(ticket, TELEGRAM_CHAT_ID)
-                results["ticket"] = "sent"
-        except Exception as e:
-            print(f"[TICKET] {e}")
-
-    print(f"[WEBHOOK] {scoring['level']} Score={scoring['score']} "
-          f"TF={parsed.get('timeframe')} Group={group} id={alert_id} {results}")
-    return jsonify({"status": "ok", "id": alert_id, "scoring": scoring,
-                    "group": group, "results": results}), 200
-
-
-@app.route("/telegram_update", methods=["POST"])
-def telegram_update():
-    data    = request.get_json(silent=True) or {}
-    message = data.get("message", {})
-    text    = message.get("text", "")
-    chat_id = str(message.get("chat", {}).get("id", ""))
-    allowed = {TELEGRAM_CHAT_ID, TELEGRAM_CHAT_ID_2}
-    if chat_id not in allowed:
-        return jsonify({"status": "unauthorized"}), 403
-    if text.startswith("/"):
-        handle_telegram_command(text, chat_id)
-    return jsonify({"status": "ok"}), 200
-
-
-@app.route("/outcome/<int:alert_id>", methods=["POST"])
-def set_outcome(alert_id):
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    d = request.get_json(silent=True) or {}
-    status = d.get("status")
-    if status not in ("pending", "win", "loss", "invalid"):
-        return jsonify({"error": "status invalide (pending|win|loss|invalid)"}), 400
-    with db() as conn:
-        conn.execute(
-            "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, r_realized=?, note=?, updated_ts=? "
-            "WHERE alert_id=?",
-            (status, d.get("mfe_pts"), d.get("mae_pts"), d.get("r_realized"),
-             d.get("note"), now_iso(), alert_id)
-        )
-        conn.commit()
-    return jsonify({"updated": alert_id, "status": status})
-
-
-@app.route("/stats", methods=["GET"])
-def stats():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT a.score, a.type, a.timeframe, o.status "
-            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id"
-        ).fetchall()
-
-    by_score, by_type, by_tf = {}, {}, {}
-    for r in rows:
-        if r["status"] not in ("win", "loss"):
-            continue
-        by_score.setdefault(r["score"], {"win": 0, "loss": 0})[r["status"]] += 1
-        by_type.setdefault(r["type"] or "?", {"win": 0, "loss": 0})[r["status"]] += 1
-        by_tf.setdefault(r["timeframe"] or "?", {"win": 0, "loss": 0})[r["status"]] += 1
-
-    def wr(d):
-        tot = d["win"] + d["loss"]
-        return round(100 * d["win"] / tot, 1) if tot else None
-
-    def enrich(bucket):
-        return {str(k): {**v, "win_rate_%": wr(v)} for k, v in sorted(bucket.items(), key=lambda x: str(x[0]))}
-
-    return jsonify({
-        "evaluated": sum(v["win"] + v["loss"] for v in by_score.values()),
-        "by_score": enrich(by_score),
-        "by_type":  enrich(by_type),
-        "by_tf":    enrich(by_tf),
-    })
-
-
-@app.route("/evaluate", methods=["GET", "POST"])
-def evaluate_route():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    n = evaluate_pending_outcomes()
-    with db() as conn:
-        remaining = conn.execute("SELECT COUNT(*) AS n FROM outcomes WHERE status='pending'").fetchone()["n"]
-    return jsonify({"evaluated": n, "remaining_pending": remaining})
-
-
-@app.route("/reeval", methods=["GET", "POST"])
-def reeval_route():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    with db() as conn:
-        cur = conn.execute(
-            "UPDATE outcomes SET status='pending', mfe_pts=NULL, mae_pts=NULL, "
-            "r_realized=NULL, note=NULL WHERE status != 'pending'"
-        )
-        conn.commit()
-        n = cur.rowcount
-    return jsonify({"reset_to_pending": n})
-
-
-@app.route("/fix_tf", methods=["GET", "POST"])
-def fix_tf_route():
-    """v2.7.17 — Nettoyage one-shot du bug TF (pré-v2.7.14) : les Hold
-    Daily→7D avaient leur TF tronqué en M1..M5 / '6' / '7'. Remappe ces
-    lignes vers 1D..7D et remet leurs outcomes en pending (l'ancienne éval
-    portait sur un horizon faux). Limité aux types hold : un éventuel vrai
-    hold minute serait remappé à tort — assumé, aucun n'est attendu.
-    NB : les gros TF resteront majoritairement non mesurables par le proxy
-    (horizon 21j) — c'est la correction d'étiquette qui compte, pas l'éval."""
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    remap = {"M1": "1D", "M2": "2D", "M3": "3D", "M4": "4D", "M5": "5D",
-             "6": "6D", "7": "7D"}
-    fixed = {}
-    with db() as conn:
-        ids_all = []
-        for old, new in remap.items():
-            rows = conn.execute(
-                "SELECT id FROM alerts WHERE timeframe = ? AND LOWER(type) LIKE '%hold%'",
-                (old,)).fetchall()
-            ids = [r["id"] for r in rows]
-            if not ids:
-                continue
-            conn.execute(
-                "UPDATE alerts SET timeframe = ? WHERE id IN (%s)"
-                % ",".join("?" * len(ids)), [new] + ids)
-            fixed[old + "->" + new] = len(ids)
-            ids_all += ids
-        if ids_all:
-            conn.execute(
-                "UPDATE outcomes SET status='pending', mfe_pts=NULL, mae_pts=NULL, "
-                "r_realized=NULL, note=NULL WHERE alert_id IN (%s)"
-                % ",".join("?" * len(ids_all)), ids_all)
-        conn.commit()
-    return jsonify({"remapped": fixed, "total": len(ids_all),
-                    "outcomes_reset_to_pending": len(ids_all)})
-
-
-@app.route("/rescore", methods=["GET", "POST"])
-def rescore_route():
-    """Recalcule le score ET le niveau de TOUTES les alertes stockées avec le
-    scoring courant (poids Syn + bonus). Le bonus de CONFLUENCE est reconstruit
-    fidèlement : on rejoue les alertes par ordre d'arrivée (id) et chaque alerte
-    n'est scorée que contre celles qui l'ont précédée — comme en live.
-    Ne touche PAS aux issues (win/loss) ; pour ça, voir /reeval."""
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, asset, timeframe, type, side, price, scope, score, level "
-            "FROM alerts ORDER BY id ASC"
-        ).fetchall()
-    hist = deque(maxlen=200)          # même capacité que l'historique live
-    rescored = changed = 0
-    with db() as conn:
-        for r in rows:
-            parsed = {"type": r["type"], "asset": r["asset"], "timeframe": r["timeframe"],
-                      "side": r["side"], "price": r["price"], "scope": r["scope"]}
-            sc = compute_score(parsed, history=hist)
-            hist.appendleft({"asset": r["asset"], "side": r["side"],
-                             "price": r["price"], "timeframe": r["timeframe"]})
-            if sc["score"] != r["score"] or sc["level"] != r["level"]:
-                changed += 1
-            conn.execute("UPDATE alerts SET score=?, level=? WHERE id=?",
-                         (sc["score"], sc["level"], r["id"]))
-            rescored += 1
-        conn.commit()
-    return jsonify({"rescored": rescored, "changed": changed})
-
-
-@app.route("/price_test", methods=["GET"])
-def price_test():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=48)
-    bars = fetch_prices("xau", "XAUUSD", start, end)
-    src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
-    sample = [{"t": b[0].isoformat(), "high": b[1], "low": b[2]} for b in bars[:3]]
-    return jsonify({"source": src, "bars": len(bars), "sample": sample})
-
-
-# ─────────────────────────────────────────────
-# TABLEAU DE BORD DE CALIBRATION (rendu serveur, sans JS ni CDN)
-# ─────────────────────────────────────────────
-DASH_CSS = """<style>
-:root{--bg:#080c10;--card:#0d1117;--bd:#1c2333;--gold:#f5a623;--grn:#3fb950;--red:#f85149;--blue:#58a6ff;--pur:#a78bfa;--tx:#cdd9e5;--dim:#768390}
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:20px;max-width:1000px;margin:0 auto}
-h1{font-size:1.5rem;color:var(--gold);margin-bottom:4px}
-.sub{color:var(--dim);font-size:.8rem;margin-bottom:20px}
-.refresh{float:right;font-size:.75rem;color:var(--blue);text-decoration:none;border:1px solid var(--bd);padding:5px 10px;border-radius:6px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:22px}
-.stat{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:13px}
-.lbl{font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:5px}
-.val{font-size:1.5rem;font-weight:700}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:18px}
-.card h2{font-size:.9rem;margin-bottom:14px;color:var(--blue)}
-.brow{display:flex;align-items:center;gap:10px;margin:7px 0;font-size:.8rem}
-.blab{width:54px;text-align:right;color:var(--tx);flex-shrink:0}
-.btrack{flex:1;height:20px;background:#0a0e14;border:1px solid var(--bd);border-radius:5px;overflow:hidden}
-.bfill{height:100%;border-radius:4px 0 0 4px;min-width:2px}
-.bval{width:172px;text-align:left;flex-shrink:0}
-.bn{color:var(--dim);font-size:.72rem}
-.note{background:rgba(88,166,255,.06);border:1px solid rgba(88,166,255,.2);border-radius:8px;padding:14px;font-size:.8rem;line-height:1.6;margin-bottom:18px}
-table{width:100%;border-collapse:collapse;font-size:.8rem}
-th{text-align:left;padding:7px 9px;font-size:.6rem;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--bd)}
-td{padding:7px 9px;border-bottom:1px solid var(--bd)}
-.empty{text-align:center;color:var(--dim);padding:40px;font-size:.9rem;line-height:1.7}
-.muted{color:var(--dim);font-size:.8rem;padding:8px}
-code{background:#161b22;padding:2px 6px;border-radius:4px;color:var(--gold)}
-.actions{float:right;display:flex;gap:8px}
-.btn{font-size:.75rem;color:var(--blue);text-decoration:none;background:transparent;border:1px solid var(--bd);padding:5px 10px;border-radius:6px;cursor:pointer;font-family:inherit}
-.btn:hover{border-color:var(--blue)}
-.btn.active{border-color:var(--blue);color:var(--gold);font-weight:700}
-.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 18px}
-.chip{font-size:.72rem;color:var(--dim);text-decoration:none;border:1px solid var(--bd);padding:4px 12px;border-radius:20px}
-.chip:hover{color:var(--blue);border-color:var(--blue)}
-.chip.active{background:var(--blue);color:#04121f;border-color:var(--blue);font-weight:700}
-@media print{.actions{display:none}*{-webkit-print-color-adjust:exact !important;print-color-adjust:exact !important}}
-</style>"""
-
-
-def _bar_rows(rows, color, nodata="aucune donn\u00e9e"):
-    if not rows:
-        return '<div class="muted">' + nodata + '</div>'
-    out = []
-    for r in rows:
-        fill = color + ("55" if r["n"] < 5 else "")
-        wrc = "var(--grn)" if r["wr"] >= 50 else "var(--gold)"
-        out.append(
-            '<div class="brow">'
-            + '<div class="blab">' + esc(r["k"]) + '</div>'
-            + '<div class="btrack"><div class="bfill" style="width:' + str(r["wr"]) + '%;background:' + fill + '"></div></div>'
-            + '<div class="bval" style="color:' + wrc + '">' + str(r["wr"]) + '% '
-            + '<span class="bn">(' + str(r["win"]) + 'W/' + str(r["loss"]) + 'L \u00b7 n=' + str(r["n"]) + ')</span></div>'
-            + '</div>')
-    return "".join(out)
-
-
-DASH_STR = {
-    "fr": {
-        "title": "\U0001F3AF Calibration du scoring",
-        "sub": "Win rate & espérance des alertes par score / type / timeframe — pour ajuster les poids sur des faits",
-        "pdf": "\U0001F5A8 Imprimer / PDF", "refresh": "\u21bb Rafraîchir",
-        "evaluated": "Évaluées", "gwr": "Win rate global", "pending": "En attente", "flt_all": "Tout",
-        "rmean_card": "R moyen (espérance)", "rtotal_card": "R total",
-        "by_score": "Win rate par SCORE — le graphe clé",
-        "by_type": "Win rate par TYPE", "by_tf": "Win rate par TIMEFRAME",
-        "detail": "Détail par score", "nodata": "aucune donnée",
-        "by_asset": "Win rate & espérance par ACTIF",
-        "how": "\u2753 Comment lire ce bloc",
-        "help_cards": "Ces chiffres viennent du <b>proxy</b> (simulation sur prix historiques), PAS de ton P&L réel. \u00c9valuées = alertes ayant abouti à win ou loss. <b>Ignore le win rate et le R globaux</b> : ils mélangent des types incomparables (pré-signaux gonflés inclus). La vérité est dans \u00ab Espérance par type \u00bb, ligne Origin Hold ACTIVATED.",
-        "help_type": "<b>Piège majeur :</b> ARMED / PROXIMITY / CREATED affichent des win rates énormes par <b>artefact de mesure</b> (ils \u00ab gagnent \u00bb en prenant de l'avance avant de savoir si le niveau tient). <b>Ne PAS les trader.</b> Le seul signal validé est <b>Origin Hold ACTIVATED</b> (rejet confirmé par englobante clôturée).",
-        "help_exp": "R moyen = espérance par trade <b>au stop courant /sl_fib</b> (défaut 0,5 entre entrée et Fib 0). Ta ligne de référence : <b>Origin Hold ACTIVATED</b>. Calibration connue : ~+0,07R à Fib 0, ~+0,18R à Fib 0,5 \u2014 edge réel mais mince ; spread/slippage non simulés.",
-        "help_asset": "Compare les actifs <b>à type de signal égal</b> (utilise le filtre type). Pollution connue : avant le 10/07, des alertes XAU ont été rangées en SOLANA (bug ?asset=), et des doublons existent. Les petits N (&lt;20) ne prouvent rien.",
-        "help_tf": "<b>Labels M1\u2013M5, 6, 7 = résidus d'un bug</b> (avant v2.7.14, les Hold Daily\u21927D étaient tronqués en minutes et évalués sur un horizon faux \u2014 leurs stats sont doublement invalides). Nettoyage : route /fix_tf. Par ailleurs les <b>gros TF (Daily\u2192Weekly) ne sont PAS mesurables</b> par le proxy (horizon plafonné 21j) : seules les barres intraday H1\u2192H12 avec N&ge;20 sont interprétables.",
-        "help_detail": "Même donnée que le graphe par score, en tableau. Règle : N &lt; 5 = anecdote, pas statistique. Le scoring est sain si le win rate <b>monte</b> avec le score.",
-        "th_asset": "Actif", "asset_note": "Filtre par actif via les puces ci-dessus. Attention : les lignes antérieures au 10/07 peuvent porter un actif erroné (bug ?asset= corrigé en v2.7.14) — les vues par actif se fiabilisent avec les données récentes.",
-        "exp_title": "Espérance par type (R) — la vraie mesure",
-        "th_type": "Type", "th_rmean": "R moyen", "th_rtotal": "R total",
-        "rnote": "<b>R moyen = espérance par trade.</b> Positif = profitable, négatif = perdant — quel que soit le win rate. C'est CE chiffre qui compte, pas le %. Rappel : la cible d'obligation des Hold est un objectif minimum, donc un R modeste est normal. Trié par espérance décroissante.",
-        "note": "<b>Comment lire :</b> si ton scoring est bon, le win rate doit <b>monter avec le score</b> (un 12 gagne plus qu'un 7). Si une barre de score faible dépasse celle d'un score fort, les <b>poids sont à recalibrer</b>. Barres pâles = moins de 5 trades (peu fiable).",
-        "empty": "Aucune alerte évaluée pour l'instant.<br><br>Les alertes sont notées automatiquement une fois passées 12h ({p} en attente).<br>Vérifie aussi que le cron <code>/evaluate</code> tourne sans erreur.",
-    },
-    "en": {
-        "title": "\U0001F3AF Scoring calibration",
-        "sub": "Alert win rate & expectancy by score / type / timeframe — to tune the weights on facts",
-        "pdf": "\U0001F5A8 Print / PDF", "refresh": "\u21bb Refresh",
-        "evaluated": "Evaluated", "gwr": "Overall win rate", "pending": "Pending", "flt_all": "All",
-        "rmean_card": "Mean R (expectancy)", "rtotal_card": "Total R",
-        "by_score": "Win rate by SCORE — the key chart",
-        "by_type": "Win rate by TYPE", "by_tf": "Win rate by TIMEFRAME",
-        "detail": "Detail by score", "nodata": "no data",
-        "by_asset": "Win rate & expectancy by ASSET",
-        "how": "\u2753 How to read this block",
-        "help_cards": "These numbers come from the <b>proxy</b> (simulation on historical prices), NOT your real P&L. Evaluated = alerts resolved to win or loss. <b>Ignore the global win rate and R</b>: they mix incomparable types (inflated pre-signals included). The truth is in \u201cExpectancy by type\u201d, row Origin Hold ACTIVATED.",
-        "help_type": "<b>Major trap:</b> ARMED / PROXIMITY / CREATED show huge win rates due to a <b>measurement artefact</b> (they \u201cwin\u201d by taking a free head start before the level is proven). <b>Do NOT trade them.</b> The only validated signal is <b>Origin Hold ACTIVATED</b> (rejection confirmed by a closed engulfing candle).",
-        "help_exp": "Mean R = expectancy per trade <b>at the current /sl_fib stop</b> (default 0.5 between entry and Fib 0). Your reference row: <b>Origin Hold ACTIVATED</b>. Known calibration: ~+0.07R at Fib 0, ~+0.18R at Fib 0.5 \u2014 a real but thin edge; spread/slippage not simulated.",
-        "help_asset": "Compare assets <b>at equal signal type</b> (use the type filter). Known pollution: before Jul 10, some XAU alerts were filed under SOLANA (?asset= bug), and duplicates exist. Small N (&lt;20) proves nothing.",
-        "help_tf": "<b>Labels M1\u2013M5, 6, 7 are bug residue</b> (before v2.7.14, Daily\u21927D Holds were truncated to minutes and evaluated on a wrong horizon \u2014 their stats are doubly invalid). Cleanup: /fix_tf route. Also, <b>large TFs (Daily\u2192Weekly) are NOT measurable</b> by the proxy (21-day horizon cap): only intraday bars H1\u2192H12 with N&ge;20 are interpretable.",
-        "help_detail": "Same data as the score chart, as a table. Rule: N &lt; 5 = anecdote, not statistics. Scoring is healthy if win rate <b>rises</b> with score.",
-        "th_asset": "Asset", "asset_note": "Filter by asset via the chips above. Note: rows before Jul 10 may carry a wrong asset (?asset= bug fixed in v2.7.14) — per-asset views become reliable with recent data.",
-        "exp_title": "Expectancy by type (R) — the real measure",
-        "th_type": "Type", "th_rmean": "Mean R", "th_rtotal": "Total R",
-        "rnote": "<b>Mean R = expectancy per trade.</b> Positive = profitable, negative = losing — regardless of win rate. This is the number that matters, not the %. Note: the Hold obligation target is a minimum objective, so a modest R is expected. Sorted by expectancy, descending.",
-        "note": "<b>How to read:</b> if your scoring is good, win rate should <b>rise with the score</b> (a 12 wins more than a 7). If a low-score bar beats a high-score one, the <b>weights need recalibrating</b>. Pale bars = fewer than 5 trades (unreliable).",
-        "empty": "No alert evaluated yet.<br><br>Alerts are scored automatically once they are 12h old ({p} pending).<br>Also check that the <code>/evaluate</code> cron runs without error.",
-    },
-}
-
-
-@app.route("/stats_view", methods=["GET"])
-def stats_view():
-    if not check_secret():
-        return ("unauthorized", 403)
-    lang = (request.args.get("lang") or "fr").lower()
-    if lang not in ("fr", "en"):
-        lang = "fr"
-    T = DASH_STR[lang]
-    type_filter  = (request.args.get("type") or "").lower().strip()
-    asset_filter = (request.args.get("asset") or "").lower().strip()   # groupe : xau/dax/solana/...
-    from urllib.parse import quote
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT a.score, a.type, a.timeframe, a.grp, o.status, o.r_realized "
-            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id"
-        ).fetchall()
-
-    counts = {"win": 0, "loss": 0, "invalid": 0, "pending": 0, "skip": 0}
-    by_score, by_type, by_tf = {}, {}, {}
-    r_by_type = {}
-    by_asset = {}          # v2.7.16 : agrégat par actif (toujours global, hors filtre asset)
-    r_sum_all, r_cnt_all = 0.0, 0
-    for r in rows:
-        if type_filter and type_filter not in (r["type"] or "").lower():
-            continue
-        # tableau par actif : sur le périmètre du filtre TYPE uniquement
-        _g = (r["grp"] or "?")
-        _st0 = r["status"] or "pending"
-        if _st0 in ("win", "loss"):
-            d = by_asset.setdefault(_g, {"win": 0, "loss": 0, "rsum": 0.0, "rcnt": 0})
-            d[_st0] += 1
-            if r["r_realized"] is not None:
-                d["rsum"] += r["r_realized"]
-                d["rcnt"] += 1
-        if asset_filter and _g.lower() != asset_filter:
-            continue
-        st = r["status"] or "pending"
-        counts[st] = counts.get(st, 0) + 1
-        if st in ("win", "loss"):
-            by_score.setdefault(r["score"], {"win": 0, "loss": 0})[st] += 1
-            by_type.setdefault(r["type"] or "?", {"win": 0, "loss": 0})[st] += 1
-            by_tf.setdefault(r["timeframe"] or "?", {"win": 0, "loss": 0})[st] += 1
-            rr = r["r_realized"]
-            if rr is not None:
-                d = r_by_type.setdefault(r["type"] or "?", {"sum": 0.0, "cnt": 0})
-                d["sum"] += rr
-                d["cnt"] += 1
-                r_sum_all += rr
-                r_cnt_all += 1
-
-    def pack(b, numeric=False):
-        items = []
-        for k, v in b.items():
-            tot = v["win"] + v["loss"]
-            items.append({"k": str(k), "_s": k, "win": v["win"], "loss": v["loss"],
-                          "n": tot, "wr": round(100 * v["win"] / tot, 1) if tot else 0})
-        items.sort(key=lambda x: x["_s"] if numeric else str(x["_s"]))
-        for it in items:
-            del it["_s"]
-        return items
-
-    bs, bt, btf = pack(by_score, True), pack(by_type), pack(by_tf)
-    tot_eval = counts["win"] + counts["loss"]
-    wr = round(100 * counts["win"] / tot_eval, 1) if tot_eval else 0
-    mean_r_all = (r_sum_all / r_cnt_all) if r_cnt_all else 0.0
-
-    def sgn(x):
-        return ("+" if x > 0 else "") + str(x)
-
-    fr_cls = "btn active" if lang == "fr" else "btn"
-    en_cls = "btn active" if lang == "en" else "btn"
-
-    def mkurl2(l, t, a=None):
-        a = asset_filter if a is None else a
-        u = "/stats_view?lang=" + l
-        if t:
-            u += "&type=" + quote(t)
-        if a:
-            u += "&asset=" + quote(a)
-        return u
-    head = ('<!DOCTYPE html><html lang="' + lang + '"><head><meta charset="UTF-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>FibLab — Calibration</title>' + DASH_CSS + '</head><body>')
-    header = ('<div class="actions">'
-              '<a class="btn" href="/export.csv">\u2b07 CSV</a>'
-              '<button class="btn" onclick="window.print()">' + T["pdf"] + '</button>'
-              '<a class="' + fr_cls + '" href="' + mkurl2("fr", type_filter) + '">FR</a>'
-              '<a class="' + en_cls + '" href="' + mkurl2("en", type_filter) + '">EN</a>'
-              '<a class="btn" href="' + mkurl2(lang, type_filter) + '">' + T["refresh"] + '</a>'
-              '</div>'
-              '<h1>' + T["title"] + '</h1>'
-              '<div class="sub">' + T["sub"] + '</div>')
-
-    _chip_defs = [("", T["flt_all"]), ("hold", "Hold"), ("bsut", "BSUT"),
-                  ("first touch", "First Touch"), ("proximity", "Proximity")]
-    chips = '<div class="chips">' + "".join(
-        '<a class="chip' + (" active" if type_filter == kw else "") + '" href="'
-        + mkurl2(lang, kw) + '">' + esc(lbl) + '</a>' for kw, lbl in _chip_defs) + '</div>'
-
-    if tot_eval == 0:
-        body = chips + '<div class="empty">' + T["empty"].format(p=counts["pending"]) + '</div>'
-        return head + header + body + '</body></html>'
-
-    def hb(key):
-        # v2.7.17 : bloc d'aide repliable, sans JS (details/summary natif)
-        return ('<details style="margin:6px 0 10px"><summary style="cursor:pointer;color:var(--dim);font-size:.85em">'
-                + T["how"] + '</summary><div class="note" style="margin-top:6px">'
-                + T[key] + '</div></details>')
-
-    wrc = "var(--grn)" if wr >= 50 else "var(--gold)"
-    rc_all = "var(--grn)" if mean_r_all > 0 else "var(--red)"
-    cards = ('<div class="grid">'
-             + '<div class="stat"><div class="lbl">' + T["evaluated"] + '</div><div class="val" style="color:var(--blue)">' + str(tot_eval) + '</div></div>'
-             + '<div class="stat"><div class="lbl">' + T["gwr"] + '</div><div class="val" style="color:' + wrc + '">' + str(wr) + '%</div></div>'
-             + '<div class="stat"><div class="lbl">' + T["rmean_card"] + '</div><div class="val" style="color:' + rc_all + '">' + sgn(round(mean_r_all, 2)) + 'R</div></div>'
-             + '<div class="stat"><div class="lbl">' + T["rtotal_card"] + '</div><div class="val" style="color:' + rc_all + '">' + sgn(round(r_sum_all, 1)) + 'R</div></div>'
-             + '<div class="stat"><div class="lbl">Win</div><div class="val" style="color:var(--grn)">' + str(counts["win"]) + '</div></div>'
-             + '<div class="stat"><div class="lbl">Loss</div><div class="val" style="color:var(--red)">' + str(counts["loss"]) + '</div></div>'
-             + '<div class="stat"><div class="lbl">Invalid</div><div class="val" style="color:var(--dim)">' + str(counts["invalid"]) + '</div></div>'
-             + '<div class="stat"><div class="lbl">' + T["pending"] + '</div><div class="val" style="color:var(--dim)">' + str(counts["pending"]) + '</div></div>'
-             + '</div>')
-    note = '<div class="note">' + T["note"] + '</div>'
-    cards += hb("help_cards")
-    trows = []
-    for r in bs:
-        c = "var(--grn)" if r["wr"] >= 50 else "var(--gold)"
-        trows.append('<tr><td>' + esc(r["k"]) + '</td><td style="color:var(--grn)">' + str(r["win"])
-                     + '</td><td style="color:var(--red)">' + str(r["loss"]) + '</td><td>' + str(r["n"])
-                     + '</td><td style="font-weight:700;color:' + c + '">' + str(r["wr"]) + '%</td></tr>')
-    table = ('<div class="card"><h2>' + T["detail"] + '</h2>' + hb("help_detail") + '<table><thead><tr>'
-             '<th>Score</th><th>Win</th><th>Loss</th><th>N</th><th>Win rate</th></tr></thead><tbody>'
-             + "".join(trows) + '</tbody></table></div>')
-
-    exp_items = []
-    for k, v in by_type.items():
-        n = v["win"] + v["loss"]
-        rd = r_by_type.get(k, {"sum": 0.0, "cnt": 0})
-        mean_r = (rd["sum"] / rd["cnt"]) if rd["cnt"] else 0.0
-        exp_items.append({"k": str(k), "n": n,
-                          "wr": round(100 * v["win"] / n, 1) if n else 0,
-                          "rmean": round(mean_r, 2), "rtotal": round(rd["sum"], 1)})
-    exp_items.sort(key=lambda x: x["rmean"], reverse=True)
-    exp_rows = []
-    for it in exp_items:
-        rc = "var(--grn)" if it["rmean"] > 0 else "var(--red)"
-        exp_rows.append('<tr><td>' + esc(it["k"]) + '</td><td>' + str(it["n"])
-                        + '</td><td>' + str(it["wr"]) + '%</td>'
-                        + '<td style="font-weight:700;color:' + rc + '">' + sgn(it["rmean"])
-                        + '</td><td style="color:' + rc + '">' + sgn(it["rtotal"]) + '</td></tr>')
-    exp_table = ('<div class="card"><h2>' + T["exp_title"] + '</h2>'
-                 + hb("help_exp")
-                 + '<div class="note">' + T["rnote"] + '</div>'
-                 + '<table><thead><tr><th>' + T["th_type"] + '</th><th>N</th><th>Win rate</th>'
-                 + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
-                 + "".join(exp_rows) + '</tbody></table></div>')
-
-    # v2.7.16 : tableau par actif (win rate + espérance)
-    a_items = []
-    for g, v in by_asset.items():
-        n = v["win"] + v["loss"]
-        mean_r = (v["rsum"] / v["rcnt"]) if v["rcnt"] else 0.0
-        lbl = ASSET_META.get(g, {}).get("emoji", "") + " " + ASSET_META.get(g, {}).get("label", g)
-        a_items.append({"g": g, "lbl": lbl.strip(), "n": n,
-                        "wr": round(100 * v["win"] / n, 1) if n else 0,
-                        "rmean": round(mean_r, 2), "rtotal": round(v["rsum"], 1)})
-    a_items.sort(key=lambda x: x["rmean"], reverse=True)
-    a_rows = []
-    for it in a_items:
-        rc = "var(--grn)" if it["rmean"] > 0 else "var(--red)"
-        a_rows.append('<tr><td><a style="color:inherit" href="' + mkurl2(lang, type_filter, it["g"]) + '">'
-                      + esc(it["lbl"]) + '</a></td><td>' + str(it["n"])
-                      + '</td><td>' + str(it["wr"]) + '%</td>'
-                      + '<td style="font-weight:700;color:' + rc + '">' + sgn(it["rmean"])
-                      + '</td><td style="color:' + rc + '">' + sgn(it["rtotal"]) + '</td></tr>')
-    asset_table = ('<div class="card"><h2>' + T["by_asset"] + '</h2>'
-                   + hb("help_asset")
-                   + '<div class="note">' + T["asset_note"] + '</div>'
-                   + '<table><thead><tr><th>' + T["th_asset"] + '</th><th>N</th><th>Win rate</th>'
-                   + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
-                   + "".join(a_rows) + '</tbody></table></div>') if a_items else ""
-
-    body = (chips + cards
-            + '<div class="card"><h2>' + T["by_score"] + '</h2>' + _bar_rows(bs, "#f5a623", T["nodata"]) + '</div>'
-            + note
-            + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
-            + exp_table
-            + asset_table
-            + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + hb("help_tf") + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
-            + table)
-    return head + header + body + '</body></html>'
-
-
-@app.route("/sl_sweep", methods=["GET"])
-def sl_sweep():
-    """Backtest : pour les Origin Hold ACTIVATED, rejoue le prix à travers
-    plusieurs niveaux de stop (fractions Fibo, de serré à au-delà du Fib 0) et
-    donne par niveau : % de stop touché, R:R, espérance. À lancer UNE fois à
-    froid (refait les fetches -> ne pas boucler, sinon rate-limit)."""
-    if not check_secret():
-        return ("unauthorized", 403)
-    now = datetime.now(timezone.utc)
-    cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
-            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
-            "WHERE a.price IS NOT NULL AND a.side IS NOT NULL AND a.target IS NOT NULL "
-            "AND a.ts <= ? AND LOWER(a.type) LIKE '%origin hold activated%' "
-            "ORDER BY a.id DESC LIMIT 500",
-            (cutoff,)
-        ).fetchall()
-    groups, order = {}, []
-    for r in rows:
-        try:
-            ts = datetime.fromisoformat(r["ts"])
-        except Exception:
-            continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        if (now - ts).total_seconds() / 3600 < EVAL_MIN_AGE_H:
-            continue
-        if r["grp"] not in EVAL_RISK:
-            continue
-        _af = (request.args.get("asset") or "").lower().strip()
-        if _af and (r["grp"] or "").lower() != _af:
-            continue
-        key = (r["grp"], r["asset"])
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append((r, ts))
-
-    agg = {f: {"win": 0, "loss": 0, "invalid": 0, "sum_r": 0.0} for f in STOP_FIB_LEVELS}
-    n_used = 0
-    _start = time.monotonic()
-    for key in order:
-        if time.monotonic() - _start > 45:
-            break
-        grp, asset = key
-        items = groups[key]
-        earliest = min(ts for _, ts in items)
-        floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
-        bars = fetch_prices(grp, asset, max(earliest - timedelta(hours=2), floor_dt), now)
-        if not bars:
-            continue
-        for r, ts in items:
-            entry, target = r["price"], r["target"]
-            long_bias = (r["side"] == "Support")
-            unit = abs(target - entry) / 0.618
-            if unit <= 0:
-                continue
-            tf_h = tf_hours(r["timeframe"])
-            horizon_h = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
-            end_win = min(ts + timedelta(hours=horizon_h), now)
-            post = [b for b in bars if ts < b[0] <= end_win]
-            if not post:
-                continue
-            tdist = abs(target - entry)
-            elapsed = now >= ts + timedelta(hours=horizon_h)
-            counted = False
-            for f in STOP_FIB_LEVELS:
-                sdist = (1.0 - f) * unit
-                if sdist <= 0:
-                    continue
-                status = None
-                for (_dt, hi, lo, _c) in post:
-                    fav = (hi - entry) if long_bias else (entry - lo)
-                    adv = (entry - lo) if long_bias else (hi - entry)
-                    if adv >= sdist:
-                        status = "loss"
-                        break
-                    if fav >= tdist:
-                        status = "win"
-                        break
-                if status is None:
-                    if elapsed:
-                        status = "invalid"
-                    else:
-                        continue
-                agg[f][status] += 1
-                if status == "win":
-                    agg[f]["sum_r"] += tdist / sdist
-                elif status == "loss":
-                    agg[f]["sum_r"] += -1.0
-                counted = True
-            if counted:
-                n_used += 1
-
-    def _lbl(f):
-        if f == 0.0:
-            return "Fib 0 (actuel)"
-        if f == -1.0:
-            return "Fib -1 (large)"
-        return "Fib " + ("%g" % f)
-
-    rowdata, best_f, best_e = [], None, None
-    for f in STOP_FIB_LEVELS:
-        a = agg[f]
-        dec = a["win"] + a["loss"]
-        wr = round(100 * a["win"] / dec, 1) if dec else 0.0
-        stop_pct = round(100 * a["loss"] / dec, 1) if dec else 0.0
-        exp = round(a["sum_r"] / dec, 3) if dec else 0.0
-        rr = round(0.618 / (1.0 - f), 2) if (1.0 - f) != 0 else 0.0
-        rowdata.append((f, rr, dec, wr, stop_pct, exp))
-        if dec and (best_e is None or exp > best_e):
-            best_e, best_f = exp, f
-
-    trows = ""
-    for f, rr, dec, wr, stop_pct, exp in rowdata:
-        ec = "var(--grn)" if exp > 0 else "var(--red)"
-        hl = " style=\"background:#132a1e\"" if f == best_f else ""
-        trows += ("<tr" + hl + "><td>" + _lbl(f) + "</td><td>1:" + str(rr) + "</td><td>"
-                  + str(dec) + "</td><td>" + str(wr) + "%</td><td>" + str(stop_pct) + "%</td>"
-                  + "<td style=\"font-weight:700;color:" + ec + "\">"
-                  + (("+" if exp > 0 else "") + str(exp)) + "R</td></tr>")
-
-    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>FibLab \u2014 SL Sweep</title>' + DASH_CSS + '</head><body>')
-    _af = (request.args.get("asset") or "").lower().strip()
-    _af_lbl = (" \u2014 filtre actif : <b>" + esc(_af.upper()) + "</b>") if _af else ""
-    body = ("<h1>\U0001F3AF Sweep de Stop Loss" + _af_lbl + "</h1>"
-            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades. "
-            "Sortie mesur\u00e9e \u00e0 TP1 (1.618). Stop serr\u00e9 = meilleur R:R mais plus de stop-outs.</div>"
-            "<div class=\"card\"><table><thead><tr><th>Stop</th><th>R:R</th><th>N</th>"
-            "<th>Win rate</th><th>% stop touch\u00e9</th><th>Esp\u00e9rance</th></tr></thead><tbody>"
-            + trows + "</tbody></table></div>"
-            "<div class=\"note\">Ligne verte = meilleure esp\u00e9rance. <b>% stop touch\u00e9</b> = "
-            "ton indicateur cl\u00e9. L'esp\u00e9rance int\u00e8gre le R:R (un stop serr\u00e9 peut "
-            "gagner malgr\u00e9 plus de sorties). Mesur\u00e9 \u00e0 TP1 seulement ; les runners "
-            "TP2+ ajoutent par-dessus. \u00c9chantillon modeste \u2192 \u00e0 revalider en d\u00e9mo.</div>")
-    return head + body + "</body></html>"
-
-
-@app.route("/tp_ladder", methods=["GET"])
-def tp_ladder():
-    """v2.7.18 — Feedback de la LADDER TP : pour chaque Origin Hold ACTIVATED,
-    rejoue le prix et mesure quels paliers (TP1=1.618, TP2=2.618, TP3=3.618,
-    TP4=4.618) sont atteints avant le stop. Compare 3 plans de sortie :
-      A) tout-dehors à TP1 (référence, = l'éval actuelle)
-      B) 4×25% aux paliers, stop INITIAL fixe
-      C) 4×25% aux paliers, stop remonté après chaque palier (BE puis palier
-         précédent) — ton playbook réel
-    Reste ouvert en fin d'horizon = clôturé au dernier close (mark-to-market).
-    Même règle conservatrice que /sl_sweep : dans une même bougie, l'adverse
-    est réputé toucher AVANT le favorable. Stop au /sl_fib courant.
-    À lancer 1× à froid (refait les fetches)."""
-    if not check_secret():
-        return ("unauthorized", 403)
-    slf_desc = "global %g" % robot_state.get("sl_fib", SL_FIB_DEFAULT)
-    if robot_state.get("sl_fib_asset"):
-        slf_desc += " + overrides " + json.dumps(robot_state["sl_fib_asset"])
-    now = datetime.now(timezone.utc)
-    cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
-            "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
-            "WHERE a.price IS NOT NULL AND a.side IS NOT NULL AND a.target IS NOT NULL "
-            "AND a.ts <= ? AND LOWER(a.type) LIKE '%origin hold activated%' "
-            "ORDER BY a.id DESC LIMIT 500",
-            (cutoff,)
-        ).fetchall()
-    groups, order = {}, []
-    for r in rows:
-        try:
-            ts = datetime.fromisoformat(r["ts"])
-        except Exception:
-            continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        if (now - ts).total_seconds() / 3600 < EVAL_MIN_AGE_H:
-            continue
-        if r["grp"] not in EVAL_RISK:
-            continue
-        key = (r["grp"], r["asset"])
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append((r, ts))
-
-    # Distances des paliers depuis l'entrée, en unités Fibo : TPn = (n-1)+0.618
-    TP_MULT = [0.618, 1.618, 2.618, 3.618]
-    tiers_reached = [0, 0, 0, 0]        # cumulatif : a atteint TPn
-    stopped_before_tp1 = 0
-    open_at_horizon = 0
-    n_used = 0
-    sum_r = {"A": 0.0, "B": 0.0, "C": 0.0}
-    _start = time.monotonic()
-    for key in order:
-        if time.monotonic() - _start > 45:
-            break
-        grp, asset = key
-        items = groups[key]
-        earliest = min(ts for _, ts in items)
-        floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
-        bars = fetch_prices(grp, asset, max(earliest - timedelta(hours=2), floor_dt), now)
-        if not bars:
-            continue
-        for r, ts in items:
-            entry, target = r["price"], r["target"]
-            long_bias = (r["side"] == "Support")
-            unit = abs(target - entry) / 0.618
-            if unit <= 0:
-                continue
-            sdist = (1.0 - sl_fib_for(grp)) * unit   # v2.7.20
-            if sdist <= 0:
-                continue
-            tf_h = tf_hours(r["timeframe"])
-            horizon_h = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
-            end_win = min(ts + timedelta(hours=horizon_h), now)
-            post = [b for b in bars if ts < b[0] <= end_win]
-            if not post:
-                continue
-            tp_d = [m * unit for m in TP_MULT]
-            # Rejeu unique : MFE séquentiel + stops mobiles du plan C
-            hit = 0                       # nb de paliers encaissés
-            # niveaux de stop (distance signée vs entrée, en points ; négatif = perte)
-            # plan C : initial -sdist ; après TP1 -> 0 (BE) ; TP2 -> +tp_d[0] ; TP3 -> +tp_d[1]
-            c_stop = -sdist
-            a_done = b_done = c_done = False
-            rA = rB = rC = None
-            last_close = post[-1][3]
-            for (_dt, hi, lo, _c) in post:
-                fav = (hi - entry) if long_bias else (entry - lo)
-                adv = (entry - lo) if long_bias else (hi - entry)
-                # conservateur : adverse d'abord
-                # Plan A/B : stop initial fixe
-                if not a_done and adv >= sdist:
-                    rA = -1.0
-                    a_done = True
-                if not b_done and adv >= sdist:
-                    # encaissé jusque-là + reste stoppé à -1
-                    rB = sum(tp_d[i] for i in range(hit)) / (4 * sdist) + (4 - hit) * (-1.0) / 4
-                    b_done = True
-                # Plan C : stop mobile (c_stop = distance signée vs entrée ;
-                # négatif = zone de perte, 0 = BE, positif = palier encaissé)
-                if not c_done:
-                    if c_stop <= 0:
-                        c_hit = adv >= -c_stop
-                    else:
-                        # stop en gain : touché si le prix retrace jusqu'à entry±c_stop
-                        c_hit = ((entry + c_stop) >= lo) if long_bias else ((entry - c_stop) <= hi)
-                    if c_hit:
-                        rC = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * c_stop) / (4 * sdist)
-                        c_done = True
-                # favorable ensuite : paliers atteints
-                new_hit = hit
-                while new_hit < 4 and fav >= tp_d[new_hit]:
-                    new_hit += 1
-                if new_hit > hit:
-                    for i in range(hit, new_hit):
-                        tiers_reached[i] += 1
-                    hit = new_hit
-                    if not a_done and hit >= 1:
-                        rA = tp_d[0] / sdist
-                        a_done = True
-                    if not b_done and hit >= 4:
-                        rB = sum(tp_d) / (4 * sdist)
-                        b_done = True
-                    if not c_done:
-                        # remonter le stop : BE après TP1, palier n-1 ensuite
-                        c_stop = 0.0 if hit == 1 else tp_d[hit - 2]
-                        if hit >= 4:
-                            rC = sum(tp_d) / (4 * sdist)
-                            c_done = True
-                if a_done and b_done and c_done:
-                    break
-            # fin d'horizon : positions restantes soldées au dernier close (M2M)
-            m2m = ((last_close - entry) if long_bias else (entry - last_close))
-            if rA is None:
-                rA = m2m / sdist
-                open_at_horizon += 1
-            if rB is None:
-                rB = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * m2m) / (4 * sdist)
-            if rC is None:
-                rC = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * m2m) / (4 * sdist)
-            if hit == 0 and rA == -1.0:
-                stopped_before_tp1 += 1
-            sum_r["A"] += rA
-            sum_r["B"] += rB
-            sum_r["C"] += rC
-            n_used += 1
-
-    def pct(x):
-        return round(100 * x / n_used, 1) if n_used else 0.0
-    tier_rows = "".join(
-        "<tr><td>TP" + str(i + 1) + " (Fib " + ("%g" % (i + 1.618 if i else 1.618)) + ")</td><td>"
-        + str(tiers_reached[i]) + "</td><td style=\"font-weight:700\">" + str(pct(tiers_reached[i]))
-        + "%</td></tr>" for i in range(4))
-    plan_rows = ""
-    for k, lbl in (("A", "A \u2014 tout-dehors \u00e0 TP1"),
-                   ("B", "B \u2014 4\u00d725% paliers, stop fixe"),
-                   ("C", "C \u2014 4\u00d725% paliers, stop remont\u00e9 (ton plan)")):
-        e = round(sum_r[k] / n_used, 3) if n_used else 0.0
-        ec = "var(--grn)" if e > 0 else "var(--red)"
-        plan_rows += ("<tr><td>" + lbl + "</td><td style=\"font-weight:700;color:" + ec + "\">"
-                      + (("+" if e > 0 else "") + str(e)) + "R</td></tr>")
-    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>FibLab \u2014 TP Ladder</title>' + DASH_CSS + '</head><body>')
-    body = ("<h1>\U0001F3AF Ladder TP \u2014 feedback</h1>"
-            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades \u00b7 stop "
-            + esc(slf_desc) + " \u00b7 " + str(pct(stopped_before_tp1)) + "% stopp\u00e9s avant TP1 \u00b7 "
-            + str(open_at_horizon) + " sold\u00e9s en fin d'horizon (M2M)</div>"
-            "<div class=\"card\"><h2>Paliers atteints (avant stop initial)</h2>"
-            "<table><thead><tr><th>Palier</th><th>N</th><th>% des trades</th></tr></thead><tbody>"
-            + tier_rows + "</tbody></table></div>"
-            "<div class=\"card\"><h2>Esp\u00e9rance par plan de sortie</h2>"
-            "<table><thead><tr><th>Plan</th><th>Esp\u00e9rance</th></tr></thead><tbody>"
-            + plan_rows + "</tbody></table></div>"
-            "<div class=\"note\"><b>Lecture :</b> les % de paliers sont mesur\u00e9s au stop initial "
-            "(un trade stopp\u00e9 apr\u00e8s TP1 compte TP1 atteint). Plans B/C : reste sold\u00e9 au dernier "
-            "close si l'horizon expire. <b>Proxy</b> : feed H1, sans spread/slippage, m\u00eame r\u00e8gle "
-            "conservatrice que /sl_sweep (adverse avant favorable dans la bougie). Le plan C approxime "
-            "ton playbook (BE apr\u00e8s TP1, puis palier pr\u00e9c\u00e9dent) \u2014 tes ajustements manuels "
-            "r\u00e9els peuvent diverger.</div>")
-    return head + body + "</body></html>"
-
-
-@app.route("/db_count", methods=["GET"])
-def db_count():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    with db() as conn:
-        a = conn.execute("SELECT COUNT(*) AS n FROM alerts").fetchone()["n"]
-        o = conn.execute("SELECT COUNT(*) AS n FROM outcomes").fetchone()["n"]
-        p = conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"]
-    return jsonify({"alerts": a, "outcomes": o, "profiles": p, "db_path": DB_PATH})
-
-
-@app.route("/export.csv", methods=["GET"])
-def export_csv():
-    """Dump CSV complet : chaque alerte + son issue (statut, MFE/MAE, R réalisé,
-    note). Pour analyse tableur / partage aux collaborateurs. Content-Disposition
-    en attachment → le navigateur télécharge le fichier."""
-    if not check_secret():
-        return ("unauthorized", 403)
-    import csv, io
-    from flask import Response
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT a.id, a.ts, a.asset, a.grp, a.timeframe, a.type, a.side, a.price, "
-            "a.scope, a.score, a.level, a.target, a.move_pct, "
-            "o.status, o.mfe_pts, o.mae_pts, o.r_realized, o.note "
-            "FROM alerts a LEFT JOIN outcomes o ON a.id = o.alert_id "
-            "ORDER BY a.id"
-        ).fetchall()
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["id", "ts", "asset", "group", "timeframe", "type", "side", "price",
-                "scope", "score", "level", "target", "move_pct", "status", "mfe_pts",
-                "mae_pts", "r_realized", "note"])
-    for r in rows:
-        w.writerow([r["id"], r["ts"], r["asset"], r["grp"], r["timeframe"], r["type"],
-                    r["side"], r["price"], r["scope"], r["score"], r["level"], r["target"],
-                    r["move_pct"], r["status"], r["mfe_pts"], r["mae_pts"], r["r_realized"],
-                    r["note"]])
-    return Response(buf.getvalue(), mimetype="text/csv",
-                    headers={"Content-Disposition": 'attachment; filename="fiblab_export.csv"'})
-
-
-@app.route("/status", methods=["GET"])
-def status():
-    profiles_summary = {uid: {"mode": p["mode"], "paused": p["paused"]}
-                        for uid, p in user_profiles.items()}
-    return jsonify({
-        "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.23",
-        "alerts_total": len(alert_history),
-        **{f"alerts_{g}": len(h) for g, h in histories.items()},
-        "user_profiles": profiles_summary,
-    })
-
-
-@app.route("/", methods=["GET"])
-def dashboard_all():
-    return render_template("dashboard.html", alerts=list(alert_history), page="all",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/xau", methods=["GET"])
-def dashboard_xau():
-    return render_template("dashboard.html", alerts=list(histories["xau"]), page="xau",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/solana", methods=["GET"])
-def dashboard_solana():
-    return render_template("dashboard.html", alerts=list(histories["solana"]), page="solana",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/dax", methods=["GET"])
-def dashboard_dax():
-    return render_template("dashboard.html", alerts=list(histories["dax"]), page="dax",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/btc", methods=["GET"])
-def dashboard_btc():
-    return render_template("dashboard.html", alerts=list(histories["btc"]), page="btc",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/hype", methods=["GET"])
-def dashboard_hype():
-    return render_template("dashboard.html", alerts=list(histories["hype"]), page="hype",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/sui", methods=["GET"])
-def dashboard_sui():
-    return render_template("dashboard.html", alerts=list(histories["sui"]), page="sui",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/stocks", methods=["GET"])
-def dashboard_stocks():
-    return render_template("dashboard.html", alerts=list(histories["stocks"]), page="stocks",
-                           counts={g: len(h) for g, h in histories.items()})
-
-
-@app.route("/levels", methods=["GET"])
-def levels():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
-    return jsonify(list(alert_history))
-
-
-def _test(fake: str):
-    parsed  = parse_fiblab_message(fake)
-    scoring = compute_score(parsed, history=alert_history)
-    group   = get_asset_group(parsed.get("asset") or "")
-    try:
-        save_alert(parsed, scoring, group)
-    except Exception as e:
-        print(f"[DB] _test save_alert : {e}")
-    msg = format_telegram_message(parsed, scoring, get_profile(TELEGRAM_CHAT_ID))
-    sent_charlie = send_telegram(msg, TELEGRAM_CHAT_ID)
-    sent_frere   = send_telegram(msg, TELEGRAM_CHAT_ID_2) if TELEGRAM_CHAT_ID_2 else False
-    return jsonify({"telegram_charlie": sent_charlie, "telegram_frere": sent_frere,
-                    "frere_configured": bool(TELEGRAM_CHAT_ID_2), "scoring": scoring})
-
-
-@app.route("/test", methods=["GET"])
-def test_xau():
-    return _test("Origin Untouched — XAUUSD 2D | Side: Support | Price: 4310.00 | Scope: Pure")
-
-
-@app.route("/test_solana", methods=["GET"])
-def test_solana():
-    return _test("Origin First Touch — SOLUSDT.P H4 | Side: Support | Price: 142.50 | Scope: Pure")
-
-
-@app.route("/test_dax", methods=["GET"])
-def test_dax():
-    return _test("Broken First Touch — DE30EUR H4 | Side: Resistance | Price: 24850.00 | Scope: Pure")
-
-
-@app.route("/test_btc", methods=["GET"])
-def test_btc():
-    return _test("Origin First Touch — BTCUSDT.P H4 | Side: Support | Price: 98500.00 | Scope: Pure")
-
-
-@app.route("/test_stocks", methods=["GET"])
-def test_stocks():
-    return _test("Origin First Touch — TSLA H4 | Side: Support | Price: 285.00 | Scope: Pure")
-
-
-@app.route("/test_hold", methods=["GET"])
-def test_hold():
-    """Test du parser hold : simule un message ACTIVATED avec cible d'obligation."""
-    raw = ("Hold ACTIVATED\nTF: 1440\nSupport\nWick Engulfment\n"
-           "Entry touched: 4310.00\nExit: 4355.00\nMove%: 1.04")
-    parsed  = parse_hold_message(raw, asset_hint="XAUUSD")
-    scoring = compute_score(parsed, history=alert_history)
-    group   = get_asset_group(parsed.get("asset") or "")
-    try:
-        save_alert(parsed, scoring, group)
-    except Exception as e:
-        print(f"[DB] _test_hold save_alert : {e}")
-    msg = format_telegram_message(parsed, scoring, get_profile(TELEGRAM_CHAT_ID))
-    sent = send_telegram(msg, TELEGRAM_CHAT_ID)
-    return jsonify({"telegram_charlie": sent, "parsed": parsed, "scoring": scoring})
-
-
-# ─────────────────────────────────────────────
-# INIT (au chargement du module → fonctionne aussi sous gunicorn)
-# ─────────────────────────────────────────────
-init_db()
-migrate_db()                     # v2.6.0 : ajoute colonnes target/move_pct si besoin
-clean_seed_rows()
-load_profiles()
-load_alert_history()
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+                   
