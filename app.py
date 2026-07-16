@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.28)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.29)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
 ║                                                              ║
 ║  Patch v2.7.26 "Alertes au format ticket" + b :              ║
@@ -1052,6 +1052,7 @@ TG_STR = {
         "tk_chart": "Ouvrir le chart TradingView",
         "tk_demo_warn": "\u26a0\ufe0f <i>D\u00e9mo. V\u00e9rifie la taille (specs broker) avant de poser.</i>",
         "tk_no_order": "\u2014 NE PAS POSER sans v\u00e9rifier l'actif",
+        "tk_origin": "Origine cr\u00e9\u00e9e", "tk_origin_unknown": "inconnue (ant\u00e9rieure au bot)",
     },
     "en": {
         "alert": "ALERT", "score": "Score", "asset": "Asset", "level": "Level",
@@ -1072,6 +1073,7 @@ TG_STR = {
         "tk_chart": "Open the TradingView chart",
         "tk_demo_warn": "\u26a0\ufe0f <i>Demo. Verify the size (broker specs) before parking.</i>",
         "tk_no_order": "\u2014 DO NOT PARK before verifying the asset",
+        "tk_origin": "Origin created", "tk_origin_unknown": "unknown (predates the bot)",
     },
 }
 
@@ -1852,6 +1854,47 @@ def evaluate_pending_outcomes():
 # ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
+
+
+def origin_created_at(grp, price, before_ts=None):
+    """v2.7.29 — Timestamp de NAISSANCE d'un niveau : premier événement
+    'CREATED' du même groupe au même prix (±0,05%). Fallback : plus ancien
+    événement non-ACTIVATED sur ce niveau. None si introuvable (niveau
+    antérieur au bot) — on n'invente pas de date."""
+    try:
+        tol = 0.0005 * max(abs(float(price)), 1e-9)
+    except (TypeError, ValueError):
+        return None
+    with db() as conn:
+        row = conn.execute(
+            "SELECT ts FROM alerts WHERE grp=? AND price BETWEEN ? AND ? "
+            "AND LOWER(type) LIKE '%created%' "
+            + ("AND ts < ? " if before_ts else "")
+            + "ORDER BY ts ASC LIMIT 1",
+            ([grp, price - tol, price + tol] + ([before_ts] if before_ts else []))).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT ts FROM alerts WHERE grp=? AND price BETWEEN ? AND ? "
+                "AND LOWER(type) NOT LIKE '%activated%' "
+                + ("AND ts < ? " if before_ts else "")
+                + "ORDER BY ts ASC LIMIT 1",
+                ([grp, price - tol, price + tol] + ([before_ts] if before_ts else []))).fetchone()
+    return row["ts"] if row else None
+
+
+def _origin_line(parsed, group, S):
+    ts = origin_created_at(group, parsed.get("price"), before_ts=parsed.get("timestamp"))
+    if not ts:
+        return "<i>" + S["tk_origin_unknown"] + "</i>"
+    try:
+        d = datetime.fromisoformat(ts)
+        if d.tzinfo:
+            d = d.astimezone(timezone.utc)
+        return "<b>" + d.strftime("%d/%m %H:%M") + " UTC</b>"
+    except Exception:
+        return "<i>" + S["tk_origin_unknown"] + "</i>"
+
+
 def build_trade_ticket(parsed, group, profile=None, scoring=None, as_alert=False):
     """ORDRE LIMITE au repos pour les types tradeables (Origin Hold ACTIVATED) :
     limite \u00e0 l'entr\u00e9e (Fib 1), SL = Fib 0 d\u00e9riv\u00e9, ladder de TP d\u00e9riv\u00e9e,
@@ -1931,6 +1974,7 @@ def build_trade_ticket(parsed, group, profile=None, scoring=None, as_alert=False
         bar,
         S["tk_dir"] + "   : " + dir_txt,
         S["tk_entry"] + " : <b>" + str(entry) + "</b> <i>" + S["tk_entry_note"] + "</i>",
+        S["tk_origin"] + " : " + _origin_line(parsed, group, S),
         "SL     : <b>" + str(_px(sl)) + "</b> <i>" + S["tk_sl_note"].format(f=("%g" % slf)) + "</i>",
         "TP1 <b>" + str(_px(target)) + "</b> \u00b7 TP2 " + str(_ext(2.618))
         + " \u00b7 TP3 " + str(_ext(3.618)) + " \u00b7 TP4 " + str(_ext(4.618)),
@@ -3456,7 +3500,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.28",
+        "version": "2.7.29",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
