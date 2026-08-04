@@ -1,7 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.33)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.35)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.35 "Éval sélective + garde-fou reeval" :         ║
+║   • Éval par priorité : ACTIVATED d'abord, autres Hold,      ║
+║     puis standard — non-ACTIVATED plafonnés à 60/run         ║
+║     (échantillon témoin) → la file ~5800 ne brûle plus le    ║
+║     quota ; les 55 lignes de référence reviennent en 1er     ║
+║   • /reeval : 409 sans ?confirm=yes au-delà de 300 évaluées  ║
+║   • /tf et /assets : espaces acceptés comme séparateurs      ║
+║   (v2.7.27-34 : origin+prox, /prox_gap, date d'origine,      ║
+║    zone Fib1→Fib0, %variation, /tf, /move — voir commits)    ║
 ║                                                              ║
 ║  Patch v2.7.26 "Alertes au format ticket" + b :              ║
 ║   • /signaux origin+prox : Origin Hold ACTIVATED + pré-avis  ║
@@ -1269,7 +1279,7 @@ def handle_telegram_command(text: str, chat_id: str):
             save_profile(chat_id, profile)
             msg = "\u2705 All assets." if _en else "\u2705 Tous les actifs."
         elif arg:
-            toks = [t.strip() for t in " ".join(parts[1:]).replace(";", ",").split(",") if t.strip()]
+            toks = [t.strip() for t in " ".join(parts[1:]).replace(";", ",").replace(" ", ",").split(",") if t.strip()]
             groups, bad = [], []
             for t in toks:
                 g = _alias.get(t, t)
@@ -1304,7 +1314,7 @@ def handle_telegram_command(text: str, chat_id: str):
             msg = ("\u2705 All timeframes (per /mode)." if _en
                    else "\u2705 Tous les timeframes (selon /mode).")
         elif arg:
-            toks = [t.strip().lower() for t in " ".join(parts[1:]).replace(";", ",").split(",") if t.strip()]
+            toks = [t.strip().lower() for t in " ".join(parts[1:]).replace(";", ",").replace(" ", ",").split(",") if t.strip()]
             tfs, bad = [], []
             for t in toks:
                 c = _canon.get(t, t.upper())
@@ -1617,6 +1627,7 @@ def handle_telegram_command(text: str, chat_id: str):
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
 EVAL_MIN_AGE_H      = 12
+EVAL_WITNESS_CAP   = 60    # v2.7.35 : non-ACTIVATED max par run (échantillon témoin)
 EVAL_ATR_BARS       = 14
 EVAL_HORIZON_BARS   = 12
 EVAL_HORIZON_MIN_H  = 48
@@ -1821,7 +1832,8 @@ def evaluate_pending_outcomes():
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
             "AND a.ts <= ? "
-            "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%hold%' THEN 0 ELSE 1 END), a.id DESC "
+            "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%activated%' THEN 0 "
+            "WHEN LOWER(a.type) LIKE '%hold%' THEN 1 ELSE 2 END), a.id DESC "
             "LIMIT 500",
             (cutoff,)
         ).fetchall()
@@ -1843,6 +1855,12 @@ def evaluate_pending_outcomes():
         tf_h       = tf_hours(r["timeframe"])
         horizon_h  = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
         lookback_h = min(EVAL_ATR_BARS * tf_h, EVAL_LOOKBACK_MAX_H)
+        # v2.7.35 : échantillon témoin — non-ACTIVATED plafonnés par run
+        if "activated" not in (r["type"] or "").lower():
+            _nact = sum(1 for g in groups.values() for it in g
+                        if "activated" not in (it["r"]["type"] or "").lower())
+            if _nact >= EVAL_WITNESS_CAP:
+                continue
         key = (r["grp"], r["asset"])
         if key not in groups:
             groups[key] = []
@@ -2728,8 +2746,16 @@ def evaluate_route():
 
 @app.route("/reeval", methods=["GET", "POST"])
 def reeval_route():
+    """v2.7.35 : destructif — exige ?confirm=yes au-delà de 300 évaluées
+    (incident du 26/07 : reset accidentel de toute la base d'évaluation)."""
     if not check_secret():
         return jsonify({"error": "unauthorized"}), 403
+    with db() as conn:
+        done = conn.execute("SELECT COUNT(*) AS n FROM outcomes WHERE status != 'pending'").fetchone()["n"]
+    if done > 300 and request.args.get("confirm") != "yes":
+        return jsonify({"blocked": True, "evaluated_that_would_reset": done,
+                        "message": "Reset TOTAL du dashboard. Si voulu : &confirm=yes. "
+                                   "Usage normal : après un changement /sl_fib."}), 409
     with db() as conn:
         cur = conn.execute(
             "UPDATE outcomes SET status='pending', mfe_pts=NULL, mae_pts=NULL, "
@@ -3607,7 +3633,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.33",
+        "version": "2.7.35",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
