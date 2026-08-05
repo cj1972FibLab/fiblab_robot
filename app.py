@@ -1,7 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.35)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.36)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.36 "FIX drainage de la file" :                   ║
+║   • Tri ASC (anciennes d'abord) dans chaque classe — la file ║
+║     se vide par l'arrière ; le DESC moulinait sur les        ║
+║     récentes non-résolubles → evaluated=0 chronique          ║
+║   • Alertes expirées hors fenêtre feed -> invalid (sinon     ║
+║     bouchon éternel en tête de file ASC)                     ║
 ║                                                              ║
 ║  Patch v2.7.35 "Éval sélective + garde-fou reeval" :         ║
 ║   • Éval par priorité : ACTIVATED d'abord, autres Hold,      ║
@@ -1832,8 +1839,11 @@ def evaluate_pending_outcomes():
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
             "AND a.ts <= ? "
+            # v2.7.36 : ASC — les plus ANCIENNES d'abord dans chaque classe :
+            # elles sont résolubles (ou expirables) immédiatement, la file se
+            # vide par l'arrière au lieu de mouliner sur les récentes en cours.
             "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%activated%' THEN 0 "
-            "WHEN LOWER(a.type) LIKE '%hold%' THEN 1 ELSE 2 END), a.id DESC "
+            "WHEN LOWER(a.type) LIKE '%hold%' THEN 1 ELSE 2 END), a.id ASC "
             "LIMIT 500",
             (cutoff,)
         ).fetchall()
@@ -1892,6 +1902,12 @@ def evaluate_pending_outcomes():
             pre  = [b for b in bars if lb_start <= b[0] <= ts]
             post = [b for b in bars if ts < b[0] <= end_win]
             if not post:
+                # v2.7.36 : horizon écoulé ET fenêtre de données dépassée -> on
+                # ne pourra JAMAIS évaluer ; classer pour vider la file.
+                if now >= ts + timedelta(hours=horizon_h) and \
+                        (bars and bars[0][0] > end_win):
+                    updates.append(("invalid", None, None, None,
+                                    "expiré hors fenêtre feed (v2.7.36)", now_iso(), r["id"]))
                 continue
 
             atr = _atr_at_tf(pre, tf_h)
@@ -3633,7 +3649,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.35",
+        "version": "2.7.36",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
