@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.41)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.42)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.42 "TP Ladder complet" :                         ║
+║   • /tp_ladder refondu : filtres asset/tf/type/sl,           ║
+║     grille P(TP1..TP4 avant stop) pour 4 niveaux de SL,      ║
+║     banc de 5 plans de sortie rejoués (dont 50/20/15/15)     ║
 ║                                                              ║
 ║  Patch v2.7.41 "Stop or = 0.786 par défaut" :                ║
 ║   • SL_FIB_ASSET_DEFAULTS : défauts de stop PAR ACTIF en dur ║
@@ -3458,33 +3463,46 @@ def sl_sweep():
 
 @app.route("/tp_ladder", methods=["GET"])
 def tp_ladder():
-    """v2.7.18 — Feedback de la LADDER TP : pour chaque Origin Hold ACTIVATED,
-    rejoue le prix et mesure quels paliers (TP1=1.618, TP2=2.618, TP3=3.618,
-    TP4=4.618) sont atteints avant le stop. Compare 3 plans de sortie :
-      A) tout-dehors à TP1 (référence, = l'éval actuelle)
-      B) 4×25% aux paliers, stop INITIAL fixe
-      C) 4×25% aux paliers, stop remonté après chaque palier (BE puis palier
-         précédent) — ton playbook réel
-    Reste ouvert en fin d'horizon = clôturé au dernier close (mark-to-market).
-    Même règle conservatrice que /sl_sweep : dans une même bougie, l'adverse
-    est réputé toucher AVANT le favorable. Stop au /sl_fib courant.
-    À lancer 1× à froid (refait les fetches)."""
+    """v2.7.42 — Analyse complète de la LADDER TP.
+    Filtres : ?asset=xau  ?tf=h4,h6  ?type=origin|activated  ?sl=0.786
+    (sl par défaut = le réglage de l'actif). Sorties :
+      1) Taux d'atteinte de TP1..TP4 AVANT le stop, pour 4 niveaux de SL
+         (0.786 / 0.5 / 0 / -1) — indépendant du plan de sortie.
+      2) Banc de 5 plans de sortie rejoués trade par trade au SL choisi :
+         A  100% TP1, stop fixe (= l'éval de référence)
+         B  25/25/25/25, stop fixe
+         C  25/25/25/25, stop remonté (BE après TP1, palier n-1 ensuite)
+         D  50/20/15/15, stop remonté (proposition Fred)
+         E  60/40 TP1/TP2, stop remonté
+    Conservateur : dans une bougie, l'adverse touche AVANT le favorable.
+    Reste ouvert en fin d'horizon = soldé au dernier close (M2M)."""
     if not check_secret():
         return ("unauthorized", 403)
-    slf_desc = "global %g" % robot_state.get("sl_fib", SL_FIB_DEFAULT)
-    if robot_state.get("sl_fib_asset"):
-        slf_desc += " + overrides " + json.dumps(robot_state["sl_fib_asset"])
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
+    _type_f = (request.args.get("type") or "origin").lower().strip()
+    _like = "%hold activated%" if _type_f == "activated" else "%origin hold activated%"
+    _af = (request.args.get("asset") or "").lower().strip()
+    _tf_f = set()
+    for _t in (request.args.get("tf") or "").upper().replace(" ", ",").split(","):
+        _t = _t.strip()
+        if _t:
+            _tf_f |= _TF_EQUIV.get(_t, {_t})
+    try:
+        _sl_arg = float(request.args.get("sl", ""))
+    except ValueError:
+        _sl_arg = None
+
     with db() as conn:
         rows = conn.execute(
             "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE a.price IS NOT NULL AND a.side IS NOT NULL AND a.target IS NOT NULL "
-            "AND a.ts <= ? AND LOWER(a.type) LIKE '%origin hold activated%' "
+            "AND a.ts <= ? AND LOWER(a.type) LIKE ? "
             "ORDER BY a.id DESC LIMIT 500",
-            (cutoff,)
+            (cutoff, _like)
         ).fetchall()
+
     groups, order = {}, []
     for r in rows:
         try:
@@ -3497,19 +3515,32 @@ def tp_ladder():
             continue
         if r["grp"] not in EVAL_RISK:
             continue
+        if _af and r["grp"] != _af:
+            continue
+        if _tf_f and (r["timeframe"] or "").upper() not in _tf_f:
+            continue
         key = (r["grp"], r["asset"])
         if key not in groups:
             groups[key] = []
             order.append(key)
         groups[key].append((r, ts))
 
-    # Distances des paliers depuis l'entrée, en unités Fibo : TPn = (n-1)+0.618
     TP_MULT = [0.618, 1.618, 2.618, 3.618]
-    tiers_reached = [0, 0, 0, 0]        # cumulatif : a atteint TPn
-    stopped_before_tp1 = 0
-    open_at_horizon = 0
+    SL_GRID = [0.786, 0.5, 0.0, -1.0]
+    # hit_grid[sl][k] = nb de trades ayant atteint TP(k+1) avant ce stop
+    hit_grid = {f: [0, 0, 0, 0] for f in SL_GRID}
+    n_grid = 0
+    # Plans : (label, poids, trailing)
+    PLANS = [("A \u00b7 100% TP1, stop fixe", [1.0, 0, 0, 0], False),
+             ("B \u00b7 25\u00d74, stop fixe", [.25, .25, .25, .25], False),
+             ("C \u00b7 25\u00d74, stop remont\u00e9", [.25, .25, .25, .25], True),
+             ("D \u00b7 50/20/15/15, stop remont\u00e9", [.50, .20, .15, .15], True),
+             ("E \u00b7 60/40 TP1-TP2, stop remont\u00e9", [.60, .40, 0, 0], True)]
+    plan_sum = [0.0] * len(PLANS)
+    plan_win = [0] * len(PLANS)
     n_used = 0
-    sum_r = {"A": 0.0, "B": 0.0, "C": 0.0}
+    open_at_horizon = 0
+    sl_used_desc = None
     _start = time.monotonic()
     for key in order:
         if time.monotonic() - _start > 45:
@@ -3527,7 +3558,9 @@ def tp_ladder():
             unit = abs(target - entry) / 0.618
             if unit <= 0:
                 continue
-            sdist = (1.0 - sl_fib_for(grp)) * unit   # v2.7.20
+            slf = _sl_arg if _sl_arg is not None else sl_fib_for(grp)
+            sl_used_desc = "%g" % slf
+            sdist = (1.0 - slf) * unit
             if sdist <= 0:
                 continue
             tf_h = tf_hours(r["timeframe"])
@@ -3537,109 +3570,110 @@ def tp_ladder():
             if not post:
                 continue
             tp_d = [m * unit for m in TP_MULT]
-            # Rejeu unique : MFE séquentiel + stops mobiles du plan C
-            hit = 0                       # nb de paliers encaissés
-            # niveaux de stop (distance signée vs entrée, en points ; négatif = perte)
-            # plan C : initial -sdist ; après TP1 -> 0 (BE) ; TP2 -> +tp_d[0] ; TP3 -> +tp_d[1]
-            c_stop = -sdist
-            a_done = b_done = c_done = False
-            rA = rB = rC = None
+
+            # ═ 1. Grille P(TPk avant stop) pour les 4 niveaux de SL — plan-agnostique ═
+            for f in SL_GRID:
+                sd = (1.0 - f) * unit
+                khit, stopped = 0, False
+                for (_dt, hi, lo, _c) in post:
+                    fav = (hi - entry) if long_bias else (entry - lo)
+                    adv = (entry - lo) if long_bias else (hi - entry)
+                    if adv >= sd:
+                        stopped = True
+                        break
+                    while khit < 4 and fav >= tp_d[khit]:
+                        hit_grid[f][khit] += 1
+                        khit += 1
+                    if khit >= 4:
+                        break
+            n_grid += 1
+
+            # ═ 2. Banc des 5 plans, au SL choisi ═
             last_close = post[-1][3]
-            for (_dt, hi, lo, _c) in post:
-                fav = (hi - entry) if long_bias else (entry - lo)
-                adv = (entry - lo) if long_bias else (hi - entry)
-                # conservateur : adverse d'abord
-                # Plan A/B : stop initial fixe
-                if not a_done and adv >= sdist:
-                    rA = -1.0
-                    a_done = True
-                if not b_done and adv >= sdist:
-                    # encaissé jusque-là + reste stoppé à -1
-                    rB = sum(tp_d[i] for i in range(hit)) / (4 * sdist) + (4 - hit) * (-1.0) / 4
-                    b_done = True
-                # Plan C : stop mobile (c_stop = distance signée vs entrée ;
-                # négatif = zone de perte, 0 = BE, positif = palier encaissé)
-                if not c_done:
-                    if c_stop <= 0:
-                        c_hit = adv >= -c_stop
-                    else:
-                        # stop en gain : touché si le prix retrace jusqu'à entry±c_stop
-                        c_hit = ((entry + c_stop) >= lo) if long_bias else ((entry - c_stop) <= hi)
-                    if c_hit:
-                        rC = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * c_stop) / (4 * sdist)
-                        c_done = True
-                # favorable ensuite : paliers atteints
-                new_hit = hit
-                while new_hit < 4 and fav >= tp_d[new_hit]:
-                    new_hit += 1
-                if new_hit > hit:
-                    for i in range(hit, new_hit):
-                        tiers_reached[i] += 1
-                    hit = new_hit
-                    if not a_done and hit >= 1:
-                        rA = tp_d[0] / sdist
-                        a_done = True
-                    if not b_done and hit >= 4:
-                        rB = sum(tp_d) / (4 * sdist)
-                        b_done = True
-                    if not c_done:
-                        # remonter le stop : BE après TP1, palier n-1 ensuite
-                        c_stop = 0.0 if hit == 1 else tp_d[hit - 2]
-                        if hit >= 4:
-                            rC = sum(tp_d) / (4 * sdist)
-                            c_done = True
-                if a_done and b_done and c_done:
-                    break
-            # fin d'horizon : positions restantes soldées au dernier close (M2M)
             m2m = ((last_close - entry) if long_bias else (entry - last_close))
-            if rA is None:
-                rA = m2m / sdist
-                open_at_horizon += 1
-            if rB is None:
-                rB = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * m2m) / (4 * sdist)
-            if rC is None:
-                rC = (sum(tp_d[i] for i in range(hit)) + (4 - hit) * m2m) / (4 * sdist)
-            if hit == 0 and rA == -1.0:
-                stopped_before_tp1 += 1
-            sum_r["A"] += rA
-            sum_r["B"] += rB
-            sum_r["C"] += rC
+            for pi, (_lbl, w, trailing) in enumerate(PLANS):
+                hit, c_stop, done, rP = 0, -sdist, False, None
+                for (_dt, hi, lo, _c) in post:
+                    fav = (hi - entry) if long_bias else (entry - lo)
+                    adv = (entry - lo) if long_bias else (hi - entry)
+                    if c_stop <= 0:
+                        s_hit = adv >= -c_stop
+                    else:
+                        s_hit = ((entry + c_stop) >= lo) if long_bias else ((entry - c_stop) <= hi)
+                    if s_hit:
+                        cash = sum(w[i] * tp_d[i] for i in range(hit))
+                        rem = sum(w[i] for i in range(hit, 4))
+                        rP = (cash + rem * c_stop) / sdist
+                        done = True
+                        break
+                    new_hit = hit
+                    while new_hit < 4 and fav >= tp_d[new_hit]:
+                        new_hit += 1
+                    if new_hit > hit:
+                        hit = new_hit
+                        if sum(w[i] for i in range(hit, 4)) <= 1e-9:
+                            rP = sum(w[i] * tp_d[i] for i in range(4)) / sdist
+                            done = True
+                            break
+                        if trailing:
+                            c_stop = 0.0 if hit == 1 else tp_d[hit - 2]
+                if not done:
+                    cash = sum(w[i] * tp_d[i] for i in range(hit))
+                    rem = sum(w[i] for i in range(hit, 4))
+                    rP = (cash + rem * m2m) / sdist
+                    if pi == 0:
+                        open_at_horizon += 1
+                plan_sum[pi] += rP
+                if rP > 0:
+                    plan_win[pi] += 1
             n_used += 1
 
-    def pct(x):
-        return round(100 * x / n_used, 1) if n_used else 0.0
-    tier_rows = "".join(
-        "<tr><td>TP" + str(i + 1) + " (Fib " + ("%g" % (i + 1.618 if i else 1.618)) + ")</td><td>"
-        + str(tiers_reached[i]) + "</td><td style=\"font-weight:700\">" + str(pct(tiers_reached[i]))
-        + "%</td></tr>" for i in range(4))
+    # ═ Rendu ═
+    title_f = []
+    if _af:
+        title_f.append(_af.upper())
+    if _tf_f:
+        title_f.append("/".join(sorted(_tf_f)))
+    title_f.append("famille ACTIVATED" if _type_f == "activated" else "Origin Hold ACTIVATED")
+    grid_rows = ""
+    for k in range(4):
+        cells = ""
+        for f in SL_GRID:
+            p = (100.0 * hit_grid[f][k] / n_grid) if n_grid else 0.0
+            rmult = TP_MULT[k] / (1.0 - f)
+            col = "var(--grn)" if p >= 50 else ("var(--gold)" if p >= 30 else "var(--dim)")
+            cells += (f'<td style="color:{col}"><b>{p:.0f}%</b> '
+                      f'<span style="font-size:.78em;color:var(--dim)">({rmult:.2f}R)</span></td>')
+        grid_rows += f'<tr><td><b>TP{k+1}</b> ({TP_MULT[k]:.3f}u)</td>{cells}</tr>'
+    best = max(range(len(PLANS)), key=lambda i: plan_sum[i]) if n_used else 0
     plan_rows = ""
-    for k, lbl in (("A", "A \u2014 tout-dehors \u00e0 TP1"),
-                   ("B", "B \u2014 4\u00d725% paliers, stop fixe"),
-                   ("C", "C \u2014 4\u00d725% paliers, stop remont\u00e9 (ton plan)")):
-        e = round(sum_r[k] / n_used, 3) if n_used else 0.0
-        ec = "var(--grn)" if e > 0 else "var(--red)"
-        plan_rows += ("<tr><td>" + lbl + "</td><td style=\"font-weight:700;color:" + ec + "\">"
-                      + (("+" if e > 0 else "") + str(e)) + "R</td></tr>")
+    for pi, (lbl, _w, _t) in enumerate(PLANS):
+        mr = plan_sum[pi] / n_used if n_used else 0.0
+        wr = 100.0 * plan_win[pi] / n_used if n_used else 0.0
+        hl = ' style="background:rgba(63,185,80,.12)"' if pi == best else ""
+        col = "var(--grn)" if mr > 0.05 else ("var(--red)" if mr < -0.05 else "var(--gold)")
+        plan_rows += (f'<tr{hl}><td>{lbl}</td><td style="color:{col};font-weight:700">{mr:+.3f}R</td>'
+                      f'<td>{wr:.0f}%</td><td style="color:var(--dim)">{plan_sum[pi]:+.1f}R</td></tr>')
     head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             '<title>FibLab \u2014 TP Ladder</title>' + DASH_CSS + '</head><body>')
-    body = ("<h1>\U0001F3AF Ladder TP \u2014 feedback</h1>"
-            "<div class=\"sub\">Origin Hold ACTIVATED \u2014 " + str(n_used) + " trades \u00b7 stop "
-            + esc(slf_desc) + " \u00b7 " + str(pct(stopped_before_tp1)) + "% stopp\u00e9s avant TP1 \u00b7 "
-            + str(open_at_horizon) + " sold\u00e9s en fin d'horizon (M2M)</div>"
-            "<div class=\"card\"><h2>Paliers atteints (avant stop initial)</h2>"
-            "<table><thead><tr><th>Palier</th><th>N</th><th>% des trades</th></tr></thead><tbody>"
-            + tier_rows + "</tbody></table></div>"
-            "<div class=\"card\"><h2>Esp\u00e9rance par plan de sortie</h2>"
-            "<table><thead><tr><th>Plan</th><th>Esp\u00e9rance</th></tr></thead><tbody>"
-            + plan_rows + "</tbody></table></div>"
-            "<div class=\"note\"><b>Lecture :</b> les % de paliers sont mesur\u00e9s au stop initial "
-            "(un trade stopp\u00e9 apr\u00e8s TP1 compte TP1 atteint). Plans B/C : reste sold\u00e9 au dernier "
-            "close si l'horizon expire. <b>Proxy</b> : feed H1, sans spread/slippage, m\u00eame r\u00e8gle "
-            "conservatrice que /sl_sweep (adverse avant favorable dans la bougie). Le plan C approxime "
-            "ton playbook (BE apr\u00e8s TP1, puis palier pr\u00e9c\u00e9dent) \u2014 tes ajustements manuels "
-            "r\u00e9els peuvent diverger.</div>")
-    return head + body + "</body></html>"
+    body = ('<h1>\U0001F3AF Ladder TP \u2014 ' + esc(" \u00b7 ".join(title_f)) + '</h1>'
+            '<div class="sub">' + str(n_used) + ' trades rejou\u00e9s \u00b7 SL du banc de plans : Fib '
+            + esc(sl_used_desc or "?") + ' \u00b7 ' + str(open_at_horizon)
+            + ' encore ouverts \u00e0 l\u2019horizon (sold\u00e9s M2M)</div>'
+            '<div class="card"><h2>Taux d\u2019atteinte des paliers AVANT le stop</h2>'
+            '<div class="note">Chaque cellule : % des trades o\u00f9 le palier est atteint avant ce stop, '
+            'et (le R que vaut ce palier \u00e0 ce stop). Un stop serr\u00e9 baisse le % mais gonfle le R \u2014 '
+            'c\u2019est l\u2019arbitrage \u00e0 lire.</div>'
+            '<table><thead><tr><th>Palier</th><th>SL 0.786</th><th>SL 0.5</th><th>SL 0</th><th>SL \u22121</th>'
+            '</tr></thead><tbody>' + grid_rows + '</tbody></table></div>'
+            '<div class="card"><h2>Banc des plans de sortie (SL Fib ' + esc(sl_used_desc or "?") + ')</h2>'
+            '<div class="note">Rejou\u00e9s trade par trade, r\u00e8gle conservatrice. \u00ab stop remont\u00e9 \u00bb '
+            '= BE apr\u00e8s TP1, puis palier n\u22121. Ligne verte = meilleure esp\u00e9rance. '
+            'Ajoute ?sl=0.5 \u00b7 ?tf=h4,h6 \u00b7 ?type=activated \u00e0 l\u2019URL pour changer le p\u00e9rim\u00e8tre.</div>'
+            '<table><thead><tr><th>Plan</th><th>R moyen</th><th>% trades positifs</th><th>R total</th>'
+            '</tr></thead><tbody>' + plan_rows + '</tbody></table></div>')
+    return head + body + '</body></html>'
 
 
 @app.route("/prox_gap", methods=["GET"])
@@ -3797,7 +3831,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.41",
+        "version": "2.7.42",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
