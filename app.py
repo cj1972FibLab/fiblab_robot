@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.38)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.39)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.39 "Matrice TYPE × TF" :                         ║
+║   • Vue croisée type × timeframe au dashboard : R moyen,     ║
+║     win rate et n par cellule — répond à "où vit l'edge"     ║
+║     (respecte les filtres type/asset ; n<10 estompé)         ║
 ║                                                              ║
 ║  Patch v2.7.38 "Range Trendlines = contexte" :               ║
 ║   • Parser des messages RT (role/approxPrice/tf) du Range    ║
@@ -3059,6 +3064,7 @@ def stats_view():
 
     counts = {"win": 0, "loss": 0, "invalid": 0, "pending": 0, "skip": 0}
     by_score, by_type, by_tf = {}, {}, {}
+    by_cross = {}          # v2.7.39 : (type, tf) -> win/loss/R
     r_by_type = {}
     by_asset = {}          # v2.7.16 : agrégat par actif (toujours global, hors filtre asset)
     r_sum_all, r_cnt_all = 0.0, 0
@@ -3082,8 +3088,14 @@ def stats_view():
             by_score.setdefault(r["score"], {"win": 0, "loss": 0})[st] += 1
             by_type.setdefault(r["type"] or "?", {"win": 0, "loss": 0})[st] += 1
             by_tf.setdefault(r["timeframe"] or "?", {"win": 0, "loss": 0})[st] += 1
+            # v2.7.39 : matrice croisée TYPE × TF — la vue qui dit OÙ vit l'edge
+            _xk = (r["type"] or "?", r["timeframe"] or "?")
+            dx = by_cross.setdefault(_xk, {"win": 0, "loss": 0, "rsum": 0.0, "rcnt": 0})
+            dx[st] += 1
             rr = r["r_realized"]
             if rr is not None:
+                dx["rsum"] += rr
+                dx["rcnt"] += 1
                 d = r_by_type.setdefault(r["type"] or "?", {"sum": 0.0, "cnt": 0})
                 d["sum"] += rr
                 d["cnt"] += 1
@@ -3196,6 +3208,49 @@ def stats_view():
                  + '<th>' + T["th_rmean"] + '</th><th>' + T["th_rtotal"] + '</th></tr></thead><tbody>'
                  + "".join(exp_rows) + '</tbody></table></div>')
 
+    # ── v2.7.39 : MATRICE TYPE × TF — où vit l'edge, cellule par cellule ──
+    _tf_rank = {"M1": 0, "M2": 1, "M3": 2, "M5": 3, "M15": 4, "M30": 5,
+                "H1": 10, "H2": 11, "H3": 12, "H4": 13, "H6": 14, "H8": 15,
+                "H10": 16, "H12": 17, "1D": 20, "2D": 21, "3D": 22, "4D": 23,
+                "5D": 24, "6D": 25, "7D": 26, "1W": 30}
+    _x_tfs = sorted({tf for (_t, tf) in by_cross}, key=lambda t: _tf_rank.get(t, 99))
+    _x_types = sorted({t for (t, _tf) in by_cross},
+                      key=lambda t: ("activated" not in t.lower(), t))
+    if by_cross and _x_tfs:
+        xh = "".join(f"<th>{esc(t)}</th>" for t in _x_tfs)
+        xrows = []
+        for ty in _x_types:
+            cells = []
+            for tf in _x_tfs:
+                v = by_cross.get((ty, tf))
+                if not v or (v["win"] + v["loss"]) == 0:
+                    cells.append('<td style="color:#30363d">·</td>')
+                    continue
+                n = v["win"] + v["loss"]
+                wrx = 100.0 * v["win"] / n
+                mr = (v["rsum"] / v["rcnt"]) if v["rcnt"] else 0.0
+                col = "var(--grn)" if mr > 0.05 else ("var(--red)" if mr < -0.05 else "var(--gold)")
+                dim = ' opacity:.45;' if n < 10 else ''
+                cells.append(
+                    f'<td style="color:{col};{dim}white-space:nowrap">'
+                    f'<b>{mr:+.2f}R</b><br><span style="font-size:.78em;color:var(--dim)">'
+                    f'{wrx:.0f}% \u00b7 n={n}</span></td>')
+            xrows.append(f'<tr><td style="white-space:nowrap">{esc(ty)}</td>' + "".join(cells) + '</tr>')
+        cross_html = ('<div class="card"><h2>' + ("Matrice TYPE \u00d7 TF \u2014 o\u00f9 vit l\u2019edge"
+                                                  if lang == "fr" else "TYPE \u00d7 TF matrix \u2014 where the edge lives")
+                      + '</h2><div class="note">'
+                      + ("Chaque cellule : <b>R moyen</b>, win rate, n. Cellules p\u00e2les = n&lt;10 (peu fiable). "
+                         "Rappel : les lignes non-ACTIVATED sont des pr\u00e9-signaux au R gonfl\u00e9 par artefact ; "
+                         "les colonnes Daily+ subissent l'horizon d'\u00e9val plafonn\u00e9 (biais loss)."
+                         if lang == "fr" else
+                         "Each cell: <b>mean R</b>, win rate, n. Faded cells = n&lt;10 (unreliable). "
+                         "Non-ACTIVATED rows are pre-signals with artificially inflated R; "
+                         "Daily+ columns suffer the capped eval horizon (loss bias).")
+                      + '</div><div style="overflow-x:auto"><table><thead><tr><th>Type</th>' + xh
+                      + '</tr></thead><tbody>' + "".join(xrows) + '</tbody></table></div></div>')
+    else:
+        cross_html = ""
+
     # v2.7.16 : tableau par actif (win rate + espérance)
     a_items = []
     for g, v in by_asset.items():
@@ -3226,6 +3281,7 @@ def stats_view():
             + note
             + '<div class="card"><h2>' + T["by_type"] + '</h2>' + _bar_rows(bt, "#58a6ff", T["nodata"]) + '</div>'
             + exp_table
+            + cross_html
             + asset_table
             + '<div class="card"><h2>' + T["by_tf"] + '</h2>' + hb("help_tf") + _bar_rows(btf, "#a78bfa", T["nodata"]) + '</div>'
             + table)
@@ -3715,7 +3771,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.38",
+        "version": "2.7.39",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
