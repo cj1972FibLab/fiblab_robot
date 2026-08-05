@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.40)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.41)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.41 "Stop or = 0.786 par défaut" :                ║
+║   • SL_FIB_ASSET_DEFAULTS : défauts de stop PAR ACTIF en dur ║
+║     (survivent aux redéploiements). xau -> 0.786, mesuré     ║
+║     +1.12R sur ACTIVATED H4-H6 (sweep du 05/08)              ║
+║   • /sl_fib runtime reste prioritaire pour expérimenter      ║
 ║                                                              ║
 ║  Patch v2.7.40 "Sweep SL filtrable" :                        ║
 ║   • /sl_sweep : ?tf=h4,h6 (filtre TF) et ?type=activated     ║
@@ -987,6 +993,10 @@ robot_state["ticket_tf_mode"] = "ultime"        # état runtime (bascule /ticket
 #  0 = Fib 0 (large) · 0.382/0.5 = intermédiaire · 0.786 = serré · -1 = très large
 # Backtest /sl_sweep : le stop serré maximise l'espérance (0.5 ~+0.18R tenable).
 SL_FIB_DEFAULT = 0.5
+# v2.7.41 : défauts PAR ACTIF, permanents (survivent aux redéploiements).
+# xau -> 0.786 : sweep du 05/08 sur ACTIVATED H4-H6 = +1.12R (vs +0.34R au 0.5).
+# /sl_fib <actif> <val> reste prioritaire en runtime pour expérimenter.
+SL_FIB_ASSET_DEFAULTS = {"xau": 0.786}
 robot_state["sl_fib"] = SL_FIB_DEFAULT
 # v2.7.20 : surcharge PAR ACTIF (groupe -> fraction). Vide par défaut = tout le
 # monde au global. Runtime (reset au redéploiement), comme /ideal et /ticket_tf.
@@ -994,11 +1004,13 @@ robot_state["sl_fib_asset"] = {}
 
 
 def sl_fib_for(group):
-    """Fraction Fibo du stop pour un groupe : surcharge par actif si définie,
-    sinon le réglage global /sl_fib."""
+    """Fraction Fibo du stop pour un groupe : surcharge runtime par actif si
+    définie, sinon défaut PAR ACTIF (permanent), sinon le réglage global."""
     ov = robot_state.get("sl_fib_asset", {})
     if group in ov:
         return ov[group]
+    if group in SL_FIB_ASSET_DEFAULTS:
+        return SL_FIB_ASSET_DEFAULTS[group]
     return robot_state.get("sl_fib", SL_FIB_DEFAULT)
 
 
@@ -3785,7 +3797,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.40",
+        "version": "2.7.41",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
