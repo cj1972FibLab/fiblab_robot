@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.42)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.43)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.43 "Stop par actif×TF" :                         ║
+║   • Défauts de stop par (actif, TF) : xau H12 -> Fib -1      ║
+║     (stop de survie mesuré +0.27R), xau autres TF -> 0.786   ║
+║   • Appliqué aux tickets, à l'éval et au préfill journal     ║
 ║                                                              ║
 ║  Patch v2.7.42 "TP Ladder complet" :                         ║
 ║   • /tp_ladder refondu : filtres asset/tf/type/sl,           ║
@@ -1002,18 +1007,24 @@ SL_FIB_DEFAULT = 0.5
 # xau -> 0.786 : sweep du 05/08 sur ACTIVATED H4-H6 = +1.12R (vs +0.34R au 0.5).
 # /sl_fib <actif> <val> reste prioritaire en runtime pour expérimenter.
 SL_FIB_ASSET_DEFAULTS = {"xau": 0.786}
+# v2.7.43 : défauts par (actif, TF) — prioritaires sur le défaut actif.
+# ("xau","H12") -> -1 : ladder du 05/08 = +0.27R au stop -1 (vs négatif au 0.786) ;
+# les stop-outs H12 sont des sweeps de liquidité, pas des invalidations.
+SL_FIB_ASSET_TF_DEFAULTS = {("xau", "H12"): -1.0}
 robot_state["sl_fib"] = SL_FIB_DEFAULT
 # v2.7.20 : surcharge PAR ACTIF (groupe -> fraction). Vide par défaut = tout le
 # monde au global. Runtime (reset au redéploiement), comme /ideal et /ticket_tf.
 robot_state["sl_fib_asset"] = {}
 
 
-def sl_fib_for(group):
-    """Fraction Fibo du stop pour un groupe : surcharge runtime par actif si
-    définie, sinon défaut PAR ACTIF (permanent), sinon le réglage global."""
+def sl_fib_for(group, tf=None):
+    """Fraction Fibo du stop : surcharge runtime par actif > défaut (actif, TF)
+    > défaut actif > réglage global."""
     ov = robot_state.get("sl_fib_asset", {})
     if group in ov:
         return ov[group]
+    if tf and (group, (tf or "").upper()) in SL_FIB_ASSET_TF_DEFAULTS:
+        return SL_FIB_ASSET_TF_DEFAULTS[(group, tf.upper())]
     if group in SL_FIB_ASSET_DEFAULTS:
         return SL_FIB_ASSET_DEFAULTS[group]
     return robot_state.get("sl_fib", SL_FIB_DEFAULT)
@@ -2015,7 +2026,7 @@ def evaluate_pending_outcomes():
             #    EXACT. Repli sur la reconstruction H1 (plancherisée) si pas de cible.
             sl, sl_src = None, None
             if is_hold:
-                _slf = sl_fib_for(r["grp"])   # v2.7.20 : stop par actif
+                _slf = sl_fib_for(r["grp"], r["timeframe"])   # v2.7.43 : stop par actif×TF
                 stop_px = _stop_from_fib(entry, r["target"], long_bias, _slf)
                 if stop_px is not None:
                     raw_sl = (entry - stop_px) if long_bias else (stop_px - entry)
@@ -2144,7 +2155,7 @@ def build_trade_ticket(parsed, group, profile=None, scoring=None, as_alert=False
     _cap = float((profile or {}).get("capital") or TICKET_CAPITAL)   # v2.7.24
     _rp  = float((profile or {}).get("risk_pct") or TICKET_RISK_PCT)
     risk_usd  = _cap * _rp / 100.0
-    slf = sl_fib_for(group)   # v2.7.20 : stop par actif
+    slf = sl_fib_for(group, parsed.get("timeframe"))   # v2.7.43 : actif×TF
     sl = _stop_from_fib(entry, target, long_bias, slf)
     asset = esc(parsed.get("asset") or "?")
     tf    = esc(parsed.get("timeframe") or "?")
@@ -2304,7 +2315,7 @@ def journal_view():
             al = conn.execute("SELECT * FROM alerts WHERE id=?", (prefill_id,)).fetchone()
         if al:
             lb = (al["side"] == "Support")
-            slv = _stop_from_fib(al["price"], al["target"], lb, sl_fib_for(al["grp"]))
+            slv = _stop_from_fib(al["price"], al["target"], lb, sl_fib_for(al["grp"], al["timeframe"]))
             pf = {"asset": al["asset"] or "", "side": "LONG" if lb else "SHORT",
                   "entry": al["price"], "sl": (round(slv, 6) if slv is not None else ""),
                   "setup": f"{al['type']} {al['timeframe'] or ''}".strip(), "alert_id": al["id"]}
@@ -3831,7 +3842,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.42",
+        "version": "2.7.43",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
