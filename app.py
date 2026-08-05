@@ -1,7 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.44)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.45)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.45 "Moteur Daily+" :                             ║
+║   • TF >= 1D évalués sur bougies DAILY (Yahoo/TD 1day),      ║
+║     horizon jusqu'à 180 j, profondeur de fetch 420 j —       ║
+║     fin des faux loss par censure à 21 j                     ║
+║   • /reeval_bigtf : re-mesure les gros TF déjà classés       ║
+║   • ATR adapté au pas de bougie                              ║
 ║                                                              ║
 ║  Patch v2.7.44 "Déduplication" :                             ║
 ║   • Même signal (grp/type/TF/side/niveau ±0.05%) revu dans   ║
@@ -1732,6 +1739,11 @@ EVAL_HORIZON_BARS   = 12
 EVAL_HORIZON_MIN_H  = 48
 EVAL_HORIZON_MAX_H  = 504
 EVAL_LOOKBACK_MAX_H = 504
+# v2.7.45 : moteur Daily+ — les TF >= 1D sont évalués sur bougies DAILY avec
+# un horizon à leur échelle (plus de faux loss par censure à 21 jours).
+EVAL_HORIZON_MAX_H_BIG = 4320    # 180 j pour les TF >= 1D
+EVAL_HORIZON_BARS_BIG  = 40      # 40 bougies du TF (vs 12 en intraday)
+EVAL_BIGTF_FLOOR_DAYS  = 420     # profondeur de fetch daily (Yahoo ok)
 
 EVAL_RISK = {
     "xau":    {"k": 2.0, "tp_r": 3.0, "sl_floor": 3.0,  "sl_cap": 150.0,  "fallback": 15.0},
@@ -1760,10 +1772,10 @@ def tf_hours(tf):
     return TF_HOURS.get(tf, TF_HOURS.get(tf.upper(), 4))
 
 
-def _atr_at_tf(pre_bars, tf_h):
+def _atr_at_tf(pre_bars, tf_h, bar_h=1):
     if len(pre_bars) < 2:
         return None
-    bucket = max(1, int(round(tf_h)))
+    bucket = max(1, int(round(tf_h / bar_h)))
     ranges = []
     i = 0
     while i + bucket <= len(pre_bars):
@@ -1847,10 +1859,10 @@ def _twelvedata_symbol(group, asset):
     return SYMBOL_MAP_TD.get(group)
 
 
-def _fetch_yahoo(symbol, start_dt, end_dt):
+def _fetch_yahoo(symbol, start_dt, end_dt, interval="1h"):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"period1": int(start_dt.timestamp()),
-              "period2": int(end_dt.timestamp()), "interval": "1h"}
+              "period2": int(end_dt.timestamp()), "interval": interval}
     r = requests.get(url, params=params, timeout=8,
                      headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
@@ -1871,9 +1883,9 @@ def _fetch_yahoo(symbol, start_dt, end_dt):
     return bars
 
 
-def _fetch_twelvedata(symbol, start_dt, end_dt):
+def _fetch_twelvedata(symbol, start_dt, end_dt, interval="1h"):
     url = "https://api.twelvedata.com/time_series"
-    params = {"symbol": symbol, "interval": "1h",
+    params = {"symbol": symbol, "interval": ("1day" if interval == "1d" else "1h"),
               "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
               "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
               "apikey": TWELVEDATA_API_KEY, "timezone": "UTC", "outputsize": 5000}
@@ -1885,7 +1897,9 @@ def _fetch_twelvedata(symbol, start_dt, end_dt):
     bars = []
     for v in vals:
         try:
-            dt = datetime.strptime(v["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            _dts = v["datetime"]
+            _fmt = "%Y-%m-%d %H:%M:%S" if len(_dts) > 10 else "%Y-%m-%d"
+            dt = datetime.strptime(_dts, _fmt).replace(tzinfo=timezone.utc)
             bars.append((dt, float(v["high"]), float(v["low"]), float(v["close"])))
         except Exception:
             continue
@@ -1893,7 +1907,7 @@ def _fetch_twelvedata(symbol, start_dt, end_dt):
     return bars
 
 
-def fetch_prices(group, asset, start_dt, end_dt):
+def fetch_prices(group, asset, start_dt, end_dt, interval="1h"):
     """[(datetime, high, low), ...] en H1. Twelve Data si clé, avec REPLI Yahoo
     dès que Twelve Data ÉCHOUE ou renvoie vide — y compris sur 429 (rate limit).
     Chaque source est isolée dans son propre try : une exception Twelve Data ne
@@ -1903,7 +1917,7 @@ def fetch_prices(group, asset, start_dt, end_dt):
         sym = _twelvedata_symbol(group, asset)
         if sym:
             try:
-                bars = _fetch_twelvedata(sym, start_dt, end_dt)
+                bars = _fetch_twelvedata(sym, start_dt, end_dt, interval)
             except Exception as e:
                 print(f"[EVAL] twelvedata {group}/{asset} : {e}")
                 bars = []
@@ -1959,15 +1973,19 @@ def evaluate_pending_outcomes():
         if not risk:
             continue
         tf_h       = tf_hours(r["timeframe"])
-        horizon_h  = min(max(EVAL_HORIZON_BARS * tf_h, EVAL_HORIZON_MIN_H), EVAL_HORIZON_MAX_H)
-        lookback_h = min(EVAL_ATR_BARS * tf_h, EVAL_LOOKBACK_MAX_H)
+        big        = tf_h >= 24                          # v2.7.45 : mode Daily+
+        _hmax      = EVAL_HORIZON_MAX_H_BIG if big else EVAL_HORIZON_MAX_H
+        _hbars     = EVAL_HORIZON_BARS_BIG if big else EVAL_HORIZON_BARS
+        horizon_h  = min(max(_hbars * tf_h, EVAL_HORIZON_MIN_H), _hmax)
+        lookback_h = min(EVAL_ATR_BARS * tf_h,
+                         EVAL_BIGTF_FLOOR_DAYS * 24 if big else EVAL_LOOKBACK_MAX_H)
         # v2.7.35 : échantillon témoin — non-ACTIVATED plafonnés par run
         if "activated" not in (r["type"] or "").lower():
             _nact = sum(1 for g in groups.values() for it in g
                         if "activated" not in (it["r"]["type"] or "").lower())
             if _nact >= EVAL_WITNESS_CAP:
                 continue
-        key = (r["grp"], r["asset"])
+        key = (r["grp"], r["asset"], "D" if big else "H")
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -1979,12 +1997,16 @@ def evaluate_pending_outcomes():
     for key in order:
         if time.monotonic() - _start > 18:      # garde-fou timeout (fetch + marge)
             break
-        grp, asset = key
+        grp, asset, _mode = key
         items = groups[key]
         # UN SEUL fetch pour tout l'actif : du plus ancien besoin jusqu'à maintenant.
         earliest = min(it["ts"] - timedelta(hours=it["lookback_h"]) for it in items)
-        floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
-        bars = fetch_prices(grp, asset, max(earliest, floor_dt), now)
+        if _mode == "D":
+            floor_dt = now - timedelta(days=EVAL_BIGTF_FLOOR_DAYS)
+            bars = fetch_prices(grp, asset, max(earliest, floor_dt), now, interval="1d")
+        else:
+            floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
+            bars = fetch_prices(grp, asset, max(earliest, floor_dt), now)
         if not bars:
             # v2.7.37 : feed indisponible. Les items expirés depuis > 7 jours ne
             # seront jamais mieux servis -> classés, sinon ils bouchent la tête
@@ -2081,6 +2103,7 @@ def evaluate_pending_outcomes():
                     continue
 
             src = "twelvedata" if TWELVEDATA_API_KEY else "yahoo"
+            src += "/1d" if _mode == "D" else ""
             note = (f"auto ({src}, TF={r['timeframe']}, SL={round(sl, 2)}[{sl_src}], "
                     f"TP={round(tp, 2)}[{tp_src}], H={int(horizon_h)}h)")
             updates.append((status, round(mfe, 2), round(mae, 2), r_real, note, now_iso(), r["id"]))
@@ -3835,6 +3858,26 @@ def prox_gap():
     return head + body + '</body></html>'
 
 
+@app.route("/reeval_bigtf", methods=["GET"])
+def reeval_bigtf():
+    """v2.7.45 — Remet en pending les outcomes des TF >= 1D (les 'invalid'
+    forcés par l'ancien plafond de 21 j) pour re-mesure par le moteur Daily+.
+    Périmètre borné aux gros TF : pas de garde-fou confirm nécessaire."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    BIG = ("1D", "D1", "2D", "3D", "4D", "5D", "6D", "7D", "1W", "W1")
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE outcomes SET status='pending', updated_ts=? WHERE alert_id IN "
+            "(SELECT id FROM alerts WHERE UPPER(COALESCE(timeframe,'')) IN (%s)) "
+            "AND status != 'pending'" % ",".join("?" * len(BIG)),
+            [now_iso()] + list(BIG))
+        conn.commit()
+        n = cur.rowcount
+    return jsonify({"reset_to_pending": n, "scope": "TF >= 1D",
+                    "note": "le cron re-mesure avec bougies daily + horizon 180j"}), 200
+
+
 @app.route("/db_count", methods=["GET"])
 def db_count():
     if not check_secret():
@@ -3883,7 +3926,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.44",
+        "version": "2.7.45",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
