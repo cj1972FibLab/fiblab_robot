@@ -1,7 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.43)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.44)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.44 "Déduplication" :                             ║
+║   • Même signal (grp/type/TF/side/niveau ±0.05%) revu dans   ║
+║     la fenêtre (48h ou 2 bougies du TF) = stocké muet, sans  ║
+║     outcome ni notification — fin des tickets fantômes après ║
+║     édition d'alertes TV, stats non double-comptées          ║
+║   • Ticket : "1er enregistrement" (honnête) au lieu          ║
+║     d'"Origine créée" (la base ne connaît pas la naissance)  ║
 ║                                                              ║
 ║  Patch v2.7.43 "Stop par actif×TF" :                         ║
 ║   • Défauts de stop par (actif, TF) : xau H12 -> Fib -1      ║
@@ -1190,7 +1198,7 @@ TG_STR = {
         "tk_chart": "Ouvrir le chart TradingView",
         "tk_demo_warn": "\u26a0\ufe0f <i>D\u00e9mo. V\u00e9rifie la taille (specs broker) avant de poser.</i>",
         "tk_no_order": "\u2014 NE PAS POSER sans v\u00e9rifier l'actif",
-        "tk_origin": "Origine cr\u00e9\u00e9e", "tk_origin_unknown": "inconnue (ant\u00e9rieure au bot)",
+        "tk_origin": "1er enregistrement", "tk_origin_unknown": "ant\u00e9rieur au bot",
         "tk_zone": "Zone d'entr\u00e9e : Fib 1 <b>{e}</b> \u2192 Fib 0 <b>{f0}</b> \u2014 au choix dans la zone",
     },
     "en": {
@@ -1212,7 +1220,7 @@ TG_STR = {
         "tk_chart": "Open the TradingView chart",
         "tk_demo_warn": "\u26a0\ufe0f <i>Demo. Verify the size (broker specs) before parking.</i>",
         "tk_no_order": "\u2014 DO NOT PARK before verifying the asset",
-        "tk_origin": "Origin created", "tk_origin_unknown": "unknown (predates the bot)",
+        "tk_origin": "First recorded", "tk_origin_unknown": "predates the bot",
         "tk_zone": "Entry zone: Fib 1 <b>{e}</b> \u2192 Fib 0 <b>{f0}</b> \u2014 your pick within the zone",
     },
 }
@@ -2722,6 +2730,39 @@ def webhook():
             parsed["_coherence_data"] = (parsed["price"], group, _rng[0], _rng[1])
         print(f"[COHERENCE] \u26a0\ufe0f {coh} | asset={parsed.get('asset')} raw={raw[:80]!r}")
 
+    # ── v2.7.44 : DÉDUPLICATION — l'indicateur ré-émet le même état à chaque
+    #    clôture revalidante (et toute édition d'alerte TV réinitialise son
+    #    état -> salve de re-signaux). Même (grp, type, TF, side, niveau
+    #    ±0.05%) déjà vu dans la fenêtre = stocké pour traçabilité mais SANS
+    #    outcome (ne double-compte pas les stats) et SANS notification.
+    is_dup = False
+    if parsed.get("price") is not None and not parsed.get("context_only"):
+        _tfh = tf_hours(parsed.get("timeframe"))
+        _win_h = max(48, 2 * _tfh)          # 48h mini, 2 bougies du TF sinon
+        _tol = 0.0005 * abs(parsed["price"])
+        _since = (datetime.now(timezone.utc) - timedelta(hours=_win_h)).isoformat()
+        try:
+            with db() as conn:
+                _d = conn.execute(
+                    "SELECT id FROM alerts WHERE grp=? AND type=? "
+                    "AND COALESCE(timeframe,'')=COALESCE(?,'') AND COALESCE(side,'')=COALESCE(?,'') "
+                    "AND price BETWEEN ? AND ? AND ts >= ? LIMIT 1",
+                    (group, parsed.get("type"), parsed.get("timeframe"), parsed.get("side"),
+                     parsed["price"] - _tol, parsed["price"] + _tol, _since)).fetchone()
+            is_dup = _d is not None
+        except Exception as e:
+            print(f"[DEDUP] {e}")
+    if is_dup:
+        parsed["context_only"] = True       # stocké sans outcome
+        try:
+            alert_id = save_alert(parsed, scoring, group)
+        except Exception as e:
+            print(f"[DB] save_alert : {e}")
+            alert_id = None
+        print(f"[WEBHOOK] DOUBLON ignoré (fenêtre {_win_h}h) id={alert_id} "
+              f"{parsed.get('type')} {parsed.get('asset')} @{parsed.get('price')}")
+        return jsonify({"status": "duplicate", "id": alert_id}), 200
+
     try:
         alert_id = save_alert(parsed, scoring, group)
     except Exception as e:
@@ -3842,7 +3883,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.43",
+        "version": "2.7.44",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
