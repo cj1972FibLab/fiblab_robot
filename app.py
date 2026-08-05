@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.39)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.40)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.40 "Sweep SL filtrable" :                        ║
+║   • /sl_sweep : ?tf=h4,h6 (filtre TF) et ?type=activated     ║
+║     (toute la famille ACTIVATED) — le sweep 0.786/0.5/0.382/ ║
+║     0/-1 se lit enfin sur la poche où vit l'edge             ║
 ║                                                              ║
 ║  Patch v2.7.39 "Matrice TYPE × TF" :                         ║
 ║   • Vue croisée type × timeframe au dashboard : R moyen,     ║
@@ -3298,15 +3303,22 @@ def sl_sweep():
         return ("unauthorized", 403)
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
+    _type_f = (request.args.get("type") or "origin").lower().strip()
+    _like = "%hold activated%" if _type_f == "activated" else "%origin hold activated%"
     with db() as conn:
         rows = conn.execute(
             "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE a.price IS NOT NULL AND a.side IS NOT NULL AND a.target IS NOT NULL "
-            "AND a.ts <= ? AND LOWER(a.type) LIKE '%origin hold activated%' "
+            "AND a.ts <= ? AND LOWER(a.type) LIKE ? "
             "ORDER BY a.id DESC LIMIT 500",
-            (cutoff,)
+            (cutoff, _like)
         ).fetchall()
+    _tf_f = set()
+    for _t in (request.args.get("tf") or "").upper().replace(" ", ",").split(","):
+        _t = _t.strip()
+        if _t:
+            _tf_f |= _TF_EQUIV.get(_t, {_t})
     groups, order = {}, []
     for r in rows:
         try:
@@ -3318,6 +3330,8 @@ def sl_sweep():
         if (now - ts).total_seconds() / 3600 < EVAL_MIN_AGE_H:
             continue
         if r["grp"] not in EVAL_RISK:
+            continue
+        if _tf_f and (r["timeframe"] or "").upper() not in _tf_f:
             continue
         _af = (request.args.get("asset") or "").lower().strip()
         if _af and (r["grp"] or "").lower() != _af:
@@ -3771,7 +3785,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.39",
+        "version": "2.7.40",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
