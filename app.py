@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.36)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.37)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.37 "FIX bouchon HYPE" :                          ║
+║   • Twelve Data court-circuité pour HYPE (404 systématique)  ║
+║   • Actif sans feed : items expirés >7j -> invalid           ║
+║     (anti-bouchon de la tête de file ASC)                    ║
 ║                                                              ║
 ║  Patch v2.7.36 "FIX drainage de la file" :                   ║
 ║   • Tri ASC (anciennes d'abord) dans chaque classe — la file ║
@@ -1746,6 +1751,10 @@ def _yahoo_symbol(group, asset):
 
 
 def _twelvedata_symbol(group, asset):
+    # v2.7.37 : HYPE n'existe pas chez Twelve Data (404 systématique en prod)
+    # -> repli Yahoo direct, zéro temps/quota brûlé.
+    if group == "hype":
+        return None
     if group == "stocks":
         return re.sub(r"[^A-Z0-9.\-]", "", (asset or "").upper())
     return SYMBOL_MAP_TD.get(group)
@@ -1890,6 +1899,22 @@ def evaluate_pending_outcomes():
         floor_dt = now - timedelta(hours=EVAL_LOOKBACK_MAX_H + EVAL_HORIZON_MAX_H)
         bars = fetch_prices(grp, asset, max(earliest, floor_dt), now)
         if not bars:
+            # v2.7.37 : feed indisponible. Les items expirés depuis > 7 jours ne
+            # seront jamais mieux servis -> classés, sinon ils bouchent la tête
+            # de file (tri ASC) pour toujours.
+            stale = []
+            for it in items:
+                if now >= it["ts"] + timedelta(hours=it["horizon_h"] + 168):
+                    stale.append(("invalid", None, None, None,
+                                  "feed indisponible, expiré (v2.7.37)",
+                                  now_iso(), it["r"]["id"]))
+            if stale:
+                with db() as conn:
+                    conn.executemany(
+                        "UPDATE outcomes SET status=?, mfe_pts=?, mae_pts=?, "
+                        "r_realized=?, note=?, updated_ts=? WHERE alert_id=?", stale)
+                    conn.commit()
+                evaluated += len(stale)
             continue
 
         updates = []
@@ -3649,7 +3674,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.36",
+        "version": "2.7.37",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
