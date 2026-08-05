@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.37)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.38)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.38 "Range Trendlines = contexte" :               ║
+║   • Parser des messages RT (role/approxPrice/tf) du Range    ║
+║     Trendlines Detector — stockés SANS outcome : contexte    ║
+║     pour la confluence trend à venir, file d'éval épargnée   ║
+║   • Jamais notifiés (non-hold -> /ideal les tait)            ║
 ║                                                              ║
 ║  Patch v2.7.37 "FIX bouchon HYPE" :                          ║
 ║   • Twelve Data court-circuité pour HYPE (404 systématique)  ║
@@ -414,10 +420,13 @@ def save_alert(parsed: dict, scoring: dict, group: str) -> int:
              scoring["score"], scoring["level"], parsed.get("target"), parsed.get("move_pct"))
         )
         alert_id = cur.lastrowid
-        conn.execute(
-            "INSERT INTO outcomes (alert_id, status, updated_ts) VALUES (?, 'pending', ?)",
-            (alert_id, now_iso())
-        )
+        # v2.7.38 : les messages de CONTEXTE (Range Trendlines) ne sont pas des
+        # trades — pas de ligne outcome, la file d'évaluation reste saine.
+        if not parsed.get("context_only"):
+            conn.execute(
+                "INSERT INTO outcomes (alert_id, status, updated_ts) VALUES (?, 'pending', ?)",
+                (alert_id, now_iso())
+            )
         conn.commit()
         return alert_id
 
@@ -706,6 +715,38 @@ def parse_fiblab_message(raw: str) -> dict:
         "scope": None, "target": None, "move_pct": None,
         "timestamp": now_iso(),
     }
+    # ── v2.7.38 : messages Range Trendlines (RT) — CONTEXTE, pas des trades.
+    #    Format : 'ORIGIN RT FIRST TOUCH (RT) | role=Support | approxPrice=4176.11 | tf=60'
+    if "(RT)" in raw.upper() or " RT " in raw.upper():
+        head = raw.split("|")[0].strip()
+        result["type"] = re.sub(r"\s*\(RT\)\s*$", "", head).title() + " (RT)"
+        result["context_only"] = True
+        m = re.search(r'role\s*=\s*(Support|Resistance)', raw, re.IGNORECASE)
+        if m:
+            result["side"] = m.group(1).capitalize()
+        m = re.search(r'approxPrice\s*=\s*([\d.]+)', raw, re.IGNORECASE)
+        if m:
+            try:
+                result["price"] = round(float(m.group(1)), 6)
+            except ValueError:
+                pass
+        m = re.search(r'tf\s*=\s*([0-9]+[A-Za-z]*|[0-9]*[A-Za-z]+)', raw, re.IGNORECASE)
+        if m:
+            tok = m.group(1)
+            if tok.isdigit():
+                n = int(tok)
+                if n < 60:
+                    result["timeframe"] = f"M{n}"
+                elif n % 1440 == 0:
+                    result["timeframe"] = f"{n // 1440}D" if n > 1440 else "1D"
+                elif n % 60 == 0:
+                    result["timeframe"] = f"H{n // 60}"
+                else:
+                    result["timeframe"] = normalize_timeframe(tok)
+            else:
+                result["timeframe"] = normalize_timeframe(tok)
+        return result
+
     if "ATR PROXIMITY" in raw.upper():
         result["type"] = "ATR Proximity"
         # v2.7.26b : format mono-ligne sans '|' → capturer le token TF seul
@@ -3674,7 +3715,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.37",
+        "version": "2.7.38",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
