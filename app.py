@@ -1,7 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.47)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.48)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.48 "Stop de survie étendu" :                     ║
+║   • xau : stop Fib -1 par défaut sur TOUS les TF >= H12      ║
+║     (verdict Daily+ : 1D/2D à 0% de wins au 0.786)           ║
 ║                                                              ║
 ║  Patch v2.7.47 "/fix_asset" :                                ║
 ║   • Répare les étiquettes crypto polluées par gamme de prix  ║
@@ -1068,10 +1072,13 @@ SL_FIB_DEFAULT = 0.5
 # xau -> 0.786 : sweep du 05/08 sur ACTIVATED H4-H6 = +1.12R (vs +0.34R au 0.5).
 # /sl_fib <actif> <val> reste prioritaire en runtime pour expérimenter.
 SL_FIB_ASSET_DEFAULTS = {"xau": 0.786}
-# v2.7.43 : défauts par (actif, TF) — prioritaires sur le défaut actif.
-# ("xau","H12") -> -1 : ladder du 05/08 = +0.27R au stop -1 (vs négatif au 0.786) ;
-# les stop-outs H12 sont des sweeps de liquidité, pas des invalidations.
-SL_FIB_ASSET_TF_DEFAULTS = {("xau", "H12"): -1.0}
+# v2.7.43/48 : défauts par (actif, TF) — prioritaires sur le défaut actif.
+# xau H12 -> -1 (ladder 05/08 : +0.27R au -1 vs négatif au 0.786) ; étendu le
+# 06/08 à TOUS les TF >= H12 : verdict Daily+ = 1D/2D à 0% de wins au 0.786.
+# Les gros TF percent les stops serrés (sweeps) avant de faire leur chemin.
+SL_FIB_ASSET_TF_DEFAULTS = {("xau", tf): -1.0 for tf in
+                            ("H12", "1D", "D1", "2D", "3D", "4D",
+                             "5D", "6D", "7D", "1W", "W1")}
 robot_state["sl_fib"] = SL_FIB_DEFAULT
 # v2.7.20 : surcharge PAR ACTIF (groupe -> fraction). Vide par défaut = tout le
 # monde au global. Runtime (reset au redéploiement), comme /ideal et /ticket_tf.
@@ -4208,7 +4215,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.47",
+        "version": "2.7.48",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
