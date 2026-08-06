@@ -1,7 +1,17 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.45)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.46)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.46 "Exécuteur — fondation" :                     ║
+║   • File d'ordres broker-agnostique (table exec_orders) :    ║
+║     signal doctrine -> ordre proposed (entry/SL/ladder/      ║
+║     risk_usd, le VOLUME est calculé par l'EA avec les specs  ║
+║     broker). ARMÉ PAR ENV : EXEC_ENABLED=on (off par défaut) ║
+║   • /exec/pending (poll EA), /exec/update (fills),           ║
+║     /exec/kill (kill-switch), /exec/view (dashboard)         ║
+║   • Garde-fous : périmètre EXEC_ASSETS/EXEC_TFS, plafond     ║
+║     EXEC_MAX_PER_DAY, risque fixe EXEC_RISK_USD              ║
 ║                                                              ║
 ║  Patch v2.7.45 "Moteur Daily+" :                             ║
 ║   • TF >= 1D évalués sur bougies DAILY (Yahoo/TD 1day),      ║
@@ -432,6 +442,28 @@ def init_db():
             except Exception:
                 pass
         conn.execute("UPDATE accounts SET hwm = 360000.0 WHERE name='UFunded' AND hwm IS NULL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS exec_orders (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_ts    TEXT NOT NULL,
+                alert_id      INTEGER,
+                asset         TEXT,          -- ticker TradingView (XAUUSD)
+                symbol        TEXT,          -- symbole broker (rempli par l'EA/pont si différent)
+                side          TEXT,          -- BUY | SELL (ordre limite)
+                entry         REAL,          -- Fib 1
+                sl            REAL,          -- stop doctrine (0.786 / -1 selon TF)
+                tp1 REAL, tp2 REAL, tp3 REAL, tp4 REAL,
+                risk_usd      REAL,          -- l'exécuteur calcule le volume localement
+                plan          TEXT DEFAULT 'ladder25x4_trail',
+                tf            TEXT,
+                status        TEXT DEFAULT 'proposed',
+                -- proposed -> sent -> placed -> partial -> closed | cancelled | expired | error
+                broker_ticket TEXT,
+                fill_info     TEXT,          -- JSON libre remonté par l'exécuteur
+                note          TEXT,
+                updated_ts    TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -996,6 +1028,14 @@ robot_state["notify_only_ideal"] = NOTIFY_ONLY_IDEAL   # état runtime (toggle /
 # ticket prêt : entrée = niveau (exact), TP = Exit (exact), SL = Fib0 reconstruit,
 # taille pour un risque fixe. Démo, pour se faire la main avant tout auto réel.
 TICKET_ENABLED   = True
+# ── v2.7.46 : EXÉCUTEUR (file d'ordres broker-agnostique, MT5-ready) ──
+EXEC_ENABLED   = os.environ.get("EXEC_ENABLED", "off").lower() == "on"
+EXEC_ASSETS    = set((os.environ.get("EXEC_ASSETS") or "xau").lower().split(","))
+EXEC_TFS       = set((os.environ.get("EXEC_TFS") or "H4,H6").upper().split(","))
+EXEC_RISK_USD  = float(os.environ.get("EXEC_RISK_USD") or 100.0)
+EXEC_MAX_PER_DAY = int(os.environ.get("EXEC_MAX_PER_DAY") or 3)
+exec_state = {"kill": False}
+
 TICKET_CAPITAL   = 100000.0                    # capital démo (USD)
 TICKET_RISK_PCT  = 1.0                          # risque par trade (% du capital)
 TICKET_TYPES     = {"origin hold activated"}
@@ -2164,6 +2204,58 @@ def _origin_line(parsed, group, S):
         return "<i>" + S["tk_origin_unknown"] + "</i>"
 
 
+
+
+def maybe_queue_exec_order(parsed, group, alert_id):
+    """v2.7.46 — Pousse un ordre dans la file d'exécution si le signal est
+    dans le périmètre doctrine (actif + TF autorisés, Origin/Hold ACTIVATED,
+    géométrie complète). N'ENVOIE RIEN : l'EA/pont MT5 vient poller
+    /exec/pending. Kill-switch et plafond journalier appliqués ici."""
+    if not EXEC_ENABLED or exec_state.get("kill"):
+        return None
+    if group not in EXEC_ASSETS:
+        return None
+    tf = (parsed.get("timeframe") or "").upper()
+    if tf not in EXEC_TFS:
+        return None
+    atype = (parsed.get("type") or "").lower()
+    if "hold activated" not in atype:
+        return None
+    entry, target = parsed.get("price"), parsed.get("target")
+    side_sup = parsed.get("side") == "Support"
+    if entry is None or target is None:
+        return None
+    unit = abs(target - entry) / 0.618
+    if unit <= 0:
+        return None
+    slf = sl_fib_for(group, tf)
+    sl = entry - (1 - slf) * unit if side_sup else entry + (1 - slf) * unit
+    def _ext(m):
+        d = (m - 1.0) * unit
+        return round(entry + d if side_sup else entry - d, 6)
+    today = now_iso()[:10]
+    with db() as conn:
+        n_today = conn.execute(
+            "SELECT COUNT(*) FROM exec_orders WHERE created_ts LIKE ? "
+            "AND status NOT IN ('cancelled','error')", (today + "%",)).fetchone()[0]
+        if n_today >= EXEC_MAX_PER_DAY:
+            print(f"[EXEC] plafond journalier atteint ({EXEC_MAX_PER_DAY})")
+            return None
+        cur = conn.execute(
+            "INSERT INTO exec_orders (created_ts, alert_id, asset, side, entry, sl, "
+            "tp1, tp2, tp3, tp4, risk_usd, tf, status, updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now_iso(), alert_id, parsed.get("asset"),
+             "BUY" if side_sup else "SELL", round(entry, 6), round(sl, 6),
+             round(target, 6), _ext(2.618), _ext(3.618), _ext(4.618),
+             EXEC_RISK_USD, tf, "proposed", now_iso()))
+        conn.commit()
+        oid = cur.lastrowid
+    print(f"[EXEC] ordre #{oid} en file : {parsed.get('asset')} "
+          f"{'BUY' if side_sup else 'SELL'} @{entry} SL {round(sl,4)} (risk {EXEC_RISK_USD}$)")
+    return oid
+
+
 def build_trade_ticket(parsed, group, profile=None, scoring=None, as_alert=False):
     """ORDRE LIMITE au repos pour les types tradeables (Origin Hold ACTIVATED) :
     limite \u00e0 l'entr\u00e9e (Fib 1), SL = Fib 0 d\u00e9riv\u00e9, ladder de TP d\u00e9riv\u00e9e,
@@ -2791,6 +2883,10 @@ def webhook():
     except Exception as e:
         print(f"[DB] save_alert : {e}")
         alert_id = None
+    try:
+        maybe_queue_exec_order(parsed, group, alert_id)   # v2.7.46
+    except Exception as e:
+        print(f"[EXEC] {e}")
 
     entry = {**parsed, **scoring, "id": alert_id}
     alert_history.appendleft(entry)
@@ -3878,6 +3974,104 @@ def reeval_bigtf():
                     "note": "le cron re-mesure avec bougies daily + horizon 180j"}), 200
 
 
+@app.route("/exec/pending", methods=["GET"])
+def exec_pending():
+    """v2.7.46 — L'EA/pont MT5 poll ici. Renvoie les ordres 'proposed' et les
+    marque 'sent'. Kill-switch coupe la distribution."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    if exec_state.get("kill"):
+        return jsonify({"orders": [], "kill": True}), 200
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM exec_orders WHERE status='proposed' ORDER BY id").fetchall()
+        out = [dict(r) for r in rows]
+        if out:
+            conn.execute("UPDATE exec_orders SET status='sent', updated_ts=? "
+                         "WHERE status='proposed'", (now_iso(),))
+            conn.commit()
+    return jsonify({"orders": out, "kill": False}), 200
+
+
+@app.route("/exec/update", methods=["POST"])
+def exec_update():
+    """L'exécuteur remonte l'état : placed / partial / closed / cancelled /
+    error, avec broker_ticket et fill_info (JSON libre)."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    d = request.get_json(silent=True) or {}
+    try:
+        oid = int(d["id"])
+        status = str(d["status"])
+    except (KeyError, ValueError, TypeError):
+        return jsonify({"error": "id/status requis"}), 400
+    if status not in ("placed", "partial", "closed", "cancelled", "expired", "error"):
+        return jsonify({"error": "status invalide"}), 400
+    with db() as conn:
+        conn.execute(
+            "UPDATE exec_orders SET status=?, broker_ticket=COALESCE(?, broker_ticket), "
+            "fill_info=COALESCE(?, fill_info), note=COALESCE(?, note), updated_ts=? WHERE id=?",
+            (status, d.get("broker_ticket"),
+             json.dumps(d.get("fill_info")) if d.get("fill_info") is not None else None,
+             d.get("note"), now_iso(), oid))
+        conn.commit()
+    return jsonify({"ok": True, "id": oid, "status": status}), 200
+
+
+@app.route("/exec/kill", methods=["GET", "POST"])
+def exec_kill():
+    """Kill-switch : /exec/kill?on=1 coupe (les 'proposed' passent cancelled),
+    ?on=0 réarme."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    on = request.args.get("on", "1") != "0"
+    exec_state["kill"] = on
+    n = 0
+    if on:
+        with db() as conn:
+            cur = conn.execute("UPDATE exec_orders SET status='cancelled', "
+                               "note='kill-switch', updated_ts=? WHERE status IN "
+                               "('proposed','sent')", (now_iso(),))
+            conn.commit()
+            n = cur.rowcount
+    return jsonify({"kill": on, "cancelled": n}), 200
+
+
+@app.route("/exec/view", methods=["GET"])
+def exec_view():
+    """Mini-dashboard de la file d'exécution."""
+    if not check_secret():
+        return ("unauthorized", 403)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM exec_orders ORDER BY id DESC LIMIT 50").fetchall()
+    COLS = {"proposed": "var(--gold)", "sent": "var(--blue)", "placed": "var(--blue)",
+            "partial": "var(--grn)", "closed": "var(--grn)",
+            "cancelled": "var(--dim)", "expired": "var(--dim)", "error": "var(--red)"}
+    trs = "".join(
+        f'<tr><td>{r["id"]}</td><td>{(r["created_ts"] or "")[:16]}</td>'
+        f'<td><b>{esc(r["asset"] or "?")}</b> {esc(r["side"] or "")} {esc(r["tf"] or "")}</td>'
+        f'<td>{r["entry"]}</td><td>{r["sl"]}</td><td>{r["tp1"]}</td>'
+        f'<td>{r["risk_usd"]:g} $</td>'
+        f'<td style="color:{COLS.get(r["status"], "var(--ink)")};font-weight:700">{esc(r["status"])}</td>'
+        f'<td style="color:var(--dim)">{esc(r["note"] or "")}</td></tr>'
+        for r in rows)
+    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>FibLab \u2014 Ex\u00e9cution</title>' + DASH_CSS + '</head><body>')
+    st = ("\U0001F534 KILL" if exec_state.get("kill") else
+          ("\U0001F7E2 ARM\u00c9" if EXEC_ENABLED else "\u26aa D\u00c9SARM\u00c9 (EXEC_ENABLED=off)"))
+    body = ('<h1>\U0001F916 File d\u2019ex\u00e9cution \u2014 ' + st + '</h1>'
+            '<div class="sub">P\u00e9rim\u00e8tre : ' + esc(",".join(sorted(EXEC_ASSETS)))
+            + ' \u00b7 TF ' + esc(",".join(sorted(EXEC_TFS))) + ' \u00b7 risque '
+            + ("%g" % EXEC_RISK_USD) + ' $ \u00b7 max ' + str(EXEC_MAX_PER_DAY) + '/jour '
+            '\u00b7 le volume est calcul\u00e9 par l\u2019EA avec les specs broker</div>'
+            '<div class="card"><table><thead><tr><th>#</th><th>Cr\u00e9\u00e9</th><th>Ordre</th>'
+            '<th>Entr\u00e9e</th><th>SL</th><th>TP1</th><th>Risque</th><th>Statut</th><th>Note</th>'
+            '</tr></thead><tbody>' + (trs or '<tr><td colspan="9" class="note">file vide</td></tr>')
+            + '</tbody></table></div>')
+    return head + body + '</body></html>'
+
+
 @app.route("/db_count", methods=["GET"])
 def db_count():
     if not check_secret():
@@ -3926,7 +4120,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.45",
+        "version": "2.7.46",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
