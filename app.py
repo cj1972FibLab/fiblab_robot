@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.46)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.47)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.47 "/fix_asset" :                                ║
+║   • Répare les étiquettes crypto polluées par gamme de prix  ║
+║     (dry-run par défaut, ?apply=yes pour exécuter) ; zone    ║
+║     ambiguë SOL/HYPE 55-68 exclue des stats ; re-rangés      ║
+║     remis en éval contre le bon feed                         ║
 ║                                                              ║
 ║  Patch v2.7.46 "Exécuteur — fondation" :                     ║
 ║   • File d'ordres broker-agnostique (table exec_orders) :    ║
@@ -4072,6 +4078,88 @@ def exec_view():
     return head + body + '</body></html>'
 
 
+@app.route("/fix_asset", methods=["GET"])
+def fix_asset():
+    """v2.7.47 — Répare les étiquettes crypto polluées (clonage ?asset= :
+    BTC/HYPE historiques rangés 'solana', vieux XAU aussi).
+    DRY-RUN par défaut : montre ce qui serait re-rangé, ne touche à rien.
+    ?apply=yes pour appliquer : grp corrigé + outcome remis en pending
+    (re-mesure contre le BON feed). Zone ambiguë SOL/HYPE (prix 55-68,
+    gammes réellement croisées cet été) : outcome -> invalid 'asset ambigu',
+    EXCLU des stats — on ne devine pas.
+    Ne touche qu'aux groupes crypto {solana, btc, hype, sui}."""
+    if not check_secret():
+        return ("unauthorized", 403)
+    apply_mode = request.args.get("apply") == "yes"
+
+    def classify(p):
+        if p is None:
+            return None, False
+        if p >= 10000:
+            return "btc", False
+        if 1500 <= p < 8000:
+            return "xau", False
+        if p < 5:
+            return "sui", False
+        if 68 <= p < 1500:
+            return "solana", False
+        if 5 <= p < 55:
+            return "hype", False
+        return None, True          # 55-68 : ambigu SOL/HYPE
+
+    SRC = ("solana", "btc", "hype", "sui")
+    moves, amb = {}, []
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, grp, price, type, ts FROM alerts WHERE grp IN (?,?,?,?) "
+            "AND price IS NOT NULL", SRC).fetchall()
+        for r in rows:
+            newg, is_amb = classify(r["price"])
+            if is_amb:
+                amb.append(r["id"])
+            elif newg and newg != r["grp"]:
+                moves.setdefault((r["grp"], newg), []).append(r["id"])
+        if apply_mode:
+            for (old, new), ids in moves.items():
+                qm = ",".join("?" * len(ids))
+                conn.execute(f"UPDATE alerts SET grp=? WHERE id IN ({qm})", [new] + ids)
+                conn.execute(
+                    f"UPDATE outcomes SET status='pending', note='fix_asset {old}->{new}', "
+                    f"updated_ts=? WHERE alert_id IN ({qm})", [now_iso()] + ids)
+            if amb:
+                qm = ",".join("?" * len(amb))
+                conn.execute(
+                    f"UPDATE outcomes SET status='invalid', note='asset ambigu (fix_asset)', "
+                    f"updated_ts=? WHERE alert_id IN ({qm})", [now_iso()] + amb)
+            conn.commit()
+
+    mv_rows = "".join(
+        f'<tr><td>{esc(o)}</td><td>\u2192 <b>{esc(n)}</b></td><td>{len(ids)}</td></tr>'
+        for (o, n), ids in sorted(moves.items(), key=lambda x: -len(x[1])))
+    total = sum(len(v) for v in moves.values())
+    head = ('<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>FibLab \u2014 fix_asset</title>' + DASH_CSS + '</head><body>')
+    mode_txt = ("\u2705 APPLIQU\u00c9" if apply_mode else
+                "\U0001F50D DRY-RUN \u2014 rien n'a \u00e9t\u00e9 modifi\u00e9")
+    body = ('<h1>\U0001F9F9 Fix des \u00e9tiquettes crypto \u2014 ' + mode_txt + '</h1>'
+            '<div class="sub">R\u00e8gles : BTC \u2265 10\u202f000 \u00b7 XAU 1\u202f500-8\u202f000 '
+            '\u00b7 SOL 68-1\u202f500 \u00b7 HYPE 5-55 \u00b7 SUI &lt; 5 \u00b7 zone 55-68 = ambigu\u00eb '
+            '(exclue des stats)</div>'
+            '<div class="card"><h2>Reclassements' + (" appliqu\u00e9s" if apply_mode else " propos\u00e9s")
+            + ' : ' + str(total) + ' lignes</h2>'
+            '<table><thead><tr><th>Actuel</th><th>Propos\u00e9</th><th>N</th></tr></thead><tbody>'
+            + (mv_rows or '<tr><td colspan="3" class="note">aucun \u2014 \u00e9tiquettes propres</td></tr>')
+            + '</tbody></table>'
+            '<div class="note">Zone ambigu\u00eb SOL/HYPE (55-68) : <b>' + str(len(amb)) + '</b> lignes '
+            + ("class\u00e9es invalid et exclues des stats." if apply_mode else "seraient exclues des stats.")
+            + (' Les lignes re-rang\u00e9es repartent en \u00e9valuation contre leur vrai feed (cron).'
+               if apply_mode else
+               ' <br><b>Pour appliquer :</b> ajoute <code>&apply=yes</code> \u00e0 l\u2019URL.')
+            + '</div></div>')
+    return head + body + '</body></html>'
+
+
 @app.route("/db_count", methods=["GET"])
 def db_count():
     if not check_secret():
@@ -4120,7 +4208,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.46",
+        "version": "2.7.47",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
