@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.50)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.51)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.51 "fix_asset — borne de confiance exacte" :     ║
+║   • La date de fiabilité des étiquettes = dernière ligne mal ║
+║     étiquetée corrigée (dernier solana->btc), pas le 1er     ║
+║     hype correct — les clones ont pollué jusqu'à fin juillet ║
 ║                                                              ║
 ║  Patch v2.7.50 "fix_asset — réparation v1 + règles v2" :     ║
 ║   • Phase 0 : annule les dégâts de l'apply v1 (75 vrais HYPE ║
@@ -4130,12 +4135,18 @@ def fix_asset():
                              f"updated_ts=? WHERE alert_id IN ({qm})",
                              [now_iso()] + r_amb)
 
-        # date de correction : 1er row hype HORS re-rangés par fix_asset
+        # Borne de confiance des étiquettes : la DERNIÈRE ligne mal étiquetée
+        # corrigée (dernier 'solana->btc/xau') = moment réel du fix des clones.
+        # Repli : 1er row hype correct (si aucune correction n'a été faite).
+        _lc = conn.execute(
+            "SELECT MAX(a.ts) AS t FROM alerts a JOIN outcomes o ON o.alert_id=a.id "
+            "WHERE o.note LIKE 'fix_asset solana->%'").fetchone()
         _fh = conn.execute(
             "SELECT MIN(a.ts) AS t FROM alerts a JOIN outcomes o ON o.alert_id=a.id "
             "WHERE a.grp='hype' AND (o.note IS NULL OR o.note NOT LIKE 'fix_asset solana%')"
         ).fetchone()
-        first_hype = (_fh["t"] if _fh else None) or "9999"
+        first_hype = (_lc["t"] if _lc and _lc["t"] else None) \
+            or (_fh["t"] if _fh else None) or "9999"
 
         # ── Phase 1 : règles v2 sur les lignes 'solana' ──
         # (en dry-run, les 75 de la v1 sont encore 'solana' : on les exclut du
@@ -4257,7 +4268,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.50",
+        "version": "2.7.51",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
