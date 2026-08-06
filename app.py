@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.48)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.49)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.49 "fix_asset v2 — critère de date" :            ║
+║   • Date de correction des webhooks auto-détectée (1er row   ║
+║     hype) : avant = le prix fait foi, après = étiquettes     ║
+║     fiables intouchées. La v1 sur-corrigeait (75 vrais HYPE  ║
+║     déportés, 562 fausses ambiguës)                          ║
 ║                                                              ║
 ║  Patch v2.7.48 "Stop de survie étendu" :                     ║
 ║   • xau : stop Fib -1 par défaut sur TOUS les TF >= H12      ║
@@ -4087,45 +4093,45 @@ def exec_view():
 
 @app.route("/fix_asset", methods=["GET"])
 def fix_asset():
-    """v2.7.47 — Répare les étiquettes crypto polluées (clonage ?asset= :
-    BTC/HYPE historiques rangés 'solana', vieux XAU aussi).
-    DRY-RUN par défaut : montre ce qui serait re-rangé, ne touche à rien.
-    ?apply=yes pour appliquer : grp corrigé + outcome remis en pending
-    (re-mesure contre le BON feed). Zone ambiguë SOL/HYPE (prix 55-68,
-    gammes réellement croisées cet été) : outcome -> invalid 'asset ambigu',
-    EXCLU des stats — on ne devine pas.
-    Ne touche qu'aux groupes crypto {solana, btc, hype, sui}."""
+    """v2.7.49 — Répare les étiquettes crypto polluées (clonage ?asset=).
+    Principe : la DATE DE CORRECTION des webhooks (auto-détectée = premier
+    row étiqueté 'hype') sépare deux mondes. AVANT : les étiquettes mentent,
+    le prix fait foi. APRÈS : les étiquettes sont fiables, on n'y touche pas.
+    Seules les lignes 'solana' (le fourre-tout historique) sont candidates.
+    DRY-RUN par défaut ; ?apply=yes pour appliquer."""
     if not check_secret():
         return ("unauthorized", 403)
     apply_mode = request.args.get("apply") == "yes"
-
-    def classify(p):
-        if p is None:
-            return None, False
-        if p >= 10000:
-            return "btc", False
-        if 1500 <= p < 8000:
-            return "xau", False
-        if p < 5:
-            return "sui", False
-        if 68 <= p < 1500:
-            return "solana", False
-        if 5 <= p < 55:
-            return "hype", False
-        return None, True          # 55-68 : ambigu SOL/HYPE
-
-    SRC = ("solana", "btc", "hype", "sui")
-    moves, amb = {}, []
     with db() as conn:
+        _fh = conn.execute("SELECT MIN(ts) AS t FROM alerts WHERE grp='hype'").fetchone()
+        first_hype = (_fh["t"] if _fh else None) or "9999"
+
+        moves, amb = {}, []
         rows = conn.execute(
-            "SELECT id, grp, price, type, ts FROM alerts WHERE grp IN (?,?,?,?) "
-            "AND price IS NOT NULL", SRC).fetchall()
+            "SELECT id, ts, price FROM alerts WHERE grp='solana' AND price IS NOT NULL"
+        ).fetchall()
         for r in rows:
-            newg, is_amb = classify(r["price"])
-            if is_amb:
-                amb.append(r["id"])
-            elif newg and newg != r["grp"]:
-                moves.setdefault((r["grp"], newg), []).append(r["id"])
+            p, pre_fix = r["price"], (r["ts"] or "") < first_hype
+            newg = None
+            if p >= 10000:
+                newg = "btc"                       # SOL n'a jamais coté là
+            elif 1500 <= p < 8000:
+                newg = "xau"
+            elif p < 5:
+                newg = "sui"
+            elif p < 55:
+                if pre_fix:
+                    newg = "hype"                  # trafic HYPE d'avant correction
+                else:
+                    amb.append(r["id"])            # solana post-fix à <55 : anomalie
+            elif p < 68:
+                if pre_fix:
+                    amb.append(r["id"])            # SOL/HYPE indécidable pré-fix
+                # post-fix : étiquette fiable, on garde solana
+            # p >= 68 : vrai SOL, on garde
+            if newg:
+                moves.setdefault(("solana", newg), []).append(r["id"])
+
         if apply_mode:
             for (old, new), ids in moves.items():
                 qm = ",".join("?" * len(ids))
@@ -4150,20 +4156,20 @@ def fix_asset():
     mode_txt = ("\u2705 APPLIQU\u00c9" if apply_mode else
                 "\U0001F50D DRY-RUN \u2014 rien n'a \u00e9t\u00e9 modifi\u00e9")
     body = ('<h1>\U0001F9F9 Fix des \u00e9tiquettes crypto \u2014 ' + mode_txt + '</h1>'
-            '<div class="sub">R\u00e8gles : BTC \u2265 10\u202f000 \u00b7 XAU 1\u202f500-8\u202f000 '
-            '\u00b7 SOL 68-1\u202f500 \u00b7 HYPE 5-55 \u00b7 SUI &lt; 5 \u00b7 zone 55-68 = ambigu\u00eb '
-            '(exclue des stats)</div>'
+            '<div class="sub">Correction des webhooks d\u00e9tect\u00e9e (1er row hype) : <b>'
+            + esc(str(first_hype)[:16]) + '</b>. Avant cette date : le prix fait foi '
+            '(BTC \u2265 10k \u00b7 XAU 1,5-8k \u00b7 SUI &lt; 5 \u00b7 HYPE &lt; 55 \u00b7 55-68 ambigu). '
+            'Apr\u00e8s : \u00e9tiquettes fiables, aucune modification. Seules les lignes '
+            '\u00ab solana \u00bb sont candidates.</div>'
             '<div class="card"><h2>Reclassements' + (" appliqu\u00e9s" if apply_mode else " propos\u00e9s")
             + ' : ' + str(total) + ' lignes</h2>'
             '<table><thead><tr><th>Actuel</th><th>Propos\u00e9</th><th>N</th></tr></thead><tbody>'
             + (mv_rows or '<tr><td colspan="3" class="note">aucun \u2014 \u00e9tiquettes propres</td></tr>')
             + '</tbody></table>'
-            '<div class="note">Zone ambigu\u00eb SOL/HYPE (55-68) : <b>' + str(len(amb)) + '</b> lignes '
-            + ("class\u00e9es invalid et exclues des stats." if apply_mode else "seraient exclues des stats.")
-            + (' Les lignes re-rang\u00e9es repartent en \u00e9valuation contre leur vrai feed (cron).'
-               if apply_mode else
-               ' <br><b>Pour appliquer :</b> ajoute <code>&apply=yes</code> \u00e0 l\u2019URL.')
-            + '</div></div>')
+            '<div class="note">Ambigu\u00ebs (exclues des stats) : <b>' + str(len(amb)) + '</b> lignes'
+            + (' \u2014 class\u00e9es invalid.' if apply_mode else
+               '. <br><b>Pour appliquer :</b> ajoute <code>&apply=yes</code> \u00e0 l\u2019URL.')
+            + ' Les lignes re-rang\u00e9es repartent en \u00e9valuation contre leur vrai feed.</div></div>')
     return head + body + '</body></html>'
 
 
@@ -4215,7 +4221,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.48",
+        "version": "2.7.49",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
