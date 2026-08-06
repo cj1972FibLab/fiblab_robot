@@ -1,7 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.49)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.50)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.50 "fix_asset — réparation v1 + règles v2" :     ║
+║   • Phase 0 : annule les dégâts de l'apply v1 (75 vrais HYPE ║
+║     restitués, 562 sur-exclusions remises en éval) via les   ║
+║     signatures laissées dans les notes d'outcome             ║
+║   • Phase 1 : règles v2 (critère de date auto-détecté)       ║
 ║                                                              ║
 ║  Patch v2.7.49 "fix_asset v2 — critère de date" :            ║
 ║   • Date de correction des webhooks auto-détectée (1er row   ║
@@ -4093,42 +4099,69 @@ def exec_view():
 
 @app.route("/fix_asset", methods=["GET"])
 def fix_asset():
-    """v2.7.49 — Répare les étiquettes crypto polluées (clonage ?asset=).
-    Principe : la DATE DE CORRECTION des webhooks (auto-détectée = premier
-    row étiqueté 'hype') sépare deux mondes. AVANT : les étiquettes mentent,
-    le prix fait foi. APRÈS : les étiquettes sont fiables, on n'y touche pas.
-    Seules les lignes 'solana' (le fourre-tout historique) sont candidates.
+    """v2.7.50 — fix_asset v2 + RÉPARATION des dégâts de la v1 (appliquée en
+    prod le 06/08 : 75 vrais HYPE déportés vers solana, 562 lignes sur-exclues).
+    Phase 0 : annule ces deux effets (signatures 'fix_asset hype->solana' et
+    'asset ambigu' dans les notes d'outcome). Phase 1 : règles v2 — la date de
+    correction des webhooks (auto-détectée) sépare le monde où le prix fait foi
+    (avant) du monde où les étiquettes sont fiables (après).
     DRY-RUN par défaut ; ?apply=yes pour appliquer."""
     if not check_secret():
         return ("unauthorized", 403)
     apply_mode = request.args.get("apply") == "yes"
     with db() as conn:
-        _fh = conn.execute("SELECT MIN(ts) AS t FROM alerts WHERE grp='hype'").fetchone()
+        # ── Phase 0 : réparation v1 ──
+        r_hyp = [r["id"] for r in conn.execute(
+            "SELECT a.id FROM alerts a JOIN outcomes o ON o.alert_id=a.id "
+            "WHERE o.note='fix_asset hype->solana'").fetchall()]
+        r_amb = [r["id"] for r in conn.execute(
+            "SELECT a.id FROM alerts a JOIN outcomes o ON o.alert_id=a.id "
+            "WHERE o.note='asset ambigu (fix_asset)'").fetchall()]
+        if apply_mode:
+            if r_hyp:
+                qm = ",".join("?" * len(r_hyp))
+                conn.execute(f"UPDATE alerts SET grp='hype' WHERE id IN ({qm})", r_hyp)
+                conn.execute(f"UPDATE outcomes SET status='pending', "
+                             f"note='fix_asset repair v1', updated_ts=? "
+                             f"WHERE alert_id IN ({qm})", [now_iso()] + r_hyp)
+            if r_amb:
+                qm = ",".join("?" * len(r_amb))
+                conn.execute(f"UPDATE outcomes SET status='pending', note=NULL, "
+                             f"updated_ts=? WHERE alert_id IN ({qm})",
+                             [now_iso()] + r_amb)
+
+        # date de correction : 1er row hype HORS re-rangés par fix_asset
+        _fh = conn.execute(
+            "SELECT MIN(a.ts) AS t FROM alerts a JOIN outcomes o ON o.alert_id=a.id "
+            "WHERE a.grp='hype' AND (o.note IS NULL OR o.note NOT LIKE 'fix_asset solana%')"
+        ).fetchone()
         first_hype = (_fh["t"] if _fh else None) or "9999"
 
+        # ── Phase 1 : règles v2 sur les lignes 'solana' ──
+        # (en dry-run, les 75 de la v1 sont encore 'solana' : on les exclut du
+        #  scan via leur signature pour que l'aperçu reflète l'état post-réparation)
         moves, amb = {}, []
         rows = conn.execute(
-            "SELECT id, ts, price FROM alerts WHERE grp='solana' AND price IS NOT NULL"
-        ).fetchall()
+            "SELECT a.id, a.ts, a.price FROM alerts a JOIN outcomes o ON o.alert_id=a.id "
+            "WHERE a.grp='solana' AND a.price IS NOT NULL "
+            "AND (o.note IS NULL OR o.note != 'fix_asset hype->solana')").fetchall()
         for r in rows:
             p, pre_fix = r["price"], (r["ts"] or "") < first_hype
             newg = None
             if p >= 10000:
-                newg = "btc"                       # SOL n'a jamais coté là
+                newg = "btc"
             elif 1500 <= p < 8000:
                 newg = "xau"
             elif p < 5:
                 newg = "sui"
             elif p < 55:
                 if pre_fix:
-                    newg = "hype"                  # trafic HYPE d'avant correction
+                    newg = "hype"
                 else:
-                    amb.append(r["id"])            # solana post-fix à <55 : anomalie
+                    amb.append(r["id"])
             elif p < 68:
                 if pre_fix:
-                    amb.append(r["id"])            # SOL/HYPE indécidable pré-fix
-                # post-fix : étiquette fiable, on garde solana
-            # p >= 68 : vrai SOL, on garde
+                    amb.append(r["id"])
             if newg:
                 moves.setdefault(("solana", newg), []).append(r["id"])
 
@@ -4155,21 +4188,24 @@ def fix_asset():
             '<title>FibLab \u2014 fix_asset</title>' + DASH_CSS + '</head><body>')
     mode_txt = ("\u2705 APPLIQU\u00c9" if apply_mode else
                 "\U0001F50D DRY-RUN \u2014 rien n'a \u00e9t\u00e9 modifi\u00e9")
-    body = ('<h1>\U0001F9F9 Fix des \u00e9tiquettes crypto \u2014 ' + mode_txt + '</h1>'
-            '<div class="sub">Correction des webhooks d\u00e9tect\u00e9e (1er row hype) : <b>'
-            + esc(str(first_hype)[:16]) + '</b>. Avant cette date : le prix fait foi '
-            '(BTC \u2265 10k \u00b7 XAU 1,5-8k \u00b7 SUI &lt; 5 \u00b7 HYPE &lt; 55 \u00b7 55-68 ambigu). '
-            'Apr\u00e8s : \u00e9tiquettes fiables, aucune modification. Seules les lignes '
-            '\u00ab solana \u00bb sont candidates.</div>'
-            '<div class="card"><h2>Reclassements' + (" appliqu\u00e9s" if apply_mode else " propos\u00e9s")
-            + ' : ' + str(total) + ' lignes</h2>'
+    verb = "" if apply_mode else " (\u00e0 faire)"
+    body = ('<h1>\U0001F9F9 Fix des \u00e9tiquettes \u2014 ' + mode_txt + '</h1>'
+            '<div class="sub">Correction des webhooks d\u00e9tect\u00e9e : <b>'
+            + esc(str(first_hype)[:16]) + '</b>. Avant : le prix fait foi. '
+            'Apr\u00e8s : \u00e9tiquettes fiables, intouch\u00e9es.</div>'
+            '<div class="card"><h2>Phase 0 \u2014 r\u00e9paration des d\u00e9g\u00e2ts v1' + verb + '</h2>'
+            '<div class="note">\u2022 ' + str(len(r_hyp)) + ' vrais HYPE restitu\u00e9s '
+            '(hype\u2192solana annul\u00e9, re-\u00e9valu\u00e9s)<br>\u2022 ' + str(len(r_amb))
+            + ' sur-exclusions annul\u00e9es (remises en \u00e9val ; la phase 1 ne re-exclut '
+            'que le pr\u00e9-correction 55-68)</div></div>'
+            '<div class="card"><h2>Phase 1 \u2014 reclassements' + verb + ' : ' + str(total) + ' lignes</h2>'
             '<table><thead><tr><th>Actuel</th><th>Propos\u00e9</th><th>N</th></tr></thead><tbody>'
-            + (mv_rows or '<tr><td colspan="3" class="note">aucun \u2014 \u00e9tiquettes propres</td></tr>')
+            + (mv_rows or '<tr><td colspan="3" class="note">aucun</td></tr>')
             + '</tbody></table>'
-            '<div class="note">Ambigu\u00ebs (exclues des stats) : <b>' + str(len(amb)) + '</b> lignes'
-            + (' \u2014 class\u00e9es invalid.' if apply_mode else
-               '. <br><b>Pour appliquer :</b> ajoute <code>&apply=yes</code> \u00e0 l\u2019URL.')
-            + ' Les lignes re-rang\u00e9es repartent en \u00e9valuation contre leur vrai feed.</div></div>')
+            '<div class="note">Ambigu\u00ebs d\u00e9finitives (pr\u00e9-correction 55-68) : <b>'
+            + str(len(amb)) + '</b>'
+            + ('' if apply_mode else '. <b>Pour appliquer :</b> <code>?apply=yes</code>')
+            + '</div></div>')
     return head + body + '</body></html>'
 
 
@@ -4221,7 +4257,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.49",
+        "version": "2.7.50",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
