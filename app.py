@@ -1,7 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.51)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.53)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.53 "/exec/test" :                                ║
+║   • Injection d'un ordre de test dans la file (tuyauterie    ║
+║     Railway->MT5) sans armer l'exécuteur ni attendre un      ║
+║     signal réel                                              ║
+║                                                              ║
+║  Patch v2.7.52 "Forex : GBPUSD + EURUSD" :                   ║
+║   • Nouveaux groupes gbpusd/eurusd : mapping, feeds TD+Yahoo ║
+║     (spot, qualité native), garde-fou cohérence, paramètres  ║
+║     d'éval 5 décimales. SUI retiré du panel par Fred (son    ║
+║     historique reste en base)                                ║
 ║                                                              ║
 ║  Patch v2.7.51 "fix_asset — borne de confiance exacte" :     ║
 ║   • La date de fiabilité des étiquettes = dernière ligne mal ║
@@ -619,6 +630,8 @@ ASSET_GROUPS = {
     "btc":    {"BTCUSDT", "BTC/USD", "BTCUSDT.P", "BTCUSD", "BTCUSDTP"},
     "hype":   {"HYPEUSDT", "HYPEUSDT.P", "HYPEUSD", "HYPE"},
     "sui":    {"SUIUSDT", "SUIUSDT.P", "SUIUSD", "SUI"},
+    "gbpusd": {"GBPUSD", "GBP/USD", "CABLE", "GBPUSD.P"},
+    "eurusd": {"EURUSD", "EUR/USD", "EURUSD.P"},
     "stocks": {"TSLA", "HOOD", "CELH", "TTD", "PLTR", "AMZN", "NVDA", "AAPL", "META", "GOOGL", "MSFT", "SOFI"},
 }
 
@@ -629,6 +642,8 @@ ASSET_META = {
     "btc":    {"label": "BITCOIN", "emoji": "₿",  "tv": "https://www.tradingview.com/chart/?symbol=BITGET:BTCUSDT.P"},
     "hype":   {"label": "HYPE",    "emoji": "🚀", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:HYPEUSDT.P"},
     "sui":    {"label": "SUI",     "emoji": "🌊", "tv": "https://www.tradingview.com/chart/?symbol=BITGET:SUIUSDT.P"},
+    "gbpusd": {"label": "GBP/USD", "emoji": "🇬🇧", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:GBPUSD"},
+    "eurusd": {"label": "EUR/USD", "emoji": "🇪🇺", "tv": "https://www.tradingview.com/chart/?symbol=OANDA:EURUSD"},
     "stocks": {"label": "STOCKS",  "emoji": "📈", "tv": "https://www.tradingview.com/chart/?symbol=NASDAQ:"},
 }
 
@@ -655,6 +670,8 @@ PRICE_RANGES = {
     "btc":    (10000, 1000000),
     "hype":   (0.5, 500),
     "sui":    (0.05, 50),
+    "gbpusd": (0.9, 2.2),
+    "eurusd": (0.7, 1.8),
 }
 
 
@@ -1822,6 +1839,8 @@ EVAL_RISK = {
     "solana": {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.5,  "sl_cap": 40.0,   "fallback": 2.0},
     "hype":   {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 30.0,   "fallback": 1.5},
     "sui":    {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.05, "sl_cap": 5.0,    "fallback": 0.3},
+    "gbpusd": {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.0008, "sl_cap": 0.06, "fallback": 0.004},
+    "eurusd": {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.0008, "sl_cap": 0.05, "fallback": 0.004},
     "stocks": {"k": 2.0, "tp_r": 3.0, "sl_floor": 0.3,  "sl_cap": 60.0,   "fallback": 2.0},
 }
 
@@ -1908,9 +1927,11 @@ def _fib0_from_bars(pre_bars, ts, tf_h, long_bias):
 
 
 SYMBOL_MAP_YF = {"xau": "GC=F", "dax": "^GDAXI", "btc": "BTC-USD", "solana": "SOL-USD",
-                 "hype": "HYPE-USD", "sui": "SUI-USD"}
+                 "hype": "HYPE-USD", "sui": "SUI-USD",
+                 "gbpusd": "GBPUSD=X", "eurusd": "EURUSD=X"}
 SYMBOL_MAP_TD = {"xau": "XAU/USD", "dax": "DAX", "btc": "BTC/USD", "solana": "SOL/USD",
-                 "hype": "HYPE/USD", "sui": "SUI/USD"}
+                 "hype": "HYPE/USD", "sui": "SUI/USD",
+                 "gbpusd": "GBP/USD", "eurusd": "EUR/USD"}
 
 
 def _yahoo_symbol(group, asset):
@@ -4004,6 +4025,44 @@ def reeval_bigtf():
                     "note": "le cron re-mesure avec bougies daily + horizon 180j"}), 200
 
 
+@app.route("/exec/test", methods=["GET"])
+def exec_test():
+    """v2.7.53 — Injecte un ordre de TEST dans la file (sans armer EXEC_ENABLED,
+    sans signal réel). Usage : /exec/test?entry=4200&side=sell&risk=50
+    L'entrée doit être posée LOIN du prix courant pour ne jamais se remplir :
+    c'est un test de tuyauterie, pas un trade. À supprimer côté MT5 après."""
+    if not check_secret():
+        return jsonify({"error": "unauthorized"}), 403
+    try:
+        entry = float(request.args.get("entry"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "param entry requis, ex: /exec/test?entry=4200&side=sell"}), 400
+    side = (request.args.get("side") or "buy").lower()
+    risk = float(request.args.get("risk") or 50.0)
+    long_bias = side != "sell"
+    target = entry * (1.005 if long_bias else 0.995)      # TP1 à 0.5%
+    unit = abs(target - entry) / 0.618
+    slf = sl_fib_for("xau", "H4")
+    sl = entry - (1 - slf) * unit if long_bias else entry + (1 - slf) * unit
+    def _ext(m):
+        d = (m - 1.0) * unit
+        return round(entry + d if long_bias else entry - d, 2)
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO exec_orders (created_ts, alert_id, asset, side, entry, sl, "
+            "tp1, tp2, tp3, tp4, risk_usd, tf, status, note, updated_ts) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now_iso(), None, "XAUUSD", "BUY" if long_bias else "SELL",
+             round(entry, 2), round(sl, 2), round(target, 2),
+             _ext(2.618), _ext(3.618), _ext(4.618), risk, "H4",
+             "proposed", "TEST tuyauterie — supprimer côté MT5", now_iso()))
+        conn.commit()
+        oid = cur.lastrowid
+    return jsonify({"test_order_id": oid, "entry": round(entry, 2), "sl": round(sl, 2),
+                    "tp1": round(target, 2), "risk_usd": risk,
+                    "note": "Ordre en file. L'EA le ramassera au prochain poll."}), 200
+
+
 @app.route("/exec/pending", methods=["GET"])
 def exec_pending():
     """v2.7.46 — L'EA/pont MT5 poll ici. Renvoie les ordres 'proposed' et les
@@ -4268,7 +4327,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.51",
+        "version": "2.7.53",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
