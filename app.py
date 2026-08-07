@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.53)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.54)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.54 "Secret exec dédié" :                         ║
+║   • EXEC_SECRET (env) protège les 5 routes /exec/* sans      ║
+║     toucher /webhook ni les dashboards — les 250 alertes     ║
+║     TradingView restent telles quelles. L'EA passe ?key=     ║
 ║                                                              ║
 ║  Patch v2.7.53 "/exec/test" :                                ║
 ║   • Injection d'un ordre de test dans la file (tuyauterie    ║
@@ -367,6 +372,20 @@ def check_secret() -> bool:
         return True
     token = request.args.get("token") or request.headers.get("X-Webhook-Token", "")
     return token == WEBHOOK_SECRET
+
+
+EXEC_SECRET = os.environ.get("EXEC_SECRET", "")
+
+
+def check_exec_secret() -> bool:
+    """v2.7.54 — Secret DÉDIÉ aux routes d'exécution (/exec/*) : protège
+    l'API qui pilote des ordres sans imposer de token aux 250 webhooks
+    TradingView. Accepte ?key= (l'EA) ou ?token= ou header."""
+    if not EXEC_SECRET:
+        return True   # non configuré = ouvert (à éviter une fois l'EA branché)
+    token = (request.args.get("key") or request.args.get("token")
+             or request.headers.get("X-Exec-Token", ""))
+    return token == EXEC_SECRET
 
 
 # ─────────────────────────────────────────────
@@ -4031,7 +4050,7 @@ def exec_test():
     sans signal réel). Usage : /exec/test?entry=4200&side=sell&risk=50
     L'entrée doit être posée LOIN du prix courant pour ne jamais se remplir :
     c'est un test de tuyauterie, pas un trade. À supprimer côté MT5 après."""
-    if not check_secret():
+    if not check_exec_secret():
         return jsonify({"error": "unauthorized"}), 403
     try:
         entry = float(request.args.get("entry"))
@@ -4067,7 +4086,7 @@ def exec_test():
 def exec_pending():
     """v2.7.46 — L'EA/pont MT5 poll ici. Renvoie les ordres 'proposed' et les
     marque 'sent'. Kill-switch coupe la distribution."""
-    if not check_secret():
+    if not check_exec_secret():
         return jsonify({"error": "unauthorized"}), 403
     if exec_state.get("kill"):
         return jsonify({"orders": [], "kill": True}), 200
@@ -4086,7 +4105,7 @@ def exec_pending():
 def exec_update():
     """L'exécuteur remonte l'état : placed / partial / closed / cancelled /
     error, avec broker_ticket et fill_info (JSON libre)."""
-    if not check_secret():
+    if not check_exec_secret():
         return jsonify({"error": "unauthorized"}), 403
     d = request.get_json(silent=True) or {}
     try:
@@ -4111,7 +4130,7 @@ def exec_update():
 def exec_kill():
     """Kill-switch : /exec/kill?on=1 coupe (les 'proposed' passent cancelled),
     ?on=0 réarme."""
-    if not check_secret():
+    if not check_exec_secret():
         return jsonify({"error": "unauthorized"}), 403
     on = request.args.get("on", "1") != "0"
     exec_state["kill"] = on
@@ -4129,7 +4148,7 @@ def exec_kill():
 @app.route("/exec/view", methods=["GET"])
 def exec_view():
     """Mini-dashboard de la file d'exécution."""
-    if not check_secret():
+    if not check_exec_secret():
         return ("unauthorized", 403)
     with db() as conn:
         rows = conn.execute("SELECT * FROM exec_orders ORDER BY id DESC LIMIT 50").fetchall()
@@ -4327,7 +4346,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.53",
+        "version": "2.7.54",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
