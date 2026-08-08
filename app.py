@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.56)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.57)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.57 "Quarantaine dès la requête" :                ║
+║   • Les groupes en quarantaine sortent du SELECT de tête de  ║
+║     file : le bouchon HYPE (500+ lignes) ne masque plus les  ║
+║     actifs sains derrière le LIMIT 500                       ║
 ║                                                              ║
 ║  Patch v2.7.56 "Quarantaine feeds morts" :                   ║
 ║   • Un groupe dont toutes les sources sont vides est mis en  ║
@@ -2133,19 +2138,24 @@ def evaluate_pending_outcomes():
     (>= EVAL_MIN_AGE_H) sont chargées."""
     now = datetime.now(timezone.utc)
     cutoff = (now - timedelta(hours=EVAL_MIN_AGE_H)).isoformat()
+    # v2.7.57 : les groupes en quarantaine sortent DE LA REQUÊTE — sinon un
+    # bouchon de 500+ lignes d'un actif au feed mort occupe toute la tête de
+    # file (LIMIT 500) et le run tourne à vide (incident HYPE, acte II).
+    _q = [g for g, u in _DEAD_FEEDS.items() if now < u]
+    _q_sql = ("AND a.grp NOT IN (%s) " % ",".join("?" * len(_q))) if _q else ""
     with db() as conn:
         rows = conn.execute(
             "SELECT a.id, a.ts, a.asset, a.grp, a.side, a.price, a.timeframe, a.target, a.type "
             "FROM alerts a JOIN outcomes o ON a.id = o.alert_id "
             "WHERE o.status = 'pending' AND a.price IS NOT NULL AND a.side IS NOT NULL "
-            "AND a.ts <= ? "
+            "AND a.ts <= ? " + _q_sql +
             # v2.7.36 : ASC — les plus ANCIENNES d'abord dans chaque classe :
             # elles sont résolubles (ou expirables) immédiatement, la file se
             # vide par l'arrière au lieu de mouliner sur les récentes en cours.
             "ORDER BY (CASE WHEN LOWER(a.type) LIKE '%activated%' THEN 0 "
             "WHEN LOWER(a.type) LIKE '%hold%' THEN 1 ELSE 2 END), a.id ASC "
             "LIMIT 500",
-            (cutoff,)
+            [cutoff] + _q
         ).fetchall()
 
     # Prépare et groupe les alertes par actif, en conservant l'ordre de priorité.
@@ -4411,7 +4421,7 @@ def db_count():
             "SELECT status, COUNT(*) AS n FROM outcomes GROUP BY status")}
     return jsonify({"alerts": n_alerts, "outcomes": n_out, "profiles": n_prof,
                     "by_status": by_status, "db_path": DB_PATH,
-                    "version": "2.7.56"})
+                    "version": "2.7.57"})
 
 
 @app.route("/export.csv", methods=["GET"])
@@ -4451,7 +4461,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.56",
+        "version": "2.7.57",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
