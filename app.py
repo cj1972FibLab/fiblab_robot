@@ -1,7 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.54)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.55)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.55 "Feeds instrumentés + OANDA" :                ║
+║   • Fin de l'aveuglement : TD/Yahoo loggent la RAISON de     ║
+║     chaque réponse vide (quota, clé, rate limit) ; bilan     ║
+║     de run [EVAL] systématique                               ║
+║   • Fetcher OANDA v20 : prioritaire DAX (DE30_EUR), secours  ║
+║     or/forex (XAU_USD, GBP_USD, EUR_USD)                     ║
+║   • Bug v2.7.45 corrigé : interval propagé au repli Yahoo    ║
+║     (le mode Daily+ recevait de l'horaire)                   ║
+║   • TF 600 -> H10 (normalisation + heures + /fix_tf)         ║
+║   • /db_count : répartition par statut + version             ║
 ║                                                              ║
 ║  Patch v2.7.54 "Secret exec dédié" :                         ║
 ║   • EXEC_SECRET (env) protège les 5 routes /exec/* sans      ║
@@ -789,7 +800,7 @@ def normalize_timeframe(tf: str) -> str:
         "1": "M1", "2": "M2", "3": "M3", "4": "M4", "5": "M5", "10": "M10",
         "15": "M15", "30": "M30", "45": "M45",
         "60": "H1", "120": "H2", "180": "H3", "240": "H4",
-        "360": "H6", "480": "H8", "720": "H12",
+        "360": "H6", "480": "H8", "600": "H10", "720": "H12",
         "1440": "D1", "10080": "W1", "43200": "MN",
         # multi-journaliers en minutes (au cas où TradingView les envoie ainsi)
         "2880": "2D", "4320": "3D", "5760": "4D", "7200": "5D",
@@ -1865,7 +1876,7 @@ EVAL_RISK = {
 
 TF_HOURS = {
     "M1": 1, "M2": 1, "M3": 1, "M4": 1, "M5": 1, "M10": 1, "M15": 1, "M30": 1, "M45": 1,
-    "H1": 1, "H2": 2, "H3": 3, "H4": 4, "H6": 6, "H8": 8, "H12": 12,
+    "H1": 1, "H2": 2, "H3": 3, "H4": 4, "H6": 6, "H8": 8, "H10": 10, "H12": 12,
     "D1": 24, "1D": 24, "D": 24, "DAILY": 24,
     "2D": 48, "3D": 72, "4D": 96, "5D": 120, "6D": 144, "7D": 168,
     "D2": 48, "D3": 72, "D4": 96, "D5": 120, "D6": 144, "D7": 168,
@@ -1976,8 +1987,10 @@ def _fetch_yahoo(symbol, start_dt, end_dt, interval="1h"):
     r = requests.get(url, params=params, timeout=8,
                      headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
-    res = (r.json().get("chart", {}).get("result") or [None])[0]
+    _ch = r.json().get("chart", {})
+    res = (_ch.get("result") or [None])[0]
     if not res:
+        print(f"[EVAL] yahoo {symbol} vide : {str(_ch.get('error') or 'sans result')[:140]}")
         return []
     ts = res.get("timestamp") or []
     q = (res.get("indicators", {}).get("quote") or [{}])[0]
@@ -2001,8 +2014,13 @@ def _fetch_twelvedata(symbol, start_dt, end_dt, interval="1h"):
               "apikey": TWELVEDATA_API_KEY, "timezone": "UTC", "outputsize": 5000}
     r = requests.get(url, params=params, timeout=8)
     r.raise_for_status()
-    vals = r.json().get("values")
+    j = r.json()
+    vals = j.get("values")
     if not vals:
+        # v2.7.55 : TD renvoie ses erreurs (quota, clé, rate limit) DANS un
+        # JSON 200 -> on loggue la raison au lieu d'être aveugle.
+        print(f"[EVAL] twelvedata {symbol} vide : "
+              f"{str(j.get('message') or j.get('code') or 'sans values')[:140]}")
         return []
     bars = []
     for v in vals:
@@ -2017,29 +2035,67 @@ def _fetch_twelvedata(symbol, start_dt, end_dt, interval="1h"):
     return bars
 
 
-def fetch_prices(group, asset, start_dt, end_dt, interval="1h"):
-    """[(datetime, high, low), ...] en H1. Twelve Data si clé, avec REPLI Yahoo
-    dès que Twelve Data ÉCHOUE ou renvoie vide — y compris sur 429 (rate limit).
-    Chaque source est isolée dans son propre try : une exception Twelve Data ne
-    saute plus par-dessus le repli Yahoo (bug < v2.7.1)."""
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
+OANDA_SYMBOLS = {"dax": "DE30_EUR", "xau": "XAU_USD",
+                 "gbpusd": "GBP_USD", "eurusd": "EUR_USD"}
+
+
+def _fetch_oanda(symbol, start_dt, end_dt, interval="1h"):
+    """v2.7.55 — OANDA v20 (compte practice). Granularité H1 ou D, prix mid.
+    Prioritaire pour le DAX (même maison que le chart DE30EUR), secours pour
+    l'or et le forex si Twelve Data/Yahoo flanchent."""
+    url = f"https://api-fxpractice.oanda.com/v3/instruments/{symbol}/candles"
+    params = {"granularity": "D" if interval == "1d" else "H1", "price": "M",
+              "from": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "to": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    r = requests.get(url, params=params, timeout=8,
+                     headers={"Authorization": f"Bearer {OANDA_API_KEY}"})
+    r.raise_for_status()
+    candles = r.json().get("candles") or []
+    if not candles:
+        print(f"[EVAL] oanda {symbol} vide")
+        return []
     bars = []
-    if TWELVEDATA_API_KEY:
-        sym = _twelvedata_symbol(group, asset)
-        if sym:
-            try:
-                bars = _fetch_twelvedata(sym, start_dt, end_dt, interval)
-            except Exception as e:
-                print(f"[EVAL] twelvedata {group}/{asset} : {e}")
-                bars = []
-    if bars:
-        return bars
-    # Twelve Data vide ou en échec (429 / quota) -> on tente Yahoo
-    sym = _yahoo_symbol(group, asset)
-    if sym:
+    for c in candles:
         try:
-            return _fetch_yahoo(sym, start_dt, end_dt)
+            dt = datetime.fromisoformat(c["time"][:19] + "+00:00")
+            m = c["mid"]
+            bars.append((dt, float(m["h"]), float(m["l"]), float(m["c"])))
+        except Exception:
+            continue
+    bars.sort(key=lambda x: x[0])
+    return bars
+
+
+def fetch_prices(group, asset, start_dt, end_dt, interval="1h"):
+    """[(datetime, high, low, close), ...]. v2.7.55 : chaîne de sources —
+    DAX : OANDA d'abord (feed frère du chart DE30EUR), puis TD, puis Yahoo.
+    Autres : TD -> Yahoo -> OANDA (secours or/forex). Chaque source isolée ;
+    chaque vide loggué ; interval ('1h'/'1d') propagé PARTOUT (bug v2.7.45 :
+    le repli Yahoo recevait de l'horaire en mode Daily+)."""
+    chain = []
+    osym = OANDA_SYMBOLS.get(group) if OANDA_API_KEY else None
+    if group == "dax" and osym:
+        chain.append(("oanda", osym))
+    if TWELVEDATA_API_KEY:
+        tsym = _twelvedata_symbol(group, asset)
+        if tsym:
+            chain.append(("twelvedata", tsym))
+    ysym = _yahoo_symbol(group, asset)
+    if ysym:
+        chain.append(("yahoo", ysym))
+    if osym and group != "dax":
+        chain.append(("oanda", osym))
+    fns = {"oanda": _fetch_oanda, "twelvedata": _fetch_twelvedata, "yahoo": _fetch_yahoo}
+    for _src, sym in chain:
+        try:
+            bars = fns[_src](sym, start_dt, end_dt, interval)
         except Exception as e:
-            print(f"[EVAL] yahoo {group}/{asset} : {e}")
+            print(f"[EVAL] {_src} {group}/{asset} : {e}")
+            bars = []
+        if bars:
+            return bars
+    print(f"[EVAL] AUCUNE donnée {group}/{asset} ({interval}) — toutes sources vides")
     return []
 
 
@@ -2227,6 +2283,7 @@ def evaluate_pending_outcomes():
                 )
                 conn.commit()
             evaluated += len(updates)
+    print(f"[EVAL] run terminé : {evaluated} évaluées")
     return evaluated
 
 
@@ -3129,6 +3186,18 @@ def fix_tf_route():
         return jsonify({"error": "unauthorized"}), 403
     remap = {"M1": "1D", "M2": "2D", "M3": "3D", "M4": "4D", "M5": "5D",
              "6": "6D", "7": "7D"}
+    # v2.7.55 : TF 600 minutes = H10, jamais normalisé -> horizon d'éval faux
+    # (défaut 4h). Remap sans filtre de type (600 est sans ambiguïté), reset éval.
+    with db() as conn:
+        rows = conn.execute("SELECT id FROM alerts WHERE timeframe='600'").fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            qm = ",".join("?" * len(ids))
+            conn.execute(f"UPDATE alerts SET timeframe='H10' WHERE id IN ({qm})", ids)
+            conn.execute(f"UPDATE outcomes SET status='pending', note='fix_tf 600->H10', "
+                         f"updated_ts=? WHERE alert_id IN ({qm}) AND status != 'pending'",
+                         [now_iso()] + ids)
+            conn.commit()
     fixed = {}
     with db() as conn:
         ids_all = []
@@ -4300,13 +4369,15 @@ def fix_asset():
 
 @app.route("/db_count", methods=["GET"])
 def db_count():
-    if not check_secret():
-        return jsonify({"error": "unauthorized"}), 403
     with db() as conn:
-        a = conn.execute("SELECT COUNT(*) AS n FROM alerts").fetchone()["n"]
-        o = conn.execute("SELECT COUNT(*) AS n FROM outcomes").fetchone()["n"]
-        p = conn.execute("SELECT COUNT(*) AS n FROM profiles").fetchone()["n"]
-    return jsonify({"alerts": a, "outcomes": o, "profiles": p, "db_path": DB_PATH})
+        n_alerts = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+        n_out = conn.execute("SELECT COUNT(*) FROM outcomes").fetchone()[0]
+        n_prof = conn.execute("SELECT COUNT(*) FROM profiles").fetchone()[0]
+        by_status = {r["status"]: r["n"] for r in conn.execute(
+            "SELECT status, COUNT(*) AS n FROM outcomes GROUP BY status")}
+    return jsonify({"alerts": n_alerts, "outcomes": n_out, "profiles": n_prof,
+                    "by_status": by_status, "db_path": DB_PATH,
+                    "version": "2.7.55"})
 
 
 @app.route("/export.csv", methods=["GET"])
@@ -4346,7 +4417,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.54",
+        "version": "2.7.55",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
