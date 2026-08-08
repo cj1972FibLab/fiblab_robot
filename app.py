@@ -1,7 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.57)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.58)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.58 "Plafond témoin relevé" :                     ║
+║   • EVAL_WITNESS_CAP 60 -> 200 (env-configurable) : le fetch ║
+║     par actif rend le plafond haut gratuit en quota ->       ║
+║     drainage ~3x plus rapide                                 ║
 ║                                                              ║
 ║  Patch v2.7.57 "Quarantaine dès la requête" :                ║
 ║   • Les groupes en quarantaine sortent du SELECT de tête de  ║
@@ -1862,7 +1867,7 @@ def handle_telegram_command(text: str, chat_id: str):
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
 
 EVAL_MIN_AGE_H      = 12
-EVAL_WITNESS_CAP   = 60    # v2.7.35 : non-ACTIVATED max par run (échantillon témoin)
+EVAL_WITNESS_CAP = int(os.environ.get("EVAL_WITNESS_CAP", "200"))  # v2.7.58 : le fetch étant par actif, un plafond haut ne coûte rien en quota    # v2.7.35 : non-ACTIVATED max par run (échantillon témoin)
 EVAL_ATR_BARS       = 14
 EVAL_HORIZON_BARS   = 12
 EVAL_HORIZON_MIN_H  = 48
@@ -4421,7 +4426,7 @@ def db_count():
             "SELECT status, COUNT(*) AS n FROM outcomes GROUP BY status")}
     return jsonify({"alerts": n_alerts, "outcomes": n_out, "profiles": n_prof,
                     "by_status": by_status, "db_path": DB_PATH,
-                    "version": "2.7.57"})
+                    "version": "2.7.58"})
 
 
 @app.route("/export.csv", methods=["GET"])
@@ -4461,7 +4466,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.57",
+        "version": "2.7.58",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
