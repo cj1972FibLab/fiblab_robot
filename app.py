@@ -1,7 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.55)     ║
+║         FIBLAB ROBOT — Webhook Trading Server  (v2.7.56)     ║
 ║         Charlie Joe 1972 — Juillet 2026                      ║
+║                                                              ║
+║  Patch v2.7.56 "Quarantaine feeds morts" :                   ║
+║   • Un groupe dont toutes les sources sont vides est mis en  ║
+║     quarantaine 6h : ses timeouts ne dévorent plus la garde  ║
+║     de temps du run (incident HYPE : runs à 0 évaluées)      ║
+║   • Plafond 8 appels Twelve Data/run (limite minute Basic)   ║
+║   • /fix_tf répare aussi les alertes SOL étiquetées hype     ║
 ║                                                              ║
 ║  Patch v2.7.55 "Feeds instrumentés + OANDA" :                ║
 ║   • Fin de l'aveuglement : TD/Yahoo loggent la RAISON de     ║
@@ -2035,6 +2042,16 @@ def _fetch_twelvedata(symbol, start_dt, end_dt, interval="1h"):
     return bars
 
 
+# v2.7.56 : un groupe dont TOUTES les sources reviennent vides est mis en
+# quarantaine 6h — ses fetches morts (timeouts en série) dévoraient la garde
+# de temps du run et affamaient les actifs sains (incident HYPE du 08/08).
+_DEAD_FEEDS = {}
+DEAD_FEED_QUARANTINE_H = 6
+# v2.7.56 : plafond d'appels Twelve Data par run (limite 8 crédits/minute du
+# plan Basic) — au-delà, bascule directe sur Yahoo/OANDA.
+_TD_CALLS_THIS_RUN = {"n": 0}
+TD_CALLS_PER_RUN_MAX = 8
+
 OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
 OANDA_SYMBOLS = {"dax": "DE30_EUR", "xau": "XAU_USD",
                  "gbpusd": "GBP_USD", "eurusd": "EUR_USD"}
@@ -2073,11 +2090,14 @@ def fetch_prices(group, asset, start_dt, end_dt, interval="1h"):
     Autres : TD -> Yahoo -> OANDA (secours or/forex). Chaque source isolée ;
     chaque vide loggué ; interval ('1h'/'1d') propagé PARTOUT (bug v2.7.45 :
     le repli Yahoo recevait de l'horaire en mode Daily+)."""
+    q_until = _DEAD_FEEDS.get(group)
+    if q_until and datetime.now(timezone.utc) < q_until:
+        return []          # feed en quarantaine : zéro tentative, zéro temps brûlé
     chain = []
     osym = OANDA_SYMBOLS.get(group) if OANDA_API_KEY else None
     if group == "dax" and osym:
         chain.append(("oanda", osym))
-    if TWELVEDATA_API_KEY:
+    if TWELVEDATA_API_KEY and _TD_CALLS_THIS_RUN["n"] < TD_CALLS_PER_RUN_MAX:
         tsym = _twelvedata_symbol(group, asset)
         if tsym:
             chain.append(("twelvedata", tsym))
@@ -2088,6 +2108,8 @@ def fetch_prices(group, asset, start_dt, end_dt, interval="1h"):
         chain.append(("oanda", osym))
     fns = {"oanda": _fetch_oanda, "twelvedata": _fetch_twelvedata, "yahoo": _fetch_yahoo}
     for _src, sym in chain:
+        if _src == "twelvedata":
+            _TD_CALLS_THIS_RUN["n"] += 1
         try:
             bars = fns[_src](sym, start_dt, end_dt, interval)
         except Exception as e:
@@ -2095,7 +2117,9 @@ def fetch_prices(group, asset, start_dt, end_dt, interval="1h"):
             bars = []
         if bars:
             return bars
-    print(f"[EVAL] AUCUNE donnée {group}/{asset} ({interval}) — toutes sources vides")
+    _DEAD_FEEDS[group] = datetime.now(timezone.utc) + timedelta(hours=DEAD_FEED_QUARANTINE_H)
+    print(f"[EVAL] AUCUNE donnée {group}/{asset} ({interval}) — toutes sources vides, "
+          f"groupe en quarantaine {DEAD_FEED_QUARANTINE_H}h")
     return []
 
 
@@ -2159,6 +2183,9 @@ def evaluate_pending_outcomes():
                             "horizon_h": horizon_h, "lookback_h": lookback_h})
 
     evaluated = 0
+    _TD_CALLS_THIS_RUN["n"] = 0
+    _nowq = datetime.now(timezone.utc)
+    order.sort(key=lambda k: 1 if (_DEAD_FEEDS.get(k[0]) and _nowq < _DEAD_FEEDS[k[0]]) else 0)
     _start = time.monotonic()
     for key in order:
         if time.monotonic() - _start > 18:      # garde-fou timeout (fetch + marge)
@@ -3186,6 +3213,13 @@ def fix_tf_route():
         return jsonify({"error": "unauthorized"}), 403
     remap = {"M1": "1D", "M2": "2D", "M3": "3D", "M4": "4D", "M5": "5D",
              "6": "6D", "7": "7D"}
+    # v2.7.56 : résidu d'étiquetage — alertes SOL rangées dans le groupe hype
+    with db() as conn:
+        n_sol = conn.execute("UPDATE alerts SET grp='solana' "
+                             "WHERE grp='hype' AND asset LIKE 'SOL%'").rowcount
+        if n_sol:
+            conn.commit()
+            print(f"[FIX_TF] {n_sol} alertes SOL sorties du groupe hype")
     # v2.7.55 : TF 600 minutes = H10, jamais normalisé -> horizon d'éval faux
     # (défaut 4h). Remap sans filtre de type (600 est sans ambiguïté), reset éval.
     with db() as conn:
@@ -4377,7 +4411,7 @@ def db_count():
             "SELECT status, COUNT(*) AS n FROM outcomes GROUP BY status")}
     return jsonify({"alerts": n_alerts, "outcomes": n_out, "profiles": n_prof,
                     "by_status": by_status, "db_path": DB_PATH,
-                    "version": "2.7.55"})
+                    "version": "2.7.56"})
 
 
 @app.route("/export.csv", methods=["GET"])
@@ -4417,7 +4451,7 @@ def status():
                         for uid, p in user_profiles.items()}
     return jsonify({
         "status": "killswitch" if robot_state["paused"] else "running",
-        "version": "2.7.55",
+        "version": "2.7.56",
         "alerts_total": len(alert_history),
         **{f"alerts_{g}": len(h) for g, h in histories.items()},
         "user_profiles": profiles_summary,
